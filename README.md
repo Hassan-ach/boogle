@@ -2,6 +2,11 @@
 
 A 2000s-style search engine built for educational purposes.
 
+<div align="center">
+  <img src="assets/search_page.png" alt="Search Page Screenshot" width="600">
+  <img src="assets/result_page.png" alt="Search Page Screenshot" width="600">
+</div>
+
 ## Quick Start
 
 ```bash
@@ -71,5 +76,5 @@ See individual service READMEs in [services/](services/) for language-specific b
 
 ---
 
-**Status**: Learning project — not for production  
+**Status**: Learning project — not for production
 **License**: MIT
