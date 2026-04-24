@@ -3,8 +3,14 @@
 A 2000s-style search engine built for educational purposes.
 
 <div align="center">
-  <img src="assets/search_page.png" alt="Search Page Screenshot" width="600">
-  <img src="assets/result_page.png" alt="Search Page Screenshot" width="600">
+  <img src="https://github.com/Hassan-ach/boogle/blob/main/assets/search_page.png" alt="Search Page Screenshot" width="400">
+  <img src="https://github.com/Hassan-ach/boogle/blob/main/assets/result_page.png" alt="Search Page Screenshot" width="400">
+</div>
+
+## Architecture Overview
+
+<div align="center">
+  <img src="https://github.com/Hassan-ach/boogle/blob/main/assets/arch_design.png" alt="Architecture Diagram" width="800">
 </div>
 
 ## Quick Start

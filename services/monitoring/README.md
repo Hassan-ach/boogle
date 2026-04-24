@@ -2,8 +2,14 @@
 
 Watches the pipeline, manages service health, and exposes live metrics.
 
-**Language**: TypeScript (Node.js)  
+<div align="center">
+  <img src="https://github.com/Hassan-ach/boogle/blob/main/assets/monitoring.png" alt="Monitoring Dashboard" width="600"/>
+  <p><em>Live dashboard showing service status and metrics</em></p>
+  </div>
+
+**Language**: TypeScript (Node.js)
 **Purpose**: Orchestrate containers, detect failures, serve a live dashboard
+
 
 ## Quick Start
 
@@ -97,7 +103,7 @@ CLEANUP_EVERY_N_TICKS=4
 
 ## Dashboard
 
-The compiled dashboard lives in `static/` and is served statically at `/`.  
+The compiled dashboard lives in `static/` and is served statically at `/`.
 It polls `/metrics` every 5 seconds and renders live status cards for every service.
 
 ## Docker
@@ -110,8 +116,8 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
-> **Note**: The container requires `/var/run/docker.sock` mounted and  
-> `BOOGLE_PROJECT_ROOT` pointing to the project root (same absolute path as on the host).  
+> **Note**: The container requires `/var/run/docker.sock` mounted and
+> `BOOGLE_PROJECT_ROOT` pointing to the project root (same absolute path as on the host).
 > See [docker-compose.yml](docker-compose.yml) for a ready-made example.
 
 ## Details

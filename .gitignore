@@ -9,7 +9,6 @@ data/
 .env
 *.svg
 *.txt
-*.png
 # === Rust ===
 target/
 **/*.rs.bk

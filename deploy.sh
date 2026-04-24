@@ -108,6 +108,22 @@ bootstrap_env "$SVC/ranking"
 bootstrap_env "$SVC/monitoring"
 ok ".env files ready"
 
+# Update (or append) a KEY=value pair in a dotenv file.
+upsert_env_var() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  local escaped
+  # Escape only chars that are special in sed replacement with | delimiter.
+  escaped="$(printf '%s' "$value" | sed -e 's/[\\|&]/\\\\&/g')"
+
+  if grep -q "^${key}=" "$file"; then
+    sed -i "s|^${key}=.*|${key}=${escaped}|" "$file"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$file"
+  fi
+}
+
 # ── Fix monitoring .env compose paths to absolute paths ───────────────────────
 # The .env.example uses relative paths suited for local dev.
 # On the VPS those paths must point to BOOGLE_PROJECT_ROOT.
@@ -122,6 +138,30 @@ if grep -q '^\(ROOT\|ENGINE\|SPIDER\|INDEXER\|RANKING\)_COMPOSE_FILE=\.\.' "$MON
     -e "s|RANKING_COMPOSE_FILE=.*|RANKING_COMPOSE_FILE=${SVC}/ranking/docker-compose.yml|" \
     "$MONITORING_ENV"
   ok "Compose paths updated"
+fi
+
+# Keep monitoring runtime endpoints aligned with root infra credentials/ports.
+# This prevents bootstrap defaults from breaking monitor startup on VPS.
+ROOT_ENV="$ROOT/.env"
+if [[ -f "$ROOT_ENV" ]]; then
+  ROOT_PG_USER="$(grep -E '^PG_USER=' "$ROOT_ENV" | head -n1 | cut -d= -f2- || true)"
+  ROOT_PG_PASSWORD="$(grep -E '^PG_PASSWORD=' "$ROOT_ENV" | head -n1 | cut -d= -f2- || true)"
+  ROOT_PG_DBNAME="$(grep -E '^PG_DBNAME=' "$ROOT_ENV" | head -n1 | cut -d= -f2- || true)"
+  ROOT_PG_PORT="$(grep -E '^PG_PORT=' "$ROOT_ENV" | head -n1 | cut -d= -f2- || true)"
+  ROOT_REDIS_PORT="$(grep -E '^REDIS_PORT=' "$ROOT_ENV" | head -n1 | cut -d= -f2- || true)"
+
+  ROOT_PG_PORT="${ROOT_PG_PORT:-5432}"
+  ROOT_REDIS_PORT="${ROOT_REDIS_PORT:-6379}"
+
+  upsert_env_var "$MONITORING_ENV" "BOOGLE_PROJECT_ROOT" "$ROOT"
+
+  if [[ -n "$ROOT_PG_USER" && -n "$ROOT_PG_PASSWORD" && -n "$ROOT_PG_DBNAME" ]]; then
+    upsert_env_var "$MONITORING_ENV" "DATABASE_URL" \
+      "postgresql://${ROOT_PG_USER}:${ROOT_PG_PASSWORD}@localhost:${ROOT_PG_PORT}/${ROOT_PG_DBNAME}"
+  fi
+
+  upsert_env_var "$MONITORING_ENV" "REDIS_URL" "redis://localhost:${ROOT_REDIS_PORT}/1"
+  ok "Monitoring .env normalized for VPS deployment"
 fi
 
 # ── Docker network ────────────────────────────────────────────────────────────
@@ -199,11 +239,31 @@ BOOGLE_PROJECT_ROOT="$ROOT" \
   up -d $BUILD_FLAG
 ok "Monitoring running"
 
+# Verify monitoring is actually listening before reporting success.
+log "Waiting for monitoring health endpoint on :7070…"
+MONITOR_READY=false
+for i in $(seq 1 20); do
+  if curl -fsS "http://127.0.0.1:7070/health" >/dev/null 2>&1; then
+    MONITOR_READY=true
+    break
+  fi
+  sleep 1
+done
+
+if [[ "$MONITOR_READY" != "true" ]]; then
+  warn "Monitoring did not become healthy on :7070"
+  warn "Last monitoring logs:"
+  docker logs --tail 120 monitoring 2>&1 || true
+  die "Monitoring failed to bind :7070. See logs above."
+fi
+ok "Monitoring health endpoint is reachable"
+
 # ── Status summary ────────────────────────────────────────────────────────────
 echo ""
 echo -e "${BLD}── Container status ──────────────────────────────────────────${RST}"
 docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" \
-  --filter "network=$NETWORK" \
+  --filter "network=$NETWORK"
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" \
   --filter "name=monitoring"
 echo ""
 echo -e "${GRN}${BLD}Deploy complete.${RST}"
