@@ -5,6 +5,7 @@ import (
 
 	"github.com/Hassan-ach/boogle/services/engine/internal/config"
 	"github.com/Hassan-ach/boogle/services/engine/internal/handlers"
+	"github.com/Hassan-ach/boogle/services/engine/internal/service"
 	"github.com/Hassan-ach/boogle/services/engine/internal/service/ranking"
 	"github.com/Hassan-ach/boogle/services/engine/internal/service/spellchecker"
 	"github.com/Hassan-ach/boogle/services/engine/internal/store"
@@ -20,10 +21,12 @@ func main() {
 
 	store := store.NewStore(conf.Store)
 
+	var speller service.Speller
 	speller, err := spellchecker.NewAspellSpellingService()
 	if err != nil {
-		panic("failed to initialize speller: " + err.Error())
+		speller = spellchecker.NewDummySpellingService()
 	}
+
 	ranker := ranking.NewRankingService(conf.Ranker)
 
 	homeHandler := &handlers.HomeHandler{}
