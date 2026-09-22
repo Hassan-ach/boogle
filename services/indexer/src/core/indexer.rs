@@ -1,3 +1,4 @@
+use tokio::time;
 use tokio::time::sleep;
 use tokio::time::Duration;
 
@@ -68,7 +69,9 @@ impl<DBImpl: DB> Indexer<DBImpl> {
             }
             Err(err) => {
                 error!(self.log, "failed to fetch page for indexing"; "error" => err.to_string());
-                tk.cancel();
+
+                sleep(Duration::from_secs(5));
+                // tk.cancel();
             }
         };
     }

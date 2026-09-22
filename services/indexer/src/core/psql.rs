@@ -34,7 +34,7 @@ impl Psql {
 
 impl DB for Psql {
     async fn get_page(&self) -> Result<Page> {
-        let tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin().await?;
         // Create a query type mapping
         let query = sqlx::query_as::<_, Page>(
             "WITH cte AS (
@@ -51,7 +51,7 @@ impl DB for Psql {
             RETURNING pages.id, pages.url_id, pages.html",
         );
         // Fetch Optional row
-        let page = query.fetch_one(&self.pool).await?;
+        let page = query.fetch_one(&mut *tx).await?;
         tx.commit().await?;
         Ok(page)
     }
