@@ -71,7 +71,7 @@ func (s *Spider) Start(startUrls []string) {
 	for i := 0; i < s.config.App.MaxCrawlers; i++ {
 		s.wg.Add(1)
 		s.logger.Info("Starting worker", "component", "spider", "crawler_id", i)
-		go s.craller(i + 1)
+		go s.crawler(i + 1)
 	}
 }
 
@@ -85,7 +85,7 @@ func (s *Spider) Close() {
 	s.logger.Close()
 }
 
-func (s *Spider) craller(craller_id int) {
+func (s *Spider) crawler(crawler_id int) {
 	defer s.wg.Done()
 
 	ticker := time.NewTicker(s.crawlerDelay)
@@ -96,7 +96,7 @@ func (s *Spider) craller(craller_id int) {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
-			s.crawl(craller_id)
+			s.crawl(crawler_id)
 		}
 	}
 }

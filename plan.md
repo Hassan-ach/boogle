@@ -4,7 +4,7 @@
 
 ### Code quality
 - [ ] Fix existing TODOs and placeholders
-- [ ] Fix naming inconsistencies (`craller` → `crawler`)
+- [x] Fix naming inconsistencies (`craller` → `crawler`)
 - [ ] Fix incorrect formatting/error handling
 - [ ] Standardize service configuration
 - [ ] Remove dead/commented-out code
