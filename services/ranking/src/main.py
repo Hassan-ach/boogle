@@ -1,7 +1,9 @@
 import asyncio
 import json
 import logging
+import functools
 import time
+import signal
 from psql import get_graph_edges, persist_pagerank, NodeMapper
 from psql import initialize_connection_pool, close_connection_pool
 from plpgsql_pagerank import update_pagerank
@@ -96,6 +98,9 @@ async def run_idf():
         except Exception as e:
             logger.error(f"IDF job failed: {e}", exc_info=True)
 
+async def work():
+    await asyncio.gather(run_idf(), run_pagerank())
+
 async def main():
     configure_logging()
     load_dotenv()
@@ -114,8 +119,11 @@ async def main():
         logger.error(f"Failed to initialize connection pool: {e}")
         return
 
-    await run_idf()
-    await run_pagerank()
+    loop = asyncio.get_running_loop()
+    for signame in {signal.SIGINT, signal.SIGTERM}:
+        loop.add_signal_handler(signame, functools.partial(shutdown,signal.Signals(signame).name, loop))
+
+    await work()
 
 
 
