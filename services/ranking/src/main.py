@@ -4,12 +4,27 @@ import logging
 import time
 from psql import get_graph_edges, persist_pagerank, NodeMapper
 from psql import initialize_connection_pool, close_connection_pool
-from page_rank import pagerank
+from plpgsql_pagerank import update_pagerank
 from idf import idf
 from dotenv import load_dotenv
 import os
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
+
+shutdown_event = asyncio.Event()
+
+
+async def shutdown(signame, loop):
+    print(f"Received {signame}, shutting down...")
+    shutdown_event.set()
+
+    tasks = [
+        task
+        for task in asyncio.all_tasks(loop)
+        if task is not asyncio.current_task()
+    ]
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    loop.stop()
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -57,35 +72,29 @@ def validate_environment():
 
 
 async def run_pagerank():
-    try:
-        start_time = time.time()
-        logger.info("Starting PageRank calculation...")
-        m = NodeMapper()
-        edges = get_graph_edges(m)
-
-        if not edges:
-            logger.warning("No edges found in graph. Skipping PageRank calculation.")
-            return
-
-        pr = pagerank(edges)
-        persist_pagerank(m, pr)
-        
-        duration = time.time() - start_time
-        logger.info(f"PageRank calculation and persistence completed in {duration:.2f}s")
-    except Exception as e:
-        logger.error(f"PageRank job failed: {e}", exc_info=True)
+    while not shutdown_event.is_set():
+        try:
+            start_time = time.time()
+            logger.info("Starting PageRank calculation...")
+            update_pagerank()
+            
+            duration = time.time() - start_time
+            logger.info(f"PageRank calculation and persistence completed in {duration:.2f}s")
+        except Exception as e:
+            logger.error(f"PageRank job failed: {e}", exc_info=True)
 
 
 async def run_idf():
-    try:
-        start_time = time.time()
-        logger.info("Starting IDF calculation...")
-        idf()
-        
-        duration = time.time() - start_time
-        logger.info(f"IDF calculation completed in {duration:.2f}s")
-    except Exception as e:
-        logger.error(f"IDF job failed: {e}", exc_info=True)
+    while not shutdown_event.is_set():
+        try:
+            start_time = time.time()
+            logger.info("Starting IDF calculation...")
+            idf()
+            
+            duration = time.time() - start_time
+            logger.info(f"IDF calculation completed in {duration:.2f}s")
+        except Exception as e:
+            logger.error(f"IDF job failed: {e}", exc_info=True)
 
 async def main():
     configure_logging()
@@ -104,50 +113,9 @@ async def main():
     except Exception as e:
         logger.error(f"Failed to initialize connection pool: {e}")
         return
-    
-    pr_schedule = os.getenv("PR_SCHEDULE", "0 0 * * *")  
-    idf_schedule = os.getenv("IDF_SCHEDULE", "0 1 * * *")  
-    run_on_startup = os.getenv("BACK_LINKS_RUN_ON_STARTUP", "true").lower() == "true"
 
-    logger.info(f"Configuration: PR_SCHEDULE='{pr_schedule}', IDF_SCHEDULE='{idf_schedule}', RUN_ON_STARTUP={run_on_startup}")
-
-    if run_on_startup:
-        logger.info("Running initial calculations on startup...")
-        await run_pagerank()
-        await run_idf()
-
-    # scheduler = AsyncIOScheduler()
-    #
-    # scheduler.add_job(
-    #    run_pagerank,
-    #    trigger=CronTrigger.from_crontab(pr_schedule),
-    #    id='pagerank_job',
-    #    name='PageRank Calculation',
-    #    max_instances=1,
-    #    replace_existing=True
-    # )
-    #
-    # scheduler.add_job(
-    #     run_idf,
-    #     trigger=CronTrigger.from_crontab(idf_schedule),
-    #     id="idf_job",
-    #     name="IDF Calculation",
-    #     max_instances=1,
-    #     replace_existing=True
-    # )
-    #
-    # scheduler.start()
-    # logger.info(f"Scheduler started with PageRank schedule: '{pr_schedule}' and IDF schedule: '{idf_schedule}'")
-    # 
-    # # Keep running forever
-    # try:
-    #     while True:
-    #         await asyncio.sleep(3600)
-    # except asyncio.CancelledError:
-    #     logger.info("Shutting down...")
-    #     scheduler.shutdown()
-    #     close_connection_pool()
-
+    await run_idf()
+    await run_pagerank()
 
 
 

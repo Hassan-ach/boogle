@@ -52,9 +52,6 @@ def retry_on_db_error(max_retries=3, delay=1.0, backoff=2.0):
                     # Don't retry on non-transient errors
                     logger.error(f"Database operation failed with non-retryable error: {e}")
                     raise
-            
-            # Shouldn't reach here, but just in case
-            raise last_exception
         
         return wrapper
     return decorator
