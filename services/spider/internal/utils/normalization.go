@@ -246,3 +246,22 @@ func isDisallowed(path string, disallowed []string) bool {
 	}
 	return false
 }
+
+func IsDisallowed(path string, disallowed []string) bool {
+	for _, d := range disallowed {
+		if d == "" {
+			continue
+		}
+		// Check for regex or prefix pattern
+		if strings.ContainsAny(d, `.^$*+?[]|()`) {
+			if matched, _ := regexp.MatchString(d, path); matched {
+				return true
+			}
+		} else {
+			if strings.HasPrefix(path, d) {
+				return true
+			}
+		}
+	}
+	return false
+}

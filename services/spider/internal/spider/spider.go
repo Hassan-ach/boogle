@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -170,6 +171,11 @@ func (s *Spider) crawl(crawler_id int) {
 				len(host.AllowedUrls),
 			)
 		}
+	}
+
+	if utils.IsDisallowed(u.Path, host.NotAllowedPaths) {
+		logger.Info("URL path is disallowed by robots.txt, skipping", "url", rawUrl, "path", u.Path)
+		return
 	}
 
 	page, err := s.fetchAndParse(rawUrl, host.MaxRetry, host.Delay)
