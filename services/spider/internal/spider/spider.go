@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -48,7 +47,7 @@ func NewSpider(conf *config.Config) *Spider {
 		ctx:            ctx,
 		cancel:         cancel,
 		crawlerTimeout: time.Duration(conf.App.CrawlerTimeout) * time.Second,
-		crawlerDelay:   time.Duration(conf.App.ClawlerDelay) * time.Microsecond,
+		crawlerDelay:   time.Duration(conf.App.ClawlerDelay) * time.Millisecond,
 		fetchpool:      make(chan struct{}, conf.App.MaxConcurrentFetch),
 		logger:         logger,
 	}

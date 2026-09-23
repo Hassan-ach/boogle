@@ -1,14 +1,11 @@
 package utils
 
 import (
-	"errors"
-	"net/http"
 	"net/url"
 	"regexp"
 	"slices"
 	"sort"
 	"strings"
-	"time"
 	"unicode/utf8"
 )
 
@@ -193,26 +190,6 @@ func forceEnglishSubdomain(u *url.URL) {
 	if isLang {
 		u.Host = "en." + rest
 	}
-}
-
-func CheckURLExists(rawURL string) bool {
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return errors.New("too many redirects")
-			}
-			return nil
-		},
-	}
-
-	resp, err := client.Head(rawURL)
-	if err != nil {
-		return false
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	return resp.StatusCode >= 200 && resp.StatusCode < 400
 }
 
 func ValidateLinks(links []string, disallowed []string) []string {

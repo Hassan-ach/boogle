@@ -131,26 +131,6 @@ func (c *RedisClient) GetUrl(ctx context.Context) (string, bool, error) {
 	return "", false, fmt.Errorf("no valid URL after %d retries err: %w", c.maxRetry, err)
 }
 
-// AddUrls adds multiple URLs to Redis sorted set.
-// func (c *RedisClient) AddUrls(ctx context.Context, urls []string) error {
-// 	if len(urls) == 0 {
-// 		return nil
-// 	}
-//
-// 	pipe := c.conn.Pipeline()
-//
-// 	for _, u := range urls {
-// 		pipe.ZIncrBy(ctx, "urls", 1, u)
-// 	}
-//
-// 	_, err := pipe.Exec(ctx)
-// 	if err != nil {
-// 		return fmt.Errorf("add URLs: %w", err)
-// 	}
-//
-// 	return nil
-// }
-
 func (c *RedisClient) AddUrls(ctx context.Context, urls []string) error {
 	if len(urls) == 0 {
 		return nil
