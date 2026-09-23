@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -36,6 +37,9 @@ func (p *Parser) ParseHTML(r io.Reader, baseURL string) (*entity.Page, error) {
 	u, _ := url.Parse(baseURL)
 
 	c := newHtmlCollector(u)
+	if skipNonEnglish(doc) {
+		return nil, fmt.Errorf("non-English content detected, skipping")
+	}
 	traverse(doc, c.Visit)
 
 	desc := strings.TrimSpace(c.TextBuffer.String())
