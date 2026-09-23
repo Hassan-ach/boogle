@@ -91,6 +91,9 @@ func (p *Parser) ParseRobots(txt, ua string) *entity.Robots {
 		case strings.HasPrefix(lower, "user-agent:"):
 			userAgent := strings.TrimSpace(line[11:])
 			uaActive = (userAgent == ua || userAgent == "*")
+		case strings.HasPrefix(lower, "sitemap:"):
+			sitemapURL := strings.TrimSpace(line[8:])
+			r.SiteMaps = append(r.SiteMaps, sitemapURL)
 		case uaActive:
 			switch {
 			case strings.HasPrefix(lower, "disallow:"):
@@ -104,10 +107,6 @@ func (p *Parser) ParseRobots(txt, ua string) *entity.Robots {
 					r.CrawlDelay = d
 				}
 			}
-
-		case strings.HasPrefix(lower, "sitemap:"):
-			sitemapURL := strings.TrimSpace(line[8:])
-			r.SiteMaps = append(r.SiteMaps, sitemapURL)
 		}
 	}
 	return r
