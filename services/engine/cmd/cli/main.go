@@ -25,7 +25,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	conf, err := config.LoadConfig("")
+	conf, err := config.LoadConfig()
 	if err != nil {
 		panic("failed to load config: " + err.Error())
 	}

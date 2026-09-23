@@ -45,7 +45,7 @@ impl TreeSink for TextSink {
         for text in self.texts.into_inner() {
             for word in text.to_lowercase().split_whitespace().filter_map(|w| {
                 let trimed_word = w.trim_matches(|c: char| {
-                    c.is_whitespace() || matches!(c, '.' | ',' | ':' | '/' | ';' | '"' | '\'')
+                    c.is_whitespace() || matches!(c, '.' | ',' | ':' | '/' | ';' | '"' | '\'' | '!' | '?' | '(' | ')' | '[' | ']')
                 });
                 if trimed_word.is_empty() || trimed_word.parse::<u32>().is_ok() {
                     return None;
@@ -170,3 +170,54 @@ impl TreeSink for TextSink {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_parse_html_word_count() {
+        let html = r#"
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <style>body { color: red; }</style>
+                <script>console.log("ignore me");</script>
+            </head>
+            <body>
+                <h1>Search Engine Indexer</h1>
+                <p>Boogle is a search engine. Search engine indexing is fast!</p>
+            </body>
+            </html>
+        "#;
+
+        let words = parse(html.to_string()).await.unwrap();
+
+        assert_eq!(words.get("search"), Some(&3));
+        assert_eq!(words.get("engine"), Some(&3));
+        assert_eq!(words.get("boogle"), Some(&1));
+        assert_eq!(words.get("indexer"), Some(&1));
+        // script and style content should be ignored
+        assert_eq!(words.get("color"), None);
+        assert_eq!(words.get("console"), None);
+    }
+
+    #[tokio::test]
+    async fn test_parse_html_filters_numbers_and_symbols() {
+        let html = r#"
+            <!DOCTYPE html>
+            <html>
+            <head><title>Test</title></head>
+            <body>
+                <p>Version 1234 test!</p>
+            </body>
+            </html>
+        "#;
+        let words = parse(html.to_string()).await.unwrap();
+
+        assert_eq!(words.get("version"), Some(&1));
+        assert_eq!(words.get("test"), Some(&2)); // 1 from title, 1 from p
+        assert_eq!(words.get("1234"), None);
+    }
+}
+

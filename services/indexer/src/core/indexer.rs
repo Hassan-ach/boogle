@@ -70,7 +70,7 @@ impl<DBImpl: DB> Indexer<DBImpl> {
             Err(err) => {
                 error!(self.log, "failed to fetch page for indexing"; "error" => err.to_string());
 
-                sleep(Duration::from_secs(5));
+                sleep(Duration::from_secs(5)).await;
                 // tk.cancel();
             }
         };
