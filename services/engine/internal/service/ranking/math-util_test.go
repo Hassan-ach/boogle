@@ -5,94 +5,102 @@ import (
 	"testing"
 )
 
-func TestCosineSimilarity(t *testing.T) {
-	tests := []struct {
-		name   string
-		inputA []float64
-		inputB []float64
-		want   float64
-	}{
-		{
-			name:   "cosine similarity of two vectors",
-			inputA: []float64{3, 2, 0, 5},
-			inputB: []float64{1, 0, 0, 0},
-			want:   0.49,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := cosineSimilarity(tt.inputA, tt.inputB)
-
-			if math.Abs(got-tt.want) > 0.01 {
-				t.Errorf("cosineSimilarity() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestDotProduct(t *testing.T) {
-
 	tests := []struct {
-		name   string
-		inputA []float64
-		inputB []float64
-		want   float64
+		name     string
+		vecA     []float64
+		vecB     []float64
+		expected float64
 	}{
 		{
-			name:   "dot product of two vectors",
-			inputA: []float64{1, 2, 3},
-			inputB: []float64{4, 5, 6},
-			want:   32,
+			name:     "identical non-zero vectors",
+			vecA:     []float64{1.0, 2.0, 3.0},
+			vecB:     []float64{1.0, 2.0, 3.0},
+			expected: 14.0, // 1*1 + 2*2 + 3*3 = 14
 		},
 		{
-			name:   "dot product of two vectors with negative values",
-			inputA: []float64{-1, -2, -3},
-			inputB: []float64{-4, -5, -6},
-			want:   32,
+			name:     "orthogonal vectors",
+			vecA:     []float64{1.0, 0.0},
+			vecB:     []float64{0.0, 1.0},
+			expected: 0.0,
+		},
+		{
+			name:     "empty vectors",
+			vecA:     []float64{},
+			vecB:     []float64{},
+			expected: 0.0,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-
-			got := dotProduct(tt.inputA, tt.inputB)
-			if got != tt.want {
-				t.Errorf("dotProduct() = %v, want %v", got, tt.want)
+			got := dotProduct(tt.vecA, tt.vecB)
+			if math.Abs(got-tt.expected) > 1e-9 {
+				t.Errorf("dotProduct() = %v, expected %v", got, tt.expected)
 			}
 		})
 	}
 }
 
 func TestMagnitude(t *testing.T) {
-
 	tests := []struct {
-		name  string
-		input []float64
-		want  float64
+		name     string
+		vec      []float64
+		expected float64
 	}{
 		{
-			name:  "magnitude of zero vector",
-			input: []float64{0, 0, 0},
-			want:  0,
+			name:     "3D vector (3, 4, 0)",
+			vec:      []float64{3.0, 4.0, 0.0},
+			expected: 5.0,
 		},
 		{
-			name:  "magnitude of unit vector",
-			input: []float64{1, 0, 0},
-			want:  1,
+			name:     "zero vector",
+			vec:      []float64{0.0, 0.0},
+			expected: 0.0,
 		},
 		{
-			name:  "magnitude of vector with negative values",
-			input: []float64{-3, -4},
-			want:  5,
+			name:     "empty vector",
+			vec:      []float64{},
+			expected: 0.0,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := magnitude(tt.input)
-			if got != tt.want {
-				t.Errorf("magnitude() = %v, want %v", got, tt.want)
+			got := magnitude(tt.vec)
+			if math.Abs(got-tt.expected) > 1e-9 {
+				t.Errorf("magnitude() = %v, expected %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestCosineSimilarity(t *testing.T) {
+	tests := []struct {
+		name     string
+		vecA     []float64
+		vecB     []float64
+		expected float64
+	}{
+		{
+			name:     "parallel vectors",
+			vecA:     []float64{1.0, 2.0},
+			vecB:     []float64{2.0, 4.0},
+			expected: 1.0,
+		},
+		{
+			name:     "orthogonal vectors",
+			vecA:     []float64{1.0, 0.0},
+			vecB:     []float64{0.0, 1.0},
+			expected: 0.0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := cosineSimilarity(tt.vecA, tt.vecB)
+			if math.Abs(got-tt.expected) > 1e-9 {
+				t.Errorf("cosineSimilarity() = %v, expected %v", got, tt.expected)
 			}
 		})
 	}
