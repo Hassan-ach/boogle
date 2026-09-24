@@ -1,6 +1,6 @@
 CREATE OR REPLACE FUNCTION update_page_rank(
     max_iterations INTEGER DEFAULT 20,
-    damping_factor FLOAT DEFAULT 0.85,
+    damping_factor FLOAT DEFAULT 0.85
 ) 
 RETURNS TABLE (url_id UUID, rank FLOAT) AS $$
 DECLARE node_num INT;
@@ -21,7 +21,7 @@ BEGIN
     INSERT INTO temp_page_rank (url_id, score)
     SELECT id, 1.0 / node_num FROM urls;
 
-    FRO i IN 1..max_iterations LOOP
+    FOR i IN 1..max_iterations LOOP
     WITH calculated AS (
         SELECT
             u.id,
