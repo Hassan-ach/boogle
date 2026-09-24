@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
+	"uuid"
 
 	"github.com/Hassan-ach/boogle/services/spider/internal/config"
 	"github.com/Hassan-ach/boogle/services/spider/internal/entity"
+	"github.com/Hassan-ach/boogle/services/spider/internal/messaging"
 	"github.com/Hassan-ach/boogle/services/spider/internal/parser"
 	"github.com/Hassan-ach/boogle/services/spider/internal/store"
 	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
@@ -21,6 +24,7 @@ type Spider struct {
 	config     *config.Config
 	httpClient *http.Client
 	store      *store.Store
+	mq         messaging.MessagingQueue
 	parser     *parser.Parser
 
 	wg             sync.WaitGroup
@@ -36,11 +40,17 @@ type Spider struct {
 func NewSpider(conf *config.Config) *Spider {
 	httpClient := &http.Client{Timeout: time.Duration(conf.App.HttpTimeout) * time.Second}
 	logger := utils.NewMultiLogger(conf.App.LogsPath)
+
+	mq, err := messaging.NewRabbitMQ(&conf.RabbitMq, logger)
+	if err != nil {
+		log.Fatal("Failed to initialize RabbitMQ", "error", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Spider{
 		config:         conf,
 		httpClient:     httpClient,
+		mq:             mq,
 		parser:         parser.NewParser(httpClient, logger),
 		store:          store.NewStore(conf.Store, logger),
 		wg:             sync.WaitGroup{},
@@ -106,6 +116,13 @@ func (s *Spider) crawl(crawler_id int) {
 	defer cancel()
 
 	logger := s.logger.With("component", "crawler", "crawler_id", crawler_id)
+
+	queue, err := s.mq.NewMessagingChannel()
+	if err != nil {
+		logger.Error("Failed to create messaging channel", "error", err)
+		return
+	}
+	defer queue.Close()
 
 	select {
 	case s.fetchpool <- struct{}{}:
@@ -200,7 +217,22 @@ func (s *Spider) crawl(crawler_id int) {
 	page.Links = normUrls
 
 	host.PagesCrawled++
-	s.store.Persist(ctx, page, host)
+	pageId := s.store.Persist(ctx, page, host)
+	if pageId == uuid.Nil() {
+		return
+	}
+	err = queue.Publish(
+		"indexer.jobs",
+		messaging.NewIndexerJobPayload(pageId.String()),
+	)
+
+	if err != nil {
+		s.logger.Error(
+			"Failed to publish job to indexer queue",
+			"url", page.URL, "error", err,
+		)
+	}
+
 }
 
 func (s *Spider) fetchAndParse(

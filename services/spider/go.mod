@@ -1,9 +1,10 @@
 module github.com/Hassan-ach/boogle/services/spider
 
-go 1.24.4
+go 1.27
 
 require (
 	github.com/lib/pq v1.10.9
+	github.com/rabbitmq/amqp091-go v1.15.0
 	github.com/redis/go-redis/v9 v9.14.0
 	golang.org/x/net v0.44.0
 )

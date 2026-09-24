@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"uuid"
 
 	"github.com/Hassan-ach/boogle/services/spider/internal/config"
 	"github.com/Hassan-ach/boogle/services/spider/internal/entity"
@@ -22,7 +23,7 @@ type Cache interface {
 	Close()
 }
 type DB interface {
-	InsertPage(ctx context.Context, tx *sql.Tx, page *entity.Page) error
+	InsertPage(ctx context.Context, tx *sql.Tx, page *entity.Page) (uuid.UUID, error)
 	InsertGraphEdges(ctx context.Context, tx *sql.Tx, from_url_id string, to_url_ids []string) error
 	InsertURLs(ctx context.Context, tx *sql.Tx, urls []string) ([]string, error)
 	WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error
@@ -52,31 +53,32 @@ func (s *Store) GetCache() Cache {
 	return s.cache
 }
 
-func (s *Store) Persist(ctx context.Context, page *entity.Page, host *entity.Host) {
+func (s *Store) Persist(ctx context.Context, page *entity.Page, host *entity.Host) uuid.UUID {
 	s.log.Info("Persisting page and host metadata", "url", page.URL, "host", host.Name)
 	s.persistHost(ctx, host)
-	err := s.persistPage(ctx, page)
+	pageID, err := s.persistPage(ctx, page)
 	if err != nil {
 		s.log.Error("persist page data", "url", page.URL, "error", err)
-		return
+		return pageID
 	}
+	return pageID
 }
 
-func (s *Store) persistPage(ctx context.Context, page *entity.Page) error {
+func (s *Store) persistPage(ctx context.Context, page *entity.Page) (pageID uuid.UUID, err error) {
 	s.log.Info("Persisting page data", "url", page.URL)
 
-	if err := s.db.WithTx(ctx, func(tx *sql.Tx) error {
-		if err := s.db.InsertPage(ctx, tx, page); err != nil {
+	if err = s.db.WithTx(ctx, func(tx *sql.Tx) error {
+		if pageID, err = s.db.InsertPage(ctx, tx, page); err != nil {
 			s.log.Error("insert page into database", "url", page.URL, "err", err)
 			return fmt.Errorf("insert page: %w", err)
 		}
 		return nil
 	}); err != nil {
 		s.log.Warn("failed to persist page", "url", page.URL, "err", err)
-		return fmt.Errorf("persist page in database: %w", err)
+		return pageID, fmt.Errorf("persist page in database: %w", err)
 	}
 
-	if err := s.db.WithTx(ctx, func(tx *sql.Tx) error {
+	if err = s.db.WithTx(ctx, func(tx *sql.Tx) error {
 		ids, err := s.db.InsertURLs(
 			ctx,
 			tx,
@@ -92,18 +94,18 @@ func (s *Store) persistPage(ctx context.Context, page *entity.Page) error {
 		return nil
 	}); err != nil {
 		s.log.Warn("", "url", page.URL, "err", err)
-		return err
+		return pageID, err
 	}
-	err := s.cache.MarkVisited(ctx, page.URL)
+	err = s.cache.MarkVisited(ctx, page.URL)
 	if err != nil {
 		s.log.Warn("add URL to visited set", "url", page.URL, "error", err)
-		return err
+		return pageID, err
 	}
 	err = s.cache.AddUrls(ctx, page.Links)
 	if err != nil {
 		s.log.Warn("add linked URLs to cache", "url", page.URL, "error", err)
 	}
-	return nil
+	return pageID, nil
 }
 
 func (s *Store) persistHost(ctx context.Context, host *entity.Host) {

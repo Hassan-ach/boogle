@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"uuid"
 
 	_ "github.com/lib/pq"
 
@@ -80,7 +81,7 @@ func (c *SQLClient) WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error
 }
 
 // Page stores a crawled page in the "pages" table.
-func (c *SQLClient) InsertPage(ctx context.Context, tx *sql.Tx, page *entity.Page) error {
+func (c *SQLClient) InsertPage(ctx context.Context, tx *sql.Tx, page *entity.Page) (uuid.UUID, error) {
 	var url_id string
 	err := tx.QueryRowContext(ctx,
 		`WITH ins AS (
@@ -95,26 +96,29 @@ func (c *SQLClient) InsertPage(ctx context.Context, tx *sql.Tx, page *entity.Pag
 		LIMIT 1;`,
 		page.URL).Scan(&url_id)
 	if err != nil {
-		return fmt.Errorf("upsert url: %w", err)
+		return uuid.Nil(), fmt.Errorf("upsert url: %w", err)
 	}
 
 	metadata, err := json.Marshal(page.MetaData)
 	if err != nil {
-		return fmt.Errorf("marshal metadata: %w", err)
+		return uuid.Nil(), fmt.Errorf("marshal metadata: %w", err)
 	}
 
-	_, err = tx.ExecContext(ctx,
+	var id uuid.UUID
+
+	err = tx.QueryRowContext(ctx,
 		`INSERT INTO pages(url_id, html, metadata) VALUES ($1,$2,$3)
-			ON CONFLICT (url_id) DO NOTHING`,
+		ON CONFLICT (url_id) DO UPDATE SET metadata = EXCLUDED.metadata
+		RETURNING id;`,
 		url_id,
 		page.HTML,
 		metadata,
-	)
+	).Scan(&id)
 	if err != nil {
-		return fmt.Errorf("insert page : %w", err)
+		return uuid.Nil(), fmt.Errorf("insert page : %w", err)
 	}
 
-	return nil
+	return id, nil
 }
 
 // InsertGraphEdges from page id → many page ids

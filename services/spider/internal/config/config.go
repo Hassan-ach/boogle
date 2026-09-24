@@ -7,6 +7,14 @@ import (
 	"time"
 )
 
+type RabbitMqConfig struct {
+	Protocol string
+	User     string
+	Password string
+	Host     string
+	Port     int
+}
+
 type RedisConfig struct {
 	Addr     string
 	Password string
@@ -48,19 +56,38 @@ type AppConfig struct {
 }
 
 type Config struct {
-	App   AppConfig
-	Store StoreConfig
+	App      AppConfig
+	Store    StoreConfig
+	RabbitMq RabbitMqConfig
 }
 
 func LoadConfig() (*Config, error) {
 	c := &Config{
-		App:   loadAppConfig(),
-		Store: loadStoreConfig(),
+		App:      loadAppConfig(),
+		Store:    loadStoreConfig(),
+		RabbitMq: loadRabbitMqConfig(),
 	}
 
 	fmt.Printf("%+v\n", c)
 
 	return c, nil
+}
+
+func loadRabbitMqConfig() RabbitMqConfig {
+
+	protocol := getWithDefault("RABBITMQ_PROTOCOL", "amqp")
+	user := getWithDefault("RABBITMQ_USER", "guest")
+	password := getWithDefault("RABBITMQ_PASSWORD", "guest")
+	host := getWithDefault("RABBITMQ_HOST", "localhost")
+	port := getIntWithDefault("RABBITMQ_PORT", 5672)
+
+	return RabbitMqConfig{
+		protocol,
+		user,
+		password,
+		host,
+		port,
+	}
 }
 
 func loadStoreConfig() StoreConfig {
