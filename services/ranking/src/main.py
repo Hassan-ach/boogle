@@ -1,34 +1,20 @@
-import asyncio
 import json
 import logging
-import functools
-import time
 import signal
-from psql import get_graph_edges, persist_pagerank, NodeMapper
-from psql import initialize_connection_pool, close_connection_pool
-from plpgsql_pagerank import update_pagerank
-from idf import idf
-from dotenv import load_dotenv
+import asyncio
 import os
+from dotenv import load_dotenv
 
-shutdown_event = asyncio.Event()
+from psql import DatabaseManager
+from calculator import RankingCalculator
+from messaging import MessagingService
 
+logger = logging.getLogger(__name__)
 
-async def shutdown(signame, loop):
-    print(f"Received {signame}, shutting down...")
-    shutdown_event.set()
-
-    tasks = [
-        task
-        for task in asyncio.all_tasks(loop)
-        if task is not asyncio.current_task()
-    ]
-
-    await asyncio.gather(*tasks, return_exceptions=True)
-
-    loop.stop()
 
 class JsonFormatter(logging.Formatter):
+    """Custom JSON log formatter."""
+
     def format(self, record: logging.LogRecord) -> str:
         payload = {
             "service": "ranking",
@@ -37,105 +23,112 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
-
         if record.exc_info:
             payload["error"] = self.formatException(record.exc_info)
-
         return json.dumps(payload, ensure_ascii=True)
 
 
-def configure_logging() -> None:
-    if logging.getLogger().handlers:
-        return
+class RankingService:
+    """Main application orchestrator for the Ranking Service."""
 
-    handlers: list[logging.Handler] = [
-        logging.FileHandler("ranking.log"),
-        logging.StreamHandler(),
-    ]
-    formatter = JsonFormatter()
+    def __init__(self):
+        self.db_manager = DatabaseManager(min_conn=2, max_conn=10)
+        self.calculator = RankingCalculator(self.db_manager)
+        self.messaging = MessagingService()
 
-    for handler in handlers:
-        handler.setFormatter(formatter)
+    @staticmethod
+    def configure_logging() -> None:
+        if logging.getLogger().handlers:
+            return
 
-    logging.basicConfig(level=logging.INFO, handlers=handlers)
+        handlers: list[logging.Handler] = [
+            logging.FileHandler("ranking.log"),
+            logging.StreamHandler(),
+        ]
+        formatter = JsonFormatter()
+        for handler in handlers:
+            handler.setFormatter(formatter)
 
-logger = logging.getLogger(__name__)
+        logging.basicConfig(level=logging.INFO, handlers=handlers)
 
+    @staticmethod
+    def validate_environment() -> None:
+        """Validate required environment variables."""
+        required_vars = [
+            "PG_HOST",
+            "PG_PORT",
+            "PG_DBNAME",
+            "PG_USER",
+            "PG_PASSWORD",
+        ]
+        missing_vars = [
+            var
+            for var in required_vars
+            if not os.getenv(var) and not os.getenv("DATABASE_URL")
+        ]
 
-def validate_environment():
-    """Validate that all required environment variables are set."""
-    required_vars = ['PG_HOST', 'PG_PORT', 'PG_DBNAME', 'PG_USER', 'PG_PASSWORD']
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
-    
-    if missing_vars:
-        raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
-    
-    logger.info("Environment variables validated successfully")
+        if missing_vars:
+            raise ValueError(
+                f"Missing required database environment variables: {', '.join(missing_vars)}"
+            )
 
+        broker_url = os.getenv("BROKER_URL") or os.getenv("RABBITMQ_URL")
+        if not broker_url:
+            raise ValueError(
+                "Missing BROKER_URL or RABBITMQ_URL environment variable"
+            )
 
-async def run_pagerank():
-    while not shutdown_event.is_set():
+        logger.info("Environment variables validated successfully")
+
+    def setup_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Configure graceful shutdown signal handlers."""
+
+        for signame in {signal.SIGINT, signal.SIGTERM}:
+            loop.add_signal_handler(
+                signame,
+                lambda sig=signame: asyncio.create_task(
+                    self.shutdown(signal.Signals(sig).name)
+                ),
+            )
+
+    async def shutdown(self, signame: str) -> None:
+        logger.info(f"Received signal {signame}, shutting down RankingService...")
+        await self.db_manager.close()
+
+    async def start(self) -> None:
+        """Initialize resources, bind handlers, and start service consumer loop."""
+        self.configure_logging()
+        load_dotenv()
+        self.validate_environment()
+
+        logger.info("Initializing Database Connection Pool...")
+        await self.db_manager.initialize()
+
+        loop = asyncio.get_running_loop()
+        self.setup_signal_handlers(loop)
+
+        # Register calculator pipeline to messaging threshold callback
+        self.messaging.register_pipeline_handler(self.calculator.run_pipeline)
+
+        logger.info("Starting Ranking Service FastStream Consumer...")
         try:
-            start_time = time.time()
-            logger.info("Starting PageRank calculation...")
-            update_pagerank()
-            
-            duration = time.time() - start_time
-            logger.info(f"PageRank calculation and persistence completed in {duration:.2f}s")
-        except Exception as e:
-            logger.error(f"PageRank job failed: {e}", exc_info=True)
+            await self.messaging.run()
+        finally:
+            await self.db_manager.close()
 
 
-async def run_idf():
-    while not shutdown_event.is_set():
-        try:
-            start_time = time.time()
-            logger.info("Starting IDF calculation...")
-            idf()
-            
-            duration = time.time() - start_time
-            logger.info(f"IDF calculation completed in {duration:.2f}s")
-        except Exception as e:
-            logger.error(f"IDF job failed: {e}", exc_info=True)
-
-async def work():
-    await asyncio.gather(run_idf(), run_pagerank())
-
-async def main():
-    configure_logging()
+def main():
     load_dotenv()
-    
-    # Validate environment variables
+    service = RankingService()
     try:
-        validate_environment()
-    except ValueError as e:
-        logger.error(f"Configuration error: {e}")
-        return
-    
-    # Initialize connection pool
-    try:
-        initialize_connection_pool(minconn=2, maxconn=10)
-    except Exception as e:
-        logger.error(f"Failed to initialize connection pool: {e}")
-        return
-
-    loop = asyncio.get_running_loop()
-    for signame in {signal.SIGINT, signal.SIGTERM}:
-        loop.add_signal_handler(signame, functools.partial(shutdown,signal.Signals(signame).name, loop))
-
-    await work()
-
-
-
-if __name__ == "__main__":
-    try:
-        configure_logging()
-        logger.info("Starting ranking Service...")
-        asyncio.run(main())
+        service.configure_logging()
+        logger.info("Starting Ranking Service application...")
+        asyncio.run(service.start())
     except KeyboardInterrupt:
         logger.info("Service stopped by user")
     except Exception as e:
         logger.error(f"Service failed with error: {e}", exc_info=True)
-    finally:
-        close_connection_pool()
 
+
+if __name__ == "__main__":
+    main()
