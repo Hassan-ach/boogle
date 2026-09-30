@@ -117,13 +117,14 @@ impl DB for Psql {
             return Ok(());
         }
 
-        let map = match batch_upsert_words(
-            &self.pool,
-            words.clone().into_keys().collect(),
-            self.conf.word_batch_size,
-            &self.log,
-        )
-        .await
+        // Sort so every concurrent worker inserts the same keys in the same order.
+        // HashMap iteration order is randomized per task, which makes concurrent
+        // INSERT ... ON CONFLICT speculative-insertion locks deadlock.
+        let mut keys: Vec<String> = words.keys().cloned().collect();
+        keys.sort_unstable();
+
+        let map = match batch_upsert_words(&self.pool, keys, self.conf.word_batch_size, &self.log)
+            .await
         {
             Ok(m) => m,
 
@@ -313,7 +314,10 @@ async fn link_words_to_page(
         return Ok(());
     }
 
-    let entries: Vec<_> = word_id_count.iter().collect();
+    // Same ordering guarantee as the word upsert, so concurrent workers never
+    // grab page_word locks in conflicting orders.
+    let mut entries: Vec<_> = word_id_count.iter().collect();
+    entries.sort_unstable_by_key(|(id, _)| **id);
 
     for chunk in entries.chunks(batch_size) {
         match retry_async(max_retries, || async {
