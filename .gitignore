@@ -32,6 +32,8 @@ coverage/
 *.dylib
 *.out
 *_templ.go
+logs.json
+.sqlx/
 
 # === Python ===
 !requirements.txt
