@@ -5,6 +5,36 @@ from psql import DatabaseManager, retry_on_db_error
 
 logger = logging.getLogger(__name__)
 
+# Recompute IDF for every word that appears on at least one page.
+#
+# Two things matter here and both were wrong before:
+#
+#   * The ratio must be computed in numeric, not integer arithmetic. `pages.id`
+#     and the `df` count are both bigint, so `378 / 352` truncated to 1 and
+#     LOG(1) is 0 -- every common word was stored with an IDF of exactly zero.
+#   * The logarithm argument must never be zero. On an empty corpus
+#     `COUNT(*) FROM pages` is 0, and `LOG(0)` raises
+#     "cannot take logarithm of zero", which is not retryable and takes the whole
+#     pipeline down. GREATEST(..., 1) floors the corpus size at 1 so the
+#     statement degrades to "every word is maximally rare" instead of erroring.
+IDF_UPDATE_SQL = """
+    WITH corpus AS (
+        SELECT GREATEST(COUNT(*), 1)::numeric AS n
+        FROM pages
+    ),
+    doc_freq AS (
+        SELECT word_id, COUNT(DISTINCT page_id) AS df
+        FROM page_word
+        GROUP BY word_id
+    )
+    UPDATE words
+    SET idf = LOG((SELECT n FROM corpus) / GREATEST(df.df + 1, 1))
+    FROM doc_freq df
+    WHERE words.id = df.word_id
+"""
+
+PAGERANK_UPDATE_SQL = "SELECT update_page_rank(%s, %s);"
+
 
 class RankingCalculator:
     """Handles IDF and PageRank computation algorithms against PostgreSQL."""
@@ -21,16 +51,7 @@ class RankingCalculator:
         async with self.db_manager.get_connection() as conn:
             try:
                 async with conn.cursor() as cursor:
-                    await cursor.execute("""
-                        UPDATE words
-                        SET idf = LOG((SELECT COUNT(*) FROM pages) / (1 + sub.df))
-                        FROM (
-                            SELECT word_id, COUNT(DISTINCT page_id) AS df
-                            FROM page_word
-                            GROUP BY word_id
-                        ) sub
-                        WHERE words.id = sub.word_id
-                    """)
+                    await cursor.execute(IDF_UPDATE_SQL)
                     affected_rows = cursor.rowcount
 
                 await conn.commit()
@@ -56,7 +77,7 @@ class RankingCalculator:
             try:
                 async with conn.cursor() as cursor:
                     await cursor.execute(
-                        "SELECT update_page_rank(%s, %s);",
+                        PAGERANK_UPDATE_SQL,
                         (iterations, damping_factor),
                     )
                     affected_rows = cursor.rowcount

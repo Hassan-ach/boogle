@@ -21,3 +21,15 @@ run: build
 
 lint:
     golangci-lint run ./...
+
+# Fast unit tests. No infrastructure required.
+test:
+    go test ./internal/... -count=1
+
+test-cov:
+    go test ./internal/... -count=1 -coverprofile=coverage.out
+    go tool cover -func=coverage.out
+
+# Tests that need live Postgres/Redis/RabbitMQ (build tag: integration).
+test-integration:
+    go test -tags integration ./internal/... -count=1

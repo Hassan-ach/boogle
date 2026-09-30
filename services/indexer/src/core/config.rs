@@ -140,3 +140,206 @@ fn load_rabbit_config() -> RabbitConfig {
         confirmation_queue_name,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    // Environment variables are process-global, so the tests that mutate them
+    // must not run concurrently.
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Rust 2024 marks `set_var`/`remove_var` unsafe because they mutate
+    /// process-global state. Every caller holds `env_lock`, so no other thread
+    /// can be reading the environment concurrently.
+    fn set_var(key: &str, value: &str) {
+        unsafe { env::set_var(key, value) }
+    }
+
+    fn remove_var(key: &str) {
+        unsafe { env::remove_var(key) }
+    }
+
+    /// Clear every variable these loaders read so each test starts from a known
+    /// state regardless of what the developer has exported.
+    fn clear_env() {
+        for key in [
+            "LOG_PATH",
+            "RABBITMQ_QUEUE",
+            "RABBITMQ_CONFIRMATION_QUEUE",
+            "PG_MAX_CONNECTIONS",
+            "PG_MIN_CONNECTIONS",
+            "ACQUIRE_TIMEOUT_SECONDS",
+            "PG_LOCK_TIMEOUT_MS",
+            "PG_STATEMENT_TIMEOUT_MS",
+            "WORD_BATCH_SIZE",
+            "PAGE_WORD_BATCH_SIZE",
+            "MAX_RETRIES",
+            "SWEEP_INTERVAL_SECONDS",
+            "SWEEP_GRACE_SECONDS",
+        ] {
+            remove_var(key);
+        }
+        // RABBITMQ_URL and DATABASE_URL are required; provide them by default.
+        set_var("DATABASE_URL", "postgres://user:pass@localhost:5432/db");
+        set_var("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/%2f");
+    }
+
+    #[test]
+    fn load_app_config_uses_defaults_when_unset() {
+        let _guard = env_lock();
+        clear_env();
+
+        let app = load_app_config();
+
+        assert_eq!(app.log_path, "indexer.log");
+        assert_eq!(app.queue_name, "indexer.jobs");
+        assert_eq!(app.confirmation_queue_name, "indexer.confirmations");
+        assert_eq!(app.max_concurrent_tasks, 10);
+        assert_eq!(app.sweep_interval, Duration::from_secs(300));
+        assert_eq!(app.sweep_grace, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn load_app_config_reads_overrides() {
+        let _guard = env_lock();
+        clear_env();
+
+        set_var("LOG_PATH", "/tmp/custom.log");
+        set_var("RABBITMQ_QUEUE", "custom.jobs");
+        set_var("RABBITMQ_CONFIRMATION_QUEUE", "custom.confirmations");
+        set_var("PG_MAX_CONNECTIONS", "42");
+        set_var("SWEEP_INTERVAL_SECONDS", "30");
+        set_var("SWEEP_GRACE_SECONDS", "90");
+
+        let app = load_app_config();
+
+        assert_eq!(app.log_path, "/tmp/custom.log");
+        assert_eq!(app.queue_name, "custom.jobs");
+        assert_eq!(app.confirmation_queue_name, "custom.confirmations");
+        assert_eq!(app.max_concurrent_tasks, 42);
+        assert_eq!(app.sweep_interval, Duration::from_secs(30));
+        assert_eq!(app.sweep_grace, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn unparseable_sweep_interval_falls_back_to_the_default() {
+        let _guard = env_lock();
+        clear_env();
+
+        // These use `.unwrap_or(...)` rather than `.expect(...)`, so bad input
+        // must degrade to the default instead of aborting startup.
+        set_var("SWEEP_INTERVAL_SECONDS", "not-a-number");
+        set_var("SWEEP_GRACE_SECONDS", "");
+
+        let app = load_app_config();
+
+        assert_eq!(app.sweep_interval, Duration::from_secs(300));
+        assert_eq!(app.sweep_grace, Duration::from_secs(600));
+    }
+
+    #[test]
+    #[should_panic(expected = "PG_MAX_CONNECTIONS must be a number")]
+    fn non_numeric_pool_size_aborts_startup() {
+        let _guard = env_lock();
+        clear_env();
+        set_var("PG_MAX_CONNECTIONS", "many");
+        load_app_config();
+    }
+
+    #[test]
+    fn load_psql_config_uses_defaults_when_unset() {
+        let _guard = env_lock();
+        clear_env();
+
+        let psql = load_psql_config();
+
+        assert_eq!(psql.url, "postgres://user:pass@localhost:5432/db");
+        assert_eq!(psql.max_connections, 10);
+        assert_eq!(psql.min_connections, 2);
+        assert_eq!(psql.acquire_timeout_seconds, Duration::from_secs(5));
+        assert_eq!(psql.lock_timeout_ms, 5000);
+        assert_eq!(psql.statement_timeout_ms, 60000);
+        assert_eq!(psql.word_batch_size, 1000);
+        assert_eq!(psql.page_word_batch_size, 500);
+        assert_eq!(psql.max_retries, 3);
+    }
+
+    #[test]
+    fn load_psql_config_reads_overrides() {
+        let _guard = env_lock();
+        clear_env();
+
+        set_var("PG_MIN_CONNECTIONS", "5");
+        set_var("ACQUIRE_TIMEOUT_SECONDS", "17");
+        set_var("PG_LOCK_TIMEOUT_MS", "1234");
+        set_var("PG_STATEMENT_TIMEOUT_MS", "9999");
+        set_var("WORD_BATCH_SIZE", "7");
+        set_var("PAGE_WORD_BATCH_SIZE", "11");
+        set_var("MAX_RETRIES", "9");
+
+        let psql = load_psql_config();
+
+        assert_eq!(psql.min_connections, 5);
+        assert_eq!(psql.acquire_timeout_seconds, Duration::from_secs(17));
+        assert_eq!(psql.lock_timeout_ms, 1234);
+        assert_eq!(psql.statement_timeout_ms, 9999);
+        assert_eq!(psql.word_batch_size, 7);
+        assert_eq!(psql.page_word_batch_size, 11);
+        assert_eq!(psql.max_retries, 9);
+    }
+
+    #[test]
+    #[should_panic(expected = "DATABASE_URL must be set")]
+    fn missing_database_url_aborts_startup() {
+        let _guard = env_lock();
+        clear_env();
+        remove_var("DATABASE_URL");
+        load_psql_config();
+    }
+
+    #[test]
+    fn load_rabbit_config_reads_values() {
+        let _guard = env_lock();
+        clear_env();
+
+        let rabbit = load_rabbit_config();
+
+        assert_eq!(rabbit.url, "amqp://guest:guest@localhost:5672/%2f");
+        assert_eq!(rabbit.queue, "indexer.jobs");
+        assert_eq!(rabbit.confirmation_queue_name, "indexer.confirmations");
+    }
+
+    #[test]
+    #[should_panic(expected = "RABBITMQ_URL must be set")]
+    fn missing_rabbit_url_aborts_startup() {
+        let _guard = env_lock();
+        clear_env();
+        remove_var("RABBITMQ_URL");
+        load_rabbit_config();
+    }
+
+    #[test]
+    fn queue_names_agree_between_app_and_rabbit_config() {
+        // The indexer consumes `app.queue_name` and the ranking service listens on
+        // `confirmation_queue_name`; a mismatch silently stops all ranking.
+        let _guard = env_lock();
+        clear_env();
+        set_var("RABBITMQ_QUEUE", "a.jobs");
+        set_var("RABBITMQ_CONFIRMATION_QUEUE", "a.confirmations");
+
+        let app = load_app_config();
+        let rabbit = load_rabbit_config();
+
+        assert_eq!(app.queue_name, rabbit.queue);
+        assert_eq!(app.confirmation_queue_name, rabbit.confirmation_queue_name);
+    }
+}

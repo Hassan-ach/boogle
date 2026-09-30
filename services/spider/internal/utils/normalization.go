@@ -2,6 +2,7 @@ package utils
 
 import (
 	"net/url"
+	"path"
 	"regexp"
 	"slices"
 	"sort"
@@ -38,6 +39,14 @@ var (
 	// Wiki-specific: blocks /Template:Foo/xx/, /Help:Bar/en/, etc.
 	wikiLangSubpageRE   = regexp.MustCompile(`(?i)/[a-z]{2,3}(-[a-z]{2,4})?/?$`)
 	wikiNoisyNamespaces = []string{"/Template:", "/Help:", "/Manual:", "/Extension:"}
+
+	// languageSubtagRE matches an IETF BCP-47 language tag: two to three
+	// subtags of two to eight alphanumerics, at least the first of them letters.
+	// The old check was "two to five characters, letters, one optional hyphen",
+	// which missed zh-yue, be-tarask, zh-min-nan and every other language
+	// Wikipedia publishes under, so those mirrors got crawled in full instead of
+	// being folded onto en.
+	languageSubtagRE = regexp.MustCompile(`^[a-z]{2,8}(-[a-z]{2,8}){0,2}$`)
 )
 
 func NormalizeUrl(raw string, baseHost string) (string, bool) {
@@ -48,6 +57,22 @@ func NormalizeUrl(raw string, baseHost string) (string, bool) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return "", false
+	}
+
+	// Resolve "." and ".." segments and collapse repeated slashes before any
+	// decision is made about the path. "/a/./b", "/a//b" and "/a/b" are the same
+	// document, and keying them separately splits a page's word counts and
+	// PageRank three ways. The skip checks then have to run on the cleaned path,
+	// or "/admin/../public" would slip past the /admin rule.
+	//
+	// path.Clean also drops a trailing slash, which is load bearing for servers
+	// that distinguish "/a" from "/a/", so it is recorded and re-applied later.
+	hadTrailingSlash := strings.HasSuffix(u.Path, "/")
+	u.Path = path.Clean("/" + u.Path)
+	if u.Path == "/" {
+		// The site root renders without a trailing slash, so "https://x" and
+		// "https://x/" cannot end up as two keys for the home page.
+		u.Path = ""
 	}
 
 	if shouldSkipByPath(u.Path) {
@@ -62,14 +87,31 @@ func NormalizeUrl(raw string, baseHost string) (string, bool) {
 		return "", false
 	}
 
-	normalizeURLParts(u, baseHost)
+	normalizeURLParts(u, baseHost, hadTrailingSlash)
 
 	return u.String(), true
 }
 
+// shouldSkipByPath reports whether a path is one the crawler should not index.
+//
+// The comparison is on path *segments*, not on a raw string prefix. A plain
+// HasPrefix meant "/cart" also swallowed "/cartoon" and "/cartoonography",
+// "/search" swallowed "/searching" and "/search-archive", and "/login"
+// swallowed "/logins-archive" -- all ordinary content pages that then never
+// reached the index, with no error anywhere to say why.
 func shouldSkipByPath(path string) bool {
+	cleaned := strings.Trim(path, "/")
+	if cleaned == "" {
+		return false
+	}
 	for _, prefix := range disallowPathPrefixes {
-		if path == prefix || strings.HasPrefix(path, prefix) {
+		trimmed := strings.Trim(prefix, "/")
+		if trimmed == "" {
+			continue
+		}
+		// Match when the rule is a whole leading path segment. "/admin" covers
+		// "/admin" and "/admin/users" but not "/administration".
+		if cleaned == trimmed || strings.HasPrefix(cleaned, trimmed+"/") {
 			return true
 		}
 	}
@@ -102,7 +144,7 @@ func shouldSkipWikiLanguageSubpage(path string) bool {
 	return false
 }
 
-func normalizeURLParts(u *url.URL, baseHost string) {
+func normalizeURLParts(u *url.URL, baseHost string, hadTrailingSlash bool) {
 	// Force HTTPS
 	u.Scheme = "https"
 
@@ -137,12 +179,15 @@ func normalizeURLParts(u *url.URL, baseHost string) {
 		u.RawQuery = sorted.Encode()
 	}
 
-	// Remove trailing slash
-	if len(u.Query()) == 0 &&
-		u.Path != "" &&
-		strings.HasSuffix(u.Path, "/") &&
-		!strings.Contains(u.Path, ".") {
-		u.Path = strings.TrimSuffix(u.Path, "/")
+	// The trailing slash is significant to some servers -- "/a" and "/a/" can be
+	// different documents -- but not all, and path.Clean has already thrown it
+	// away. Put it back only where it is meaningful: when a query survived, or
+	// when the path looks like a filename, in which case the slash denotes a
+	// directory listing rather than the document itself.
+	if hadTrailingSlash && u.Path != "" && !strings.HasSuffix(u.Path, "/") {
+		if len(u.Query()) > 0 || strings.Contains(u.Path, ".") {
+			u.Path += "/"
+		}
 	}
 }
 
@@ -184,10 +229,7 @@ func forceEnglishSubdomain(u *url.URL) {
 		return // already English
 	}
 
-	isLang := len(potentialLang) >= 2 && len(potentialLang) <= 5 &&
-		regexp.MustCompile(`^[a-z]+(-[a-z]+)?$`).MatchString(potentialLang)
-
-	if isLang {
+	if languageSubtagRE.MatchString(potentialLang) {
 		u.Host = "en." + rest
 	}
 }
@@ -204,15 +246,23 @@ func ValidateLinks(links []string, disallowed []string) []string {
 	return normUrls.GetAll()
 }
 
-func isDisallowed(path string, disallowed []string) bool {
+// IsDisallowed reports whether a path is blocked by any of the given rules.
+//
+// A rule containing a regex metacharacter is treated as a regular expression,
+// otherwise it is a path prefix. Two rules that used to live here as separate
+// copies of this function disagreed: the unexported one had no guard for an
+// empty rule, and strings.HasPrefix(p, "") is true for every p, so a single
+// blank line in a robots.txt file blocked the entire host.
+func IsDisallowed(path string, disallowed []string) bool {
 	for _, d := range disallowed {
-		// detect if pattern looks like regex
+		if d == "" {
+			continue
+		}
 		if strings.ContainsAny(d, `.^$*+?[]|()`) {
-			matched, err := regexp.MatchString(d, path)
-			if err != nil {
-				continue
-			}
-			if matched {
+			// An unparseable pattern is skipped rather than allowed through:
+			// failing open on a malformed rule would crawl something an
+			// operator explicitly asked not to be crawled.
+			if matched, err := regexp.MatchString(d, path); err == nil && matched {
 				return true
 			}
 		} else {
@@ -224,21 +274,8 @@ func isDisallowed(path string, disallowed []string) bool {
 	return false
 }
 
-func IsDisallowed(path string, disallowed []string) bool {
-	for _, d := range disallowed {
-		if d == "" {
-			continue
-		}
-		// Check for regex or prefix pattern
-		if strings.ContainsAny(d, `.^$*+?[]|()`) {
-			if matched, _ := regexp.MatchString(d, path); matched {
-				return true
-			}
-		} else {
-			if strings.HasPrefix(path, d) {
-				return true
-			}
-		}
-	}
-	return false
+// isDisallowed is the private alias kept for the callers inside this package.
+// It delegates rather than reimplementing, so the two cannot drift apart again.
+func isDisallowed(p string, disallowed []string) bool {
+	return IsDisallowed(p, disallowed)
 }

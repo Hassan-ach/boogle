@@ -1,6 +1,7 @@
 package util
 
 import (
+	"math"
 	"os"
 	"strconv"
 )
@@ -25,7 +26,10 @@ func GetIntWithDefault(key string, defaultValue int) int {
 func GetFloatWithDefault(key string, defaultValue float64) float64 {
 	k := GetWithDefault(key, "")
 	v, err := strconv.ParseFloat(k, 64)
-	if err != nil {
+	if err != nil || math.IsNaN(v) {
+		// NaN parses without error, but every comparison it takes part in is
+		// false, so a weight of NaN would silently disable ranking instead of
+		// failing loudly. Treat it as the misconfiguration it is.
 		return defaultValue
 	}
 	return v

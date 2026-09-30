@@ -8,6 +8,32 @@ import (
 	"github.com/Hassan-ach/boogle/services/engine/internal/util"
 )
 
+// less reports whether a must be ordered before b, best match first.
+//
+// It has to be a total order, and above all asymmetric. The old comparator's
+// `return -1` fall-through made less(a, b) and less(b, a) both true for pages
+// that tied on every key, so the sorted order depended on the input order --
+// and the input came out of a Go map, so the same query could come back ranked
+// differently run to run.
+//
+// Score, word count and title are the meaningful keys. URL and ID are the
+// deterministic backstop for the case where two distinct pages agree on all
+// three, so no pair is ever left to the randomised map iteration order.
+func less(a, b *model.Page) bool {
+	switch {
+	case a.GlobalScore != b.GlobalScore:
+		return a.GlobalScore > b.GlobalScore
+	case len(a.Words) != len(b.Words):
+		return len(a.Words) > len(b.Words)
+	case a.MetaData.Title != b.MetaData.Title:
+		return a.MetaData.Title > b.MetaData.Title
+	case a.URL != b.URL:
+		return a.URL > b.URL
+	default:
+		return a.ID.String() > b.ID.String()
+	}
+}
+
 func sort(pages map[*model.Page]float64,
 	factor float64,
 ) ([]*model.Page, error) {
@@ -17,22 +43,18 @@ func sort(pages map[*model.Page]float64,
 		pgs = append(pgs, p)
 	}
 
+	// Deterministic even though the input is a map: every pair of distinct
+	// pages is separated by `less`, so Go's randomised map iteration order
+	// cannot leak into the result.
 	slices.SortStableFunc(pgs, func(a, b *model.Page) int {
-		if a.GlobalScore < b.GlobalScore {
+		switch {
+		case less(a, b):
+			return -1
+		case less(b, a):
 			return 1
+		default:
+			return 0
 		}
-		// just to make sure that the order is deterministic.
-		if a.GlobalScore == b.GlobalScore {
-			if len(a.Words) < len(b.Words) {
-				return 1
-			}
-			if len(a.Words) == len(b.Words) {
-				if a.MetaData.Title < b.MetaData.Title {
-					return 1
-				}
-			}
-		}
-		return -1
 	})
 
 	return pgs, nil

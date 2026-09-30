@@ -1,7 +1,7 @@
 use crate::core::errors::{AppError, DatabaseError};
 use crate::core::utils::retry_async;
 use crate::core::{config::PsqlConfig, indexer::Page};
-use slog::{error, info, warn, Logger};
+use slog::{Logger, error, info, warn};
 use std::collections::HashMap;
 use std::time::Duration;
 

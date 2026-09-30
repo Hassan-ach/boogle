@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use lapin::{
+    BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, Consumer,
     options::{BasicConsumeOptions, BasicPublishOptions, BasicQosOptions, QueueDeclareOptions},
     types::{FieldTable, ShortString},
-    BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, Consumer,
 };
 use serde::{Deserialize, Serialize};
-use slog::{error, info, Logger};
+use slog::{Logger, error, info};
 
 use crate::core::errors::AppError;
 use crate::core::{config::RabbitConfig, errors::MessagingError};
@@ -27,6 +27,83 @@ pub struct RabbitMQ {
     ch: Channel,
     confirm_ch: Channel,
     log: Arc<Logger>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The spider service (Go) publishes `{"page_id":"<uuid>"}`. If this shape
+    /// drifts, the indexer rejects every job with a serde error and the crawl
+    /// silently stops indexing, so the wire format is pinned here.
+    const SPIDER_PAYLOAD: &str = r#"{"page_id":"6f8c3c3c-1b1a-4b2e-9f3d-2c4e5f6a7b8c"}"#;
+
+    #[test]
+    fn job_deserializes_the_spider_payload() {
+        let job: Job = serde_json::from_str(SPIDER_PAYLOAD).expect("spider payload must parse");
+        assert_eq!(
+            job.page_id.to_string(),
+            "6f8c3c3c-1b1a-4b2e-9f3d-2c4e5f6a7b8c"
+        );
+    }
+
+    #[test]
+    fn job_round_trips_through_serde() {
+        let id = uuid::Uuid::new_v4();
+        let job = Job { page_id: id };
+        let encoded = serde_json::to_vec(&job).unwrap();
+        let decoded: Job = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.page_id, id);
+    }
+
+    #[test]
+    fn job_encodes_page_id_as_a_bare_string() {
+        let id = uuid::Uuid::new_v4();
+        let encoded = serde_json::to_string(&Job { page_id: id }).unwrap();
+        assert_eq!(encoded, format!(r#"{{"page_id":"{id}"}}"#));
+    }
+
+    #[test]
+    fn job_uses_the_same_wire_shape_as_index_confirmation() {
+        // Both messages cross a service boundary, so they must stay compatible
+        // with the Go producer.
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(
+            serde_json::to_string(&Job { page_id: id }).unwrap(),
+            serde_json::to_string(&IndexConfirmation { page_id: id }).unwrap()
+        );
+    }
+
+    #[test]
+    fn malformed_job_payloads_are_rejected() {
+        for bad in [
+            "",
+            "{",
+            "{}",
+            r#"{"page_id":""}"#,
+            r#"{"page_id":"not-a-uuid"}"#,
+            r#"{"pageid":"6f8c3c3c-1b1a-4b2e-9f3d-2c4e5f6a7b8c"}"#,
+        ] {
+            let parsed = serde_json::from_str::<Job>(bad);
+            assert!(parsed.is_err(), "expected {bad:?} to be rejected");
+        }
+    }
+
+    #[test]
+    fn index_confirmation_round_trips() {
+        let id = uuid::Uuid::new_v4();
+        let encoded = serde_json::to_vec(&IndexConfirmation { page_id: id }).unwrap();
+        let decoded: IndexConfirmation = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.page_id, id);
+    }
+
+    #[test]
+    fn extra_fields_are_tolerated() {
+        // Forward compatibility: a newer producer must not break this consumer.
+        let payload = r#"{"page_id":"6f8c3c3c-1b1a-4b2e-9f3d-2c4e5f6a7b8c","attempt":2}"#;
+        let job: Job = serde_json::from_str(payload).unwrap();
+        assert!(!job.page_id.is_nil());
+    }
 }
 
 #[async_trait::async_trait]

@@ -37,6 +37,8 @@ class MessagingService:
         self.max_indexer_pages = max_indexer_pages
         self._indexer_pages = 0
         self._job_lock = asyncio.Lock()
+        self._pipeline_running = False
+        self._tasks: set = set()
 
         self.broker = RabbitBroker(self.broker_url)
         self.app = FastStream(self.broker)
@@ -55,31 +57,71 @@ class MessagingService:
         @self.broker.subscriber(self.queue)
         async def handle_confirmation(body: dict[str, Any]) -> None:
             logger.info(f"Received confirmation message: {body}")
-            self._indexer_pages += 1
+            self.record_confirmation()
 
-            if self._indexer_pages >= self.max_indexer_pages:
-                self._indexer_pages = 0
-                if self._pipeline_handler is not None:
-                    # Spawn task non-blockingly so the consumer callback returns immediately
-                    asyncio.create_task(self._safe_run_pipeline())
+    def record_confirmation(self) -> bool:
+        """Count one indexed page and spawn the pipeline when the threshold is hit.
+
+        The counter is deliberately *not* reset here. It is reset inside
+        ``_safe_run_pipeline`` at the moment a run starts, so a threshold reached
+        while a run is in flight stays counted and the in-flight run picks it up
+        before it exits. Resetting here used to discard those triggers entirely:
+        the task would see the lock held and return without doing anything, and
+        since a full pipeline takes far longer than `max_indexer_pages` pages take
+        to arrive, ranking would effectively never run again.
+        """
+        self._indexer_pages += 1
+
+        if self._indexer_pages < self.max_indexer_pages:
+            return False
+
+        if self._pipeline_handler is None:
+            return False
+
+        if self._pipeline_running:
+            # A run is in flight; it will drain the backlog before exiting.
+            return True
+
+        self._pipeline_running = True
+        # Spawn non-blockingly so the consumer callback returns immediately.
+        task = asyncio.create_task(self._safe_run_pipeline())
+        # Hold a reference so the task cannot be garbage collected mid-flight.
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return True
 
     async def _safe_run_pipeline(self) -> None:
-        """Executes pipeline under an asyncio lock to prevent concurrent runs."""
+        """Run the pipeline, holding a lock, until the counted backlog is drained.
+
+        Anything that arrives while a run is in flight stays counted and is
+        handled by the next pass of the loop, so a threshold reached mid-run is
+        never dropped and confirmations are never queued one-run-each.
+        """
         if self._job_lock.locked():
             logger.info(
-                "Ranking pipeline is already running. Skipping execution."
+                "Ranking pipeline is already running. Skipping this run; the "
+                "threshold stays reached and will be handled when it finishes."
             )
+            self._pipeline_running = False
             return
 
-        async with self._job_lock:
-            if self._pipeline_handler:
-                try:
-                    await self._pipeline_handler()
-                except Exception as e:
-                    logger.error(
-                        f"Error executing ranking pipeline handler: {e}",
-                        exc_info=True,
-                    )
+        try:
+            async with self._job_lock:
+                while (
+                    self._pipeline_handler is not None
+                    and self._indexer_pages >= self.max_indexer_pages
+                ):
+                    # This batch is now genuinely being processed.
+                    self._indexer_pages = 0
+                    try:
+                        await self._pipeline_handler()
+                    except Exception as e:
+                        logger.error(
+                            f"Error executing ranking pipeline handler: {e}",
+                            exc_info=True,
+                        )
+        finally:
+            self._pipeline_running = False
 
     async def publish_message(
         self, message: str, queue_name: Optional[str] = None
