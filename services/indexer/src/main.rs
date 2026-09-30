@@ -60,9 +60,10 @@ async fn main() -> Result<(), AppError> {
     // Ensure the cancellation token is active if the indexer exited first
     token.cancel();
 
-    // Wait for the consumer loop to stop
-    match indexer_handle.await {
-        Ok(Ok(())) => {}
+    // Wait for the consumer loop to stop. The Consumer is kept alive here: dropping
+    // it closes its lapin channel, which would break acks from workers still draining.
+    let consumer = match indexer_handle.await {
+        Ok(Ok(consumer)) => consumer,
         Ok(Err(err)) => {
             error!(log, "Indexer loop exited with error"; "error" => %err);
             process::exit(1);
@@ -71,7 +72,7 @@ async fn main() -> Result<(), AppError> {
             error!(log, "Indexer loop task panicked"; "error" => %err);
             process::exit(1);
         }
-    }
+    };
     if let Err(err) = sweep_handle.await {
         error!(log, "Sweep loop task failed"; "error" => %err);
         process::exit(1);
@@ -89,11 +90,18 @@ async fn main() -> Result<(), AppError> {
     .await
     {
         Ok(_) => info!(log, "All indexer tasks completed"),
-        Err(_) => info!(
-            log,
-            "Timeout reached while waiting for indexer tasks to complete"
-        ),
+        Err(_) => {
+            let still_running = indx.tasks.lock().await.len();
+            info!(
+                log,
+                "Timeout reached while waiting for indexer tasks to complete";
+                "still_running" => still_running
+            );
+        }
     }
+
+    // Release the consumer only after every worker has acked or nacked.
+    drop(consumer);
 
     info!(log, "Indexer service shutting down");
     indx.close().await;

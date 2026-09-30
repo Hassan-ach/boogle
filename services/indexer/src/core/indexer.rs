@@ -1,5 +1,6 @@
 use lapin::options::BasicAckOptions;
 use lapin::options::BasicNackOptions;
+use lapin::Consumer;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -14,7 +15,7 @@ use crate::core::psql::DB;
 use crate::core::text_sink::parse;
 use crate::core::utils::retry_async;
 use crate::core::utils::retry_sync;
-use slog::{Logger, error, info};
+use slog::{error, info, Logger};
 use sqlx::prelude::FromRow;
 use std::sync::Arc;
 use tokio_stream::StreamExt;
@@ -40,7 +41,7 @@ pub struct Indexer<DBImpl: DB, MQImpl: MessagingQueue> {
 
 #[async_trait::async_trait]
 pub trait Indexe {
-    async fn start(self: Arc<Self>, tk: CancellationToken) -> Result<(), AppError>;
+    async fn start(self: Arc<Self>, tk: CancellationToken) -> Result<Consumer, AppError>;
     async fn close(&self);
     async fn sweep_loop(self: Arc<Self>, tk: CancellationToken);
 }
@@ -68,13 +69,18 @@ where
         Ok(())
     }
 
-    pub async fn index_loop(self: Arc<Self>, tk: CancellationToken) -> Result<(), AppError> {
+    /// Returns the still-open [`Consumer`] so the caller can keep it alive while
+    /// in-flight workers drain. Dropping a lapin `Consumer` closes its channel,
+    /// which makes every outstanding ack fail with `InvalidChannel`.
+    pub async fn index_loop(self: Arc<Self>, tk: CancellationToken) -> Result<Consumer, AppError> {
         if tk.is_cancelled() {
             info!(
                 self.log,
                 "indexing task received shutdown signal, stopping..."
             );
-            return Ok(());
+            return Err(AppError::Other(
+                "indexing task received shutdown signal before consuming".to_string(),
+            ));
         }
         match retry_async(3, || async {
             self.mq
@@ -87,12 +93,12 @@ where
                 tokio::select! {
                     _ = tk.cancelled() => {
                         info!(self.log, "Received shutdown signal, stopping consumer for queue"; "queue" => self.conf.queue_name.to_string());
-                        return Ok(());
+                        return Ok(consumer);
                     }
                     result = consumer.next() => {
                         let Some(result) = result else {
                             info!(self.log, "Consumer stream ended for queue"; "queue" => self.conf.queue_name.to_string());
-                            return Ok(());
+                            return Ok(consumer);
                         };
 
                         let delivery = result?;
@@ -107,7 +113,7 @@ where
                             Ok(p) = Arc::clone(&indx.limit).acquire_owned() => p,
                             _ = tk.cancelled() => {
                                 info!(log, "Received shutdown signal while waiting for permit, stopping"; "queue" => queue_name.clone());
-                                return Ok(());
+                                return Ok(consumer);
                             }
                         };
 
@@ -262,7 +268,7 @@ where
     DBImpl: DB + Sync + Send + 'static,
     MQImpl: MessagingQueue + Send + Sync + 'static,
 {
-    async fn start(self: Arc<Self>, tk: CancellationToken) -> Result<(), AppError> {
+    async fn start(self: Arc<Self>, tk: CancellationToken) -> Result<Consumer, AppError> {
         let tk_clone = tk.clone();
         let res = Arc::clone(&self).index_loop(tk_clone).await;
         tk.cancel();
