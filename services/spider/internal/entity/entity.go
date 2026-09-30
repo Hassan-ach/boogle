@@ -14,15 +14,21 @@ type Host struct {
 	NotAllowedPaths []string // Paths disallowed to crawl (typo kept for backward compatibility)
 }
 type MetaData struct {
-	URL         string    `json:"url"`
-	Title       string    `json:"title,omitempty"`
-	Description string    `json:"description,omitempty"`
-	Type        string    `json:"type,omitempty"`
-	SiteName    string    `json:"siteName,omitempty"`
-	Locale      string    `json:"locale,omitempty"`
-	Keywords    []string  `json:"keywords,omitempty"`
-	Icons       []string  `json:"icons,omitempty"`
-	CrawledAt   time.Time `json:"crawledAt"`
+	URL         string   `json:"url"`
+	Title       string   `json:"title,omitempty"`
+	Description string   `json:"description,omitempty"`
+	Type        string   `json:"type,omitempty"`
+	SiteName    string   `json:"siteName,omitempty"`
+	Locale      string   `json:"locale,omitempty"`
+	Keywords    []string `json:"keywords,omitempty"`
+	Icons       []string `json:"icons,omitempty"`
+	// Lang is the document's own <html lang> declaration, reported rather than
+	// acted on. The parser used to decide on it and report a non-English page
+	// as a parse *error*, which made a language filter indistinguishable from a
+	// network failure in the logs. The policy manager now reads this and
+	// refuses with a counted reason.
+	Lang      string    `json:"lang,omitempty"`
+	CrawledAt time.Time `json:"crawledAt"`
 }
 
 type Robots struct {

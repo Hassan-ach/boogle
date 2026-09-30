@@ -16,6 +16,7 @@ import (
 	"github.com/Hassan-ach/boogle/services/spider/internal/entity"
 	"github.com/Hassan-ach/boogle/services/spider/internal/messaging"
 	"github.com/Hassan-ach/boogle/services/spider/internal/parser"
+	"github.com/Hassan-ach/boogle/services/spider/internal/policy"
 	"github.com/Hassan-ach/boogle/services/spider/internal/store"
 	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
@@ -198,6 +199,18 @@ func (s *Spider) crawl(crawler_id int) {
 	if err != nil {
 		logger.Error("Failed to fetch and parse page",
 			"url", rawUrl, "error", err)
+		return
+	}
+
+	// The parser no longer decides this. It reports what the document claims
+	// about its own language, and the policy manager judges. Until Admit owns
+	// the whole decision (a later phase) the check stays here, but it is now a
+	// distinct, named outcome -- previously the parser returned an error here,
+	// so this line logged "failed to fetch and parse page" for every non-English
+	// page ever seen, and no count of them was possible.
+	if !policy.IsEnglish(page.Lang) {
+		logger.Info("Skipping non-English page",
+			"url", rawUrl, "lang", page.Lang)
 		return
 	}
 

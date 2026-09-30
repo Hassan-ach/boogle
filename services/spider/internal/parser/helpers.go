@@ -49,27 +49,30 @@ func findHtmlNode(n *html.Node) *html.Node {
 	}
 	return nil
 }
-func skipNonEnglish(root *html.Node) bool {
+
+// documentLanguage reports the language a document declares for itself, by
+// reading the lang or xml:lang attribute off the <html> element.
+//
+// It reports rather than decides. It used to return a skip boolean, and
+// ParseHTML turned that into an error, so every non-English page logged "failed
+// to fetch and parse page" and was indistinguishable from a network failure --
+// and neither was countable. The policy manager makes the call now; this only
+// supplies the evidence.
+//
+// An absent attribute is reported as the empty string, which policy.IsEnglish
+// reads as "no claim made" rather than "not English". Most real pages omit it.
+func documentLanguage(root *html.Node) string {
 	htmlNode := findHtmlNode(root)
 	if htmlNode == nil {
-		return false
+		return ""
 	}
-	var langValue string
 	for _, attr := range htmlNode.Attr {
 		key := strings.ToLower(attr.Key)
 		if key == "lang" || key == "xml:lang" {
-			langValue = attr.Val
-			break
+			return strings.TrimSpace(attr.Val)
 		}
 	}
-	if langValue != "" {
-		langLower := strings.ToLower(strings.TrimSpace(langValue))
-		// Allow "en", "en-US", "en-GB", etc.
-		if !strings.HasPrefix(langLower, "en") {
-			return true // Non-English content detected
-		}
-	}
-	return false
+	return ""
 }
 
 func traverse(n *html.Node, visit func(*html.Node)) {
