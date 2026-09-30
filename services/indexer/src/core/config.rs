@@ -5,6 +5,7 @@ use std::env;
 pub struct Config {
     pub app: AppConfig,
     pub psql: PsqlConfig,
+    pub rabbit: RabbitConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -15,6 +16,13 @@ pub struct PsqlConfig {
     pub acquire_timeout_seconds: std::time::Duration,
     pub word_batch_size: usize,
     pub page_word_batch_size: usize,
+    pub max_retries: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RabbitConfig {
+    pub url: String,
+    pub queue: String,
 }
 
 #[derive(Debug, Clone)]
@@ -31,7 +39,8 @@ pub fn load_config(env_path: String) -> Config {
 
     let app = load_app_config();
     let psql = load_psql_config();
-    Config { app, psql }
+    let rabbit = load_rabbit_config();
+    Config { app, psql, rabbit }
 }
 
 fn load_app_config() -> AppConfig {
@@ -83,4 +92,10 @@ fn load_psql_config() -> PsqlConfig {
         word_batch_size,
         page_word_batch_size,
     }
+}
+
+fn load_rabbit_config() -> RabbitConfig {
+    let url = env::var("RABBITMQ_URL").expect("RABBITMQ_URL must be set");
+    let queue = env::var("RABBITMQ_QUEUE").unwrap_or_else(|_| "indexer.jobs".to_string());
+    RabbitConfig { url, queue }
 }
