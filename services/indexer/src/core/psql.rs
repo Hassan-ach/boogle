@@ -55,6 +55,20 @@ impl DB for Psql {
         older_than: Duration,
         limit: i64,
     ) -> Result<Vec<Uuid>, AppError> {
+        // A page is marked indexed before any indexing work starts, so a worker that
+        // died or hung leaves it claimed forever. Release stale claims first,
+        // otherwise those pages are invisible to the sweep.
+        sqlx::query!(
+            r#"UPDATE pages
+                SET indexed = FALSE
+                WHERE indexed = TRUE
+                    AND last_index_attempt_at IS NOT NULL
+                    AND last_index_attempt_at < NOW() - make_interval(secs => $1)"#,
+            older_than.as_secs() as f64
+        )
+        .execute(&self.pool)
+        .await?;
+
         let ids = sqlx::query_scalar!(
             r#"SELECT id FROM pages
                 WHERE indexed = FALSE
@@ -86,7 +100,8 @@ impl DB for Psql {
                  LIMIT 1
             )
             UPDATE pages
-            SET indexed = TRUE
+            SET indexed = TRUE,
+                last_index_attempt_at = NOW()
             FROM cte
             WHERE pages.id = cte.id
             RETURNING pages.id, pages.url_id, pages.html",
