@@ -51,8 +51,24 @@ func suggestionsFor(q string, speller dictionary, maxSuggestions int) []string {
 			continue
 		}
 
+		// The word as typed is always a candidate.
+		//
+		// It used to be kept only if the dictionary knew it, and otherwise
+		// replaced by whatever `Suggest` returned. A word the dictionary has
+		// never seen -- a product name, a username, an identifier, anything
+		// coined since aspell's word list was written -- has no suggestions at
+		// all, so it was dropped from the query entirely. Searching for a term
+		// that was genuinely on an indexed page returned nothing, with no error
+		// and nothing in the logs: the query had been silently rewritten into a
+		// shorter one.
+		//
+		// Keeping the original is strictly additive. The store matches with
+		// `word = ANY($1)`, which is an OR, so an extra term can only widen the
+		// candidate set, and a user searching for a literal string gets the pages
+		// containing it rather than pages containing a guess.
+		suggestions[strings.ToLower(word)] = struct{}{}
+
 		if speller.Check(word) {
-			suggestions[strings.ToLower(word)] = struct{}{}
 			continue
 		}
 

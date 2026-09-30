@@ -25,8 +25,11 @@ test:
 test-cov:
     {{python}} -m pytest tests -m "not integration" --cov=src --cov-report=term-missing
 
-# Tests that need live Postgres/RabbitMQ. Bring infra up first.
+# Tests that need a live PostgreSQL. Creates and migrates an isolated
+# `boogle_test` database first -- never the live `boogle` one, because these
+# tests write scores.
 test-integration:
+    bash {{justfile_directory()}}/../../scripts/setup-test-db.sh
     {{python}} -m pytest tests -m integration
 
 clean:

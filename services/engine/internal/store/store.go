@@ -151,6 +151,17 @@ func (s PsqlStore) GetData(c context.Context, words []string, pageNum int) (*Dat
 		pgs = append(pgs, page)
 	}
 
+	// `Next` reports the end of the result set and a mid-stream failure the same
+	// way -- false -- so the difference is only visible in `Err`. Without this
+	// check a connection dropped halfway through the rows returns a short page and
+	// no error at all: the user sees "10 results", three of which never arrived,
+	// and nothing anywhere records that the query was cut off. For a search engine
+	// that is the worst failure mode available, because the response looks
+	// completely normal.
+	if err := rows.Err(); err != nil {
+		return nil, apperror.Internal(fmt.Errorf("failed while reading results: %w", err))
+	}
+
 	pageMapper := util.NewPageMapper()
 
 	for _, page := range pgs {

@@ -7,16 +7,28 @@ logger = logging.getLogger(__name__)
 
 # Recompute IDF for every word that appears on at least one page.
 #
-# Two things matter here and both were wrong before:
+# Three things matter here, and all three were wrong before:
 #
 #   * The ratio must be computed in numeric, not integer arithmetic. `pages.id`
 #     and the `df` count are both bigint, so `378 / 352` truncated to 1 and
 #     LOG(1) is 0 -- every common word was stored with an IDF of exactly zero.
-#   * The logarithm argument must never be zero. On an empty corpus
-#     `COUNT(*) FROM pages` is 0, and `LOG(0)` raises
-#     "cannot take logarithm of zero", which is not retryable and takes the whole
-#     pipeline down. GREATEST(..., 1) floors the corpus size at 1 so the
-#     statement degrades to "every word is maximally rare" instead of erroring.
+#   * The logarithm argument must never be below 1, or the result is negative.
+#     A word appearing on *every* page has n/df == 1, and a word on every page
+#     except one has n/df slightly above 1 while n/(df+1) is slightly below it,
+#     so the smoothed form pushed those words negative. The engine multiplies tf
+#     by idf, so a negative weight does not merely fail to help -- it actively
+#     subtracts from a page's score, and a word present in all N documents is
+#     the definition of one that carries no information. GREATEST(..., 1) floors
+#     the ratio, which makes "appears in nearly every page" score 0 rather than
+#     a penalty.
+#   * The argument must never be exactly 0, or LOG raises "cannot take
+#     logarithm of zero" -- a non-retryable error that takes the whole pipeline
+#     down on an empty corpus. GREATEST(COUNT(*), 1) floors the corpus size so
+#     the statement degrades to "every word is maximally rare" instead.
+#
+# Note on the base: PostgreSQL's LOG() is base 10, not natural. Either is a
+# valid IDF; log10 is what has always been stored here, and switching bases is a
+# reindex, not a fix. The tests pin the base so a change is deliberate.
 IDF_UPDATE_SQL = """
     WITH corpus AS (
         SELECT GREATEST(COUNT(*), 1)::numeric AS n
@@ -28,7 +40,10 @@ IDF_UPDATE_SQL = """
         GROUP BY word_id
     )
     UPDATE words
-    SET idf = LOG((SELECT n FROM corpus) / GREATEST(df.df + 1, 1))
+    SET idf = LOG(GREATEST(
+        (SELECT n FROM corpus) / GREATEST(df.df, 1),
+        1
+    ))
     FROM doc_freq df
     WHERE words.id = df.word_id
 """

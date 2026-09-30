@@ -70,8 +70,8 @@ func TestParseSitemapRejectsMalformedXML(t *testing.T) {
 	// A truncated sitemap is the common real-world case, and it must be an
 	// error rather than a silent zero-URL result.
 	for name, doc := range map[string]string{
-		"unclosed tag":     `<urlset><url><loc>https://example.com/a</urlset>`,
-		"not xml at all":   `{"this": "is json"}`,
+		"unclosed tag":    `<urlset><url><loc>https://example.com/a</urlset>`,
+		"not xml at all":  `{"this": "is json"}`,
 		"empty input":     ``,
 		"mismatched tags": `<urlset></sitemapindex>`,
 		"bare ampersand":  `<urlset><url><loc>https://example.com/?a=1&b=2</loc></url></urlset>`,

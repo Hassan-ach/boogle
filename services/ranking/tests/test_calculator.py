@@ -16,7 +16,7 @@ from psycopg import OperationalError
 
 from calculator import IDF_UPDATE_SQL, PAGERANK_UPDATE_SQL, RankingCalculator
 
-from conftest import FakeConnection, FakeDBManager
+from .conftest import FakeConnection, FakeDBManager
 
 
 def make_calculator(rowcount: int = 0, errors=None) -> tuple[RankingCalculator, FakeDBManager]:
@@ -60,7 +60,7 @@ async def test_compute_idf_uses_numeric_division_not_integer() -> None:
     an IDF of exactly zero and stopped contributing to search scores.
     """
     assert "::numeric" in IDF_UPDATE_SQL
-    assert "/ GREATEST(df.df + 1, 1)" in IDF_UPDATE_SQL
+    assert "GREATEST(df.df, 1)" in IDF_UPDATE_SQL
 
 
 async def test_compute_idf_never_takes_the_logarithm_of_zero() -> None:
@@ -70,7 +70,21 @@ async def test_compute_idf_never_takes_the_logarithm_of_zero() -> None:
     fatal and the entire pipeline dies before it can ever index a page.
     """
     assert "GREATEST(COUNT(*), 1)" in IDF_UPDATE_SQL
-    assert "GREATEST(df.df + 1, 1)" in IDF_UPDATE_SQL
+    assert "GREATEST(df.df, 1)" in IDF_UPDATE_SQL
+
+
+async def test_compute_idf_never_stores_a_negative_weight() -> None:
+    """The engine multiplies tf by idf, so a negative idf subtracts from a score.
+
+    A word on every page of a small corpus has n/df == 1, and the old smoothed
+    denominator `df + 1` pushed that to n/(n+1) < 1, giving a negative IDF. The
+    engine then made the most common word on a page *reduce* that page's score.
+    Flooring the ratio at 1 makes it exactly 0 instead. A fresh crawl is when
+    this bites hardest: the index starts at a handful of pages, so words present
+    in all of them are everywhere.
+    """
+    assert "LOG(GREATEST(" in IDF_UPDATE_SQL
+    assert "(SELECT n FROM corpus) / GREATEST(df.df, 1)," in IDF_UPDATE_SQL
 
 
 async def test_compute_idf_only_touches_words_that_appear_on_a_page() -> None:

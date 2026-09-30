@@ -103,13 +103,6 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
-    fn boom<T, E>() -> Result<T, E>
-    where
-        E: Default,
-    {
-        Err(E::default())
-    }
-
     #[tokio::test(start_paused = true)]
     async fn retry_async_returns_first_success_without_retrying() {
         let calls = Cell::new(0);

@@ -6,11 +6,11 @@ import (
 
 func TestNormalizeUrl(t *testing.T) {
 	tests := []struct {
-		name         string
-		rawURL       string
-		baseHost     string
-		expectedURL  string
-		expectedOK   bool
+		name        string
+		rawURL      string
+		baseHost    string
+		expectedURL string
+		expectedOK  bool
 	}{
 		{
 			name:        "valid absolute URL",

@@ -41,8 +41,9 @@ func TestSuggestionsAreSortedAndDeduplicated(t *testing.T) {
 	got := suggestionsFor("zebra mispeled apple", d, 3)
 
 	// "zebra" is correct, and is also a suggestion for "mispeled", so it must
-	// appear exactly once.
-	want := []string{"apple", "zapping", "zebra", "zulu"}
+	// appear exactly once. "mispeled" is here because the word as typed is always
+	// a candidate -- see TestAnUnknownWordIsNotDroppedFromTheQuery.
+	want := []string{"apple", "mispeled", "zapping", "zebra", "zulu"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("suggestionsFor() = %v, want %v", got, want)
 	}
@@ -109,21 +110,22 @@ func TestSuggestionsAreLowercased(t *testing.T) {
 
 	got := suggestionsFor("mispeled", d, 3)
 
-	if !reflect.DeepEqual(got, []string{"apple", "zebra"}) {
-		t.Errorf("suggestionsFor() = %v, want [apple zebra]", got)
+	if !reflect.DeepEqual(got, []string{"apple", "mispeled", "zebra"}) {
+		t.Errorf("suggestionsFor() = %v, want [apple mispeled zebra]", got)
 	}
 }
 
 func TestAtMostThreeSuggestionsPerMisspelledWord(t *testing.T) {
-	// An unbounded list swamps the result page and costs a full aspell pass.
+	// An unbounded list swamps the result page and costs a full aspell pass. The
+	// cap is on suggestions, not on the word itself, which is always kept.
 	d := newFake([]string{}, map[string][]string{
 		"mispeled": {"one", "two", "three", "four", "five"},
 	})
 
 	got := suggestionsFor("mispeled", d, 3)
 
-	if !reflect.DeepEqual(got, []string{"one", "three", "two"}) {
-		t.Errorf("suggestionsFor() = %v, want [one three two]", got)
+	if !reflect.DeepEqual(got, []string{"mispeled", "one", "three", "two"}) {
+		t.Errorf("suggestionsFor() = %v, want [mispeled one three two]", got)
 	}
 }
 
@@ -137,7 +139,7 @@ func TestTheLimitIsRespectedPerWordNotInTotal(t *testing.T) {
 
 	got := suggestionsFor("aaaa bbbb", d, 3)
 
-	want := []string{"a1", "a2", "a3", "b1", "b2", "b3"}
+	want := []string{"a1", "a2", "a3", "aaaa", "b1", "b2", "b3", "bbbb"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("suggestionsFor() = %v, want %v", got, want)
 	}
@@ -179,8 +181,13 @@ func TestWhitespaceOnlySuggestionsAreDropped(t *testing.T) {
 
 	got := suggestionsFor("x", d, 3)
 
-	if !reflect.DeepEqual(got, []string{"real"}) {
-		t.Errorf("suggestionsFor() = %v, want [real]", got)
+	for _, w := range got {
+		if strings.TrimSpace(w) == "" {
+			t.Errorf("suggestionsFor() = %v, which contains a blank entry", got)
+		}
+	}
+	if !reflect.DeepEqual(got, []string{"real", "x"}) {
+		t.Errorf("suggestionsFor() = %v, want [real x]", got)
 	}
 }
 
@@ -196,8 +203,8 @@ func TestTheQueryIsSplitOnSpaces(t *testing.T) {
 	if !reflect.DeepEqual(d.ordered, []string{"alpha", "beta"}) {
 		t.Errorf("Check was called with %v, want each word separately", d.ordered)
 	}
-	if !reflect.DeepEqual(got, []string{"alfa", "bta"}) {
-		t.Errorf("suggestionsFor() = %v, want [alfa bta]", got)
+	if !reflect.DeepEqual(got, []string{"alfa", "alpha", "beta", "bta"}) {
+		t.Errorf("suggestionsFor() = %v, want [alfa alpha beta bta]", got)
 	}
 }
 
@@ -217,15 +224,41 @@ func TestQueryOfOnlySpacesReturnsNothing(t *testing.T) {
 	}
 }
 
-func TestAWordWithNoSuggestionsIsSimplyOmitted(t *testing.T) {
-	// Aspell returns an empty list for input it cannot parse; that must not
-	// produce an empty string in the results.
+// TestAnUnknownWordIsNotDroppedFromTheQuery is a regression test.
+//
+// The word as typed used to be kept only if the dictionary recognised it, and
+// otherwise replaced by whatever `Suggest` returned. A word aspell has never
+// heard of -- a product name, a username, an identifier, anything coined since
+// its word list was written -- has no suggestions, so it was dropped from the
+// query entirely. Searching for a term that really was on an indexed page
+// returned nothing, with no error and nothing in the logs, because the query had
+// been silently rewritten into a shorter one.
+//
+// Keeping the original is strictly additive here: the store matches with
+// `word = ANY($1)`, which is an OR, so an extra term can only widen the
+// candidate set.
+func TestAnUnknownWordIsNotDroppedFromTheQuery(t *testing.T) {
 	d := newFake([]string{}, map[string][]string{})
 
 	got := suggestionsFor("zzzzzz", d, 3)
 
-	if len(got) != 0 {
-		t.Errorf("suggestionsFor() = %v, want an empty slice", got)
+	if !reflect.DeepEqual(got, []string{"zzzzzz"}) {
+		t.Errorf("suggestionsFor() = %v, want the word as typed: [zzzzzz]", got)
+	}
+}
+
+// The typed word is kept, but a suggestion that is nothing but whitespace still
+// has to go, or the result set fills up with entries that can never match
+// anything in the index.
+func TestAWordWithNoSuggestionsDoesNotProduceABlankEntry(t *testing.T) {
+	d := newFake([]string{}, map[string][]string{})
+
+	got := suggestionsFor("zzzzzz", d, 3)
+
+	for _, w := range got {
+		if strings.TrimSpace(w) == "" {
+			t.Errorf("suggestionsFor() = %v, which contains a blank entry", got)
+		}
 	}
 }
 

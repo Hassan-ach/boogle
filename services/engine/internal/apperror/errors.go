@@ -9,7 +9,17 @@ type AppError struct {
 }
 
 func (e *AppError) Error() string {
+	if e == nil {
+		return ""
+	}
 	return e.Message
+}
+
+func (e *AppError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
 }
 
 // Constructors

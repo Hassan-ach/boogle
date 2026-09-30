@@ -83,7 +83,6 @@ impl From<io::Error> for IndexerError {
 mod tests {
     use super::*;
     use crate::core::messaging::Job;
-    use std::sync::Arc;
 
     #[test]
     fn sqlx_errors_become_database_errors() {

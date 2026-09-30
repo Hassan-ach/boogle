@@ -1,8 +1,6 @@
 package handlers
 
 import (
-	"fmt"
-	"net/http"
 	"strconv"
 
 	"github.com/Hassan-ach/boogle/services/engine/internal/service"
@@ -55,19 +53,31 @@ func (h SearchingHandler) handleAllTab(c *echo.Context, sugs []string) error {
 
 	currentPage := getPageNum(c)
 
+	// The error is returned rather than written to the response. Writing it here
+	// looked harmless and was not:
+	//
+	//     return c.String(http.StatusInternalServerError, fmt.Sprint("err: %w", err))
+	//
+	// `%w` is only meaningful to fmt.Errorf, so Sprint printed the verb
+	// literally -- the body read "err: %wdial tcp 127.0.0.1:5432: connect:
+	// connection refused" -- and the whole driver error, host and port included,
+	// went to the browser. Returning the error hands it to HandleError, which
+	// logs the cause and renders only the user-facing message, which is the whole
+	// reason AppError keeps `Err` separate from `Message`. The store already
+	// returns an *apperror.AppError, so there is nothing left to wrap.
 	totalPages, err := h.Store.GetTotalPages(ctx, sugs)
 	if err != nil {
-		return c.String(http.StatusInternalServerError, fmt.Sprint("err: %w", err))
+		return err
 	}
 
 	data, err := h.Store.GetData(ctx, sugs, currentPage-1)
 	if err != nil {
-		return c.String(http.StatusInternalServerError, fmt.Sprint("err: %w", err))
+		return err
 	}
 
 	pages, err := h.Ranker.Rank(data)
 	if err != nil {
-		return c.String(http.StatusInternalServerError, fmt.Sprint("err: %w", err))
+		return err
 	}
 
 	isHtmx := c.Request().Header.Get("HX-Request") == "true"
