@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use lapin::{
-    BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, Consumer,
     options::{BasicConsumeOptions, BasicPublishOptions, BasicQosOptions, QueueDeclareOptions},
     types::{FieldTable, ShortString},
+    BasicProperties, Channel, Confirmation, Connection, ConnectionProperties, Consumer,
 };
 use serde::{Deserialize, Serialize};
-use slog::{Logger, error, info};
+use slog::{error, info, Logger};
 
 use crate::core::errors::AppError;
 use crate::core::{config::RabbitConfig, errors::MessagingError};
@@ -90,6 +90,7 @@ impl RabbitMQ {
         };
 
         mq.queue_declare(&conf.queue).await?;
+        mq.queue_declare(&conf.confirmation_queue_name).await?;
 
         info!(log, "Connected to RabbitMQ successfully"; "queue" => &conf.queue);
 

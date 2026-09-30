@@ -23,6 +23,7 @@ pub struct PsqlConfig {
 pub struct RabbitConfig {
     pub url: String,
     pub queue: String,
+    pub confirmation_queue_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -119,5 +120,11 @@ fn load_psql_config() -> PsqlConfig {
 fn load_rabbit_config() -> RabbitConfig {
     let url = env::var("RABBITMQ_URL").expect("RABBITMQ_URL must be set");
     let queue = env::var("RABBITMQ_QUEUE").unwrap_or_else(|_| "indexer.jobs".to_string());
-    RabbitConfig { url, queue }
+    let confirmation_queue_name = env::var("RABBITMQ_CONFIRMATION_QUEUE")
+        .unwrap_or_else(|_| "indexer.confirmations".to_string());
+    RabbitConfig {
+        url,
+        queue,
+        confirmation_queue_name,
+    }
 }
