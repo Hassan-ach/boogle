@@ -14,6 +14,8 @@ pub struct PsqlConfig {
     pub max_connections: u32,
     pub min_connections: u32,
     pub acquire_timeout_seconds: std::time::Duration,
+    pub lock_timeout_ms: u64,
+    pub statement_timeout_ms: u64,
     pub word_batch_size: usize,
     pub page_word_batch_size: usize,
     pub max_retries: usize,
@@ -93,6 +95,14 @@ fn load_psql_config() -> PsqlConfig {
         .unwrap_or_else(|_| "5".to_string())
         .parse::<u64>()
         .expect("ACQUIRE_TIMEOUT_SECONDS must be a number");
+    let lock_timeout_ms = env::var("PG_LOCK_TIMEOUT_MS")
+        .unwrap_or_else(|_| "5000".to_string())
+        .parse::<u64>()
+        .expect("PG_LOCK_TIMEOUT_MS must be a number");
+    let statement_timeout_ms = env::var("PG_STATEMENT_TIMEOUT_MS")
+        .unwrap_or_else(|_| "60000".to_string())
+        .parse::<u64>()
+        .expect("PG_STATEMENT_TIMEOUT_MS must be a number");
     let word_batch_size = env::var("WORD_BATCH_SIZE")
         .unwrap_or_else(|_| "1000".to_string())
         .parse::<usize>()
@@ -111,6 +121,8 @@ fn load_psql_config() -> PsqlConfig {
         max_connections,
         min_connections,
         acquire_timeout_seconds: std::time::Duration::from_secs(acquire_timeout),
+        lock_timeout_ms,
+        statement_timeout_ms,
         word_batch_size,
         page_word_batch_size,
         max_retries,

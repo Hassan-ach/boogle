@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Result;
+use sqlx::postgres::PgConnectOptions;
 use sqlx::{Pool, Postgres};
 use uuid::Uuid;
 
@@ -39,7 +40,9 @@ impl Psql {
         info!(log, "PostgreSQL connection pool created successfully";
              "max_connections" => conf.max_connections,
              "min_connections" => conf.min_connections,
-             "acquire_timeout_seconds" => conf.acquire_timeout_seconds.as_secs()
+             "acquire_timeout_seconds" => conf.acquire_timeout_seconds.as_secs(),
+             "lock_timeout_ms" => conf.lock_timeout_ms,
+             "statement_timeout_ms" => conf.statement_timeout_ms
         );
         Ok(Psql { pool, conf, log })
     }
@@ -194,11 +197,23 @@ impl DB for Psql {
 // Function connect to postgres and test it
 // return a pool connect
 async fn db_connectioon(conf: &PsqlConfig) -> Result<Pool<Postgres>, AppError> {
+    // Startup parameters, so they apply to every connection handed out by the pool.
+    // Without these a lock wait is unbounded and a worker task can hang forever.
+    let lock_timeout = format!("{}", conf.lock_timeout_ms);
+    let statement_timeout = format!("{}", conf.statement_timeout_ms);
+    let opts: PgConnectOptions = conf.url.parse()?;
+    let opts = opts.options([
+        ("application_name", "boogle-indexer"),
+        ("lock_timeout", lock_timeout.as_str()),
+        ("statement_timeout", statement_timeout.as_str()),
+        ("idle_in_transaction_session_timeout", "30000"),
+    ]);
+
     let pool = match sqlx::postgres::PgPoolOptions::new()
         .max_connections(conf.max_connections)
         .min_connections(conf.min_connections)
         .acquire_timeout(conf.acquire_timeout_seconds)
-        .connect(conf.url.as_str())
+        .connect_with(opts)
         .await
     {
         Ok(pool) => pool,
