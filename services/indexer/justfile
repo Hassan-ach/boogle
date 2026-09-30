@@ -11,7 +11,7 @@ test:
     cargo test
 
 test-cov:
-    cargo llvm-cov --html --summary-only || cargo test
+    cargo llvm-cov --summary-only || cargo test
 
 # Tests that need live Postgres (ignored by default; run with --ignored).
 test-integration:
