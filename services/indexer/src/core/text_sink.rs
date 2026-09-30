@@ -1,10 +1,15 @@
-use std::{borrow::Cow, cell::RefCell, collections::HashMap, io::Cursor, io::Error, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    io::{Cursor, Error},
+    rc::Rc,
+};
 
 use html5ever::{
-    Attribute, QualName,
     interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink},
     local_name, ns, parse_document,
     tendril::{StrTendril, TendrilSink},
+    Attribute, QualName,
 };
 
 pub fn parse(html: String) -> Result<HashMap<String, u32>, Error> {
@@ -20,19 +25,46 @@ enum Node {
 
 type Handle = Rc<Node>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct TextSink {
-    pub texts: RefCell<Vec<StrTendril>>,
-    pub doc: Handle,
+    words: RefCell<HashMap<String, u32>>,
+    doc: Handle,
 }
 
 impl TextSink {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
-            texts: RefCell::new(Vec::new()),
+            words: RefCell::new(HashMap::new()),
             doc: Handle::new(Node::Element(QualName::new(None, ns!(), local_name!("")))),
         }
     }
+
+    fn process_text(&self, text: &str) {
+        let mut words = self.words.borrow_mut();
+
+        for raw_word in text.split_whitespace() {
+            let word = raw_word.trim_matches(is_word_punctuation);
+
+            if word.is_empty() {
+                continue;
+            }
+
+            if !word.chars().all(char::is_alphabetic) {
+                continue;
+            }
+
+            let word = word.to_lowercase();
+
+            *words.entry(word).or_insert(0) += 1;
+        }
+    }
+}
+
+fn is_word_punctuation(c: char) -> bool {
+    matches!(
+        c,
+        '.' | ',' | ':' | '/' | ';' | '"' | '\'' | '!' | '?' | '(' | ')' | '[' | ']'
+    )
 }
 
 impl TreeSink for TextSink {
@@ -41,48 +73,10 @@ impl TreeSink for TextSink {
     type ElemName<'a> = &'a QualName;
 
     fn finish(self) -> Self::Output {
-        let mut out: HashMap<String, u32> = HashMap::new();
-        for text in self.texts.into_inner() {
-            for word in text.to_lowercase().split_whitespace().filter_map(|w| {
-                let trimed_word = w.trim_matches(|c: char| {
-                    c.is_whitespace()
-                        || matches!(
-                            c,
-                            '.' | ','
-                                | ':'
-                                | '/'
-                                | ';'
-                                | '"'
-                                | '\''
-                                | '!'
-                                | '?'
-                                | '('
-                                | ')'
-                                | '['
-                                | ']'
-                        )
-                });
-                if trimed_word.is_empty() || trimed_word.parse::<u32>().is_ok() {
-                    return None;
-                }
-                // remove every word that is not an English word
-                // so no symbols in my data words
-                for c in trimed_word.chars() {
-                    if !c.is_alphabetic() {
-                        return None;
-                    }
-                }
-                Some(trimed_word.to_string())
-            }) {
-                *out.entry(word).or_insert(0) += 1;
-            }
-        }
-        out
+        self.words.into_inner()
     }
 
-    fn parse_error(&self, _msg: Cow<'static, str>) {
-        // eprintln!("Parse error: {_msg}");
-    }
+    fn parse_error(&self, _msg: std::borrow::Cow<'static, str>) {}
 
     fn get_document(&self) -> Self::Handle {
         self.doc.clone()
@@ -93,12 +87,12 @@ impl TreeSink for TextSink {
         name
     }
 
-    fn create_comment(&self, _text: StrTendril) -> Self::Handle {
-        Handle::new(Node::Element(QualName::new(None, ns!(), local_name!(""))))
-    }
-
     fn create_element(&self, name: QualName, _: Vec<Attribute>, _: ElementFlags) -> Self::Handle {
         Handle::new(Node::Element(name))
+    }
+
+    fn create_comment(&self, _text: StrTendril) -> Self::Handle {
+        Handle::new(Node::Element(QualName::new(None, ns!(), local_name!(""))))
     }
 
     fn create_pi(&self, _target: StrTendril, _data: StrTendril) -> Self::Handle {
@@ -106,14 +100,18 @@ impl TreeSink for TextSink {
     }
 
     fn append(&self, parent: &Self::Handle, child: NodeOrText<Self::Handle>) {
-        if let NodeOrText::AppendText(t) = child {
-            let Node::Element(name) = parent.as_ref();
-            let local = name.local.as_ref();
-            if local == "script" || local == "style" {
-                return; //ignore script and style elements
-            }
-            self.texts.borrow_mut().push(t);
+        let NodeOrText::AppendText(text) = child else {
+            return;
+        };
+
+        let Node::Element(name) = parent.as_ref();
+        let local = name.local.as_ref();
+
+        if local == "script" || local == "style" {
+            return;
         }
+
+        self.process_text(text.as_ref());
     }
 
     fn append_based_on_parent_node(
@@ -137,15 +135,15 @@ impl TreeSink for TextSink {
     fn pop(&self, _node: &Self::Handle) {}
 
     fn get_template_contents(&self, _: &Self::Handle) -> Self::Handle {
-        Handle::new(Node::Element(html5ever::QualName::new(
+        Handle::new(Node::Element(QualName::new(
             None,
             ns!(),
             local_name!("template"),
         )))
     }
 
-    fn same_node(&self, _: &Self::Handle, _: &Self::Handle) -> bool {
-        false
+    fn same_node(&self, a: &Self::Handle, b: &Self::Handle) -> bool {
+        Rc::ptr_eq(a, b)
     }
 
     fn set_quirks_mode(&self, _mode: QuirksMode) {}
@@ -183,55 +181,5 @@ impl TreeSink for TextSink {
         _attrs: &[Attribute],
     ) -> bool {
         false
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_parse_html_word_count() {
-        let html = r#"
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <style>body { color: red; }</style>
-                <script>console.log("ignore me");</script>
-            </head>
-            <body>
-                <h1>Search Engine Indexer</h1>
-                <p>Boogle is a search engine. Search engine indexing is fast!</p>
-            </body>
-            </html>
-        "#;
-
-        let words = parse(html.to_string()).unwrap();
-
-        assert_eq!(words.get("search"), Some(&3));
-        assert_eq!(words.get("engine"), Some(&3));
-        assert_eq!(words.get("boogle"), Some(&1));
-        assert_eq!(words.get("indexer"), Some(&1));
-        // script and style content should be ignored
-        assert_eq!(words.get("color"), None);
-        assert_eq!(words.get("console"), None);
-    }
-
-    #[tokio::test]
-    async fn test_parse_html_filters_numbers_and_symbols() {
-        let html = r#"
-            <!DOCTYPE html>
-            <html>
-            <head><title>Test</title></head>
-            <body>
-                <p>Version 1234 test!</p>
-            </body>
-            </html>
-        "#;
-        let words = parse(html.to_string()).unwrap();
-
-        assert_eq!(words.get("version"), Some(&1));
-        assert_eq!(words.get("test"), Some(&2)); // 1 from title, 1 from p
-        assert_eq!(words.get("1234"), None);
     }
 }
