@@ -1,13 +1,13 @@
 use std::{borrow::Cow, cell::RefCell, collections::HashMap, io::Cursor, io::Error, rc::Rc};
 
 use html5ever::{
+    Attribute, QualName,
     interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink},
     local_name, ns, parse_document,
     tendril::{StrTendril, TendrilSink},
-    Attribute, QualName,
 };
 
-pub async fn parse(html: String) -> Result<HashMap<String, u32>, Error> {
+pub fn parse(html: String) -> Result<HashMap<String, u32>, Error> {
     parse_document(TextSink::new(), Default::default())
         .from_utf8()
         .read_from(&mut Cursor::new(html.as_bytes()))
@@ -45,7 +45,22 @@ impl TreeSink for TextSink {
         for text in self.texts.into_inner() {
             for word in text.to_lowercase().split_whitespace().filter_map(|w| {
                 let trimed_word = w.trim_matches(|c: char| {
-                    c.is_whitespace() || matches!(c, '.' | ',' | ':' | '/' | ';' | '"' | '\'' | '!' | '?' | '(' | ')' | '[' | ']')
+                    c.is_whitespace()
+                        || matches!(
+                            c,
+                            '.' | ','
+                                | ':'
+                                | '/'
+                                | ';'
+                                | '"'
+                                | '\''
+                                | '!'
+                                | '?'
+                                | '('
+                                | ')'
+                                | '['
+                                | ']'
+                        )
                 });
                 if trimed_word.is_empty() || trimed_word.parse::<u32>().is_ok() {
                     return None;
@@ -191,7 +206,7 @@ mod tests {
             </html>
         "#;
 
-        let words = parse(html.to_string()).await.unwrap();
+        let words = parse(html.to_string()).unwrap();
 
         assert_eq!(words.get("search"), Some(&3));
         assert_eq!(words.get("engine"), Some(&3));
@@ -213,11 +228,10 @@ mod tests {
             </body>
             </html>
         "#;
-        let words = parse(html.to_string()).await.unwrap();
+        let words = parse(html.to_string()).unwrap();
 
         assert_eq!(words.get("version"), Some(&1));
         assert_eq!(words.get("test"), Some(&2)); // 1 from title, 1 from p
         assert_eq!(words.get("1234"), None);
     }
 }
-

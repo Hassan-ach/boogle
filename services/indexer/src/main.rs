@@ -1,55 +1,49 @@
 mod core;
 
 use crate::core::config::load_config;
+use crate::core::errors::AppError;
 use crate::core::indexer::Indexe;
 use crate::core::indexer::Indexer;
+use crate::core::messaging::RabbitMQ;
 use crate::core::psql::Psql;
-use slog::{error, info, o, Drain, Logger};
-use std::error::Error;
-use std::fs::OpenOptions;
-use std::io;
-use std::path::Path;
+use crate::core::utils::init_logger;
+use slog::error;
+use slog::info;
+use std::process;
 use std::sync::Arc;
-use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), AppError> {
     let conf = load_config(".env".to_string());
-    let worker_count = conf.app.indexer_count.clone();
-    if worker_count == 0 {
-        panic!("INDEXER_COUNT must be greater than 0");
-    }
-
     let log = init_logger(conf.app.log_path.clone().as_str())?;
-    info!(log, "Indexer service starting up"; "worker_count" => worker_count);
 
     let psql = Psql::new(conf.psql, log.clone()).await?;
-    let indx = Arc::new(Indexer::<Psql>::new(psql, conf.app, log.clone()));
+    let mq = RabbitMQ::new(conf.rabbit, log.clone()).await?;
+    let indx = Arc::new(Indexer::<Psql, RabbitMQ>::new(
+        psql,
+        mq,
+        conf.app,
+        log.clone(),
+    ));
 
     let token = tokio_util::sync::CancellationToken::new();
-    let mut handles = Vec::<JoinHandle<()>>::new();
 
-    // Start multiple indexer tasks
-    for i in 0..worker_count {
-        info!(log, "Starting indexer indexes"; "indexer_id" => i);
-        let token_clone = token.clone();
-        let job = indx.clone();
-        handles.push(tokio::spawn(async move {
-            job.start(token_clone).await;
-        }));
-    }
+    // Start the indexer loop in the background
+    let indexer_handle = tokio::spawn(Arc::clone(&indx).start(token.clone()));
 
+    // Start the sweep loop in the background
+    let sweep_handle = tokio::spawn(Arc::clone(&indx).sweep_loop(token.clone()));
+
+    // Spawn a task to listen for Ctrl-C signal and cancel the token when received
     let log_clone = log.clone();
+    let token_clone = token.clone();
     let sig_handle = tokio::spawn(async move {
-        // listen for Ctrl-C signal
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {
-                info!(log_clone, "Ctrl-C received, sending shutdown signal");
-            }
-            Err(err) => {
-                error!(log_clone, "Failed to listen for Ctrl-C"; "error" => %err);
-            }
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            error!(log_clone, "Failed to listen for Ctrl-C"; "error" => %err);
+        } else {
+            info!(log_clone, "Ctrl-C received, sending shutdown signal");
+            token_clone.cancel();
         }
     });
 
@@ -62,13 +56,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
             info!(log, "Cancellation token was cancelled");
         }
     }
+
+    // Ensure the cancellation token is active if the indexer exited first
     token.cancel();
+
+    // Wait for the consumer loop to stop
+    match indexer_handle.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            error!(log, "Indexer loop exited with error"; "error" => %err);
+            process::exit(1);
+        }
+        Err(err) => {
+            error!(log, "Indexer loop task panicked"; "error" => %err);
+            process::exit(1);
+        }
+    }
+    if let Err(err) = sweep_handle.await {
+        error!(log, "Sweep loop task failed"; "error" => %err);
+        process::exit(1);
+    }
 
     // wait for all indexer tasks to complete, but with a timeout to prevent hanging indefinitely
     match timeout(std::time::Duration::from_secs(30), async {
-        for handle in handles {
-            if let Err(err) = handle.await {
-                error!(log, "Task failed to join"; "error" => %err);
+        let mut tasks = indx.tasks.lock().await;
+        while let Some(result) = tasks.join_next().await {
+            if let Err(err) = result {
+                error!(log, "Indexer worker task failed"; "error" => %err);
             }
         }
     })
@@ -82,46 +96,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     info!(log, "Indexer service shutting down");
+    indx.close().await;
 
     Ok(())
-}
-
-pub fn init_logger(log_file: &str) -> io::Result<Logger> {
-    // Create log directory
-    if let Some(parent) = Path::new(log_file).parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Terminal: Pretty, colored output
-    let term = slog_term::TermDecorator::new()
-        .stderr()
-        .force_color()
-        .build();
-    let term_drain = slog_term::FullFormat::new(term)
-        .use_local_timestamp()
-        .build()
-        .fuse();
-
-    // File: JSON format
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_file)?;
-
-    let json_drain = slog_json::Json::new(file)
-        .add_default_keys()
-        .add_key_value(slog::o!(
-            "service" => "indexer",
-        ))
-        .build()
-        .fuse();
-
-    // Combine both - logs go to terminal AND file
-    let drain = slog::Duplicate::new(term_drain, json_drain).fuse();
-
-    // Wrap in Arc for thread-safe sharing across Tokio tasks
-    // slog_async makes it non-blocking
-    let async_drain = slog_async::Async::new(drain).chan_size(1024).build();
-
-    Ok(Logger::root(Arc::new(async_drain).fuse(), o!()))
 }

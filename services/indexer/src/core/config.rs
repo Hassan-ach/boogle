@@ -1,5 +1,5 @@
 use dotenv::from_path;
-use std::env;
+use std::{env, time::Duration};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -28,8 +28,11 @@ pub struct RabbitConfig {
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub log_path: String,
-    pub loop_delay_ms: u64,
-    pub indexer_count: usize,
+    pub queue_name: String,
+    pub max_concurrent_tasks: usize,
+    pub sweep_interval: std::time::Duration,
+    pub sweep_grace: std::time::Duration,
+    pub confirmation_queue_name: String,
 }
 
 pub fn load_config(env_path: String) -> Config {
@@ -45,19 +48,33 @@ pub fn load_config(env_path: String) -> Config {
 
 fn load_app_config() -> AppConfig {
     let log_path = env::var("LOG_PATH").unwrap_or_else(|_| "indexer.log".to_string());
-    let loop_delay_ms = env::var("LOOP_DELAY_MS")
-        .unwrap_or_else(|_| "100".to_string())
-        .parse::<u64>()
-        .expect("LOOP_DELAY_MS must be a number");
-    let indexer_count = env::var("INDEXER_COUNT")
-        .unwrap_or_else(|_| "4".to_string())
+    let queue_name = env::var("RABBITMQ_QUEUE").unwrap_or_else(|_| "indexer.jobs".to_string());
+    let max_concurrent_tasks = env::var("PG_MAX_CONNECTIONS")
+        .unwrap_or_else(|_| "10".to_string())
         .parse::<usize>()
-        .expect("INDEXER_COUNT must be a number");
+        .expect("PG_MAX_CONNECTIONS must be a number");
+    let sweep_interval = Duration::from_secs(
+        env::var("SWEEP_INTERVAL_SECONDS")
+            .unwrap_or_else(|_| "300".into())
+            .parse()
+            .unwrap_or(300),
+    );
+    let sweep_grace = Duration::from_secs(
+        env::var("SWEEP_GRACE_SECONDS")
+            .unwrap_or_else(|_| "600".into())
+            .parse()
+            .unwrap_or(600),
+    );
+    let confirmation_queue_name = env::var("RABBITMQ_CONFIRMATION_QUEUE")
+        .unwrap_or_else(|_| "indexer.confirmations".to_string());
 
     AppConfig {
         log_path,
-        loop_delay_ms,
-        indexer_count,
+        queue_name,
+        max_concurrent_tasks,
+        sweep_grace,
+        sweep_interval,
+        confirmation_queue_name,
     }
 }
 
@@ -83,6 +100,10 @@ fn load_psql_config() -> PsqlConfig {
         .unwrap_or_else(|_| "500".to_string())
         .parse::<usize>()
         .expect("PAGE_WORD_BATCH_SIZE must be a number");
+    let max_retries = env::var("MAX_RETRIES")
+        .unwrap_or_else(|_| "3".to_string())
+        .parse::<usize>()
+        .expect("MAX_RETRIES must be a number");
 
     PsqlConfig {
         url,
@@ -91,6 +112,7 @@ fn load_psql_config() -> PsqlConfig {
         acquire_timeout_seconds: std::time::Duration::from_secs(acquire_timeout),
         word_batch_size,
         page_word_batch_size,
+        max_retries,
     }
 }
 
