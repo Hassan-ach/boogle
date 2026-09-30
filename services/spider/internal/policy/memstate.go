@@ -202,10 +202,94 @@ func (m *MemoryState) EnqueueDelayed(ctx context.Context, url string, due time.T
 func (m *MemoryState) FrontierLen(ctx context.Context) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.begin(); err != nil {
+	// Named, so a test can fail this read alone. That distinction matters for
+	// the store's seeding decision, which has to tell "the frontier is empty"
+	// from "I could not read the frontier" -- and a fake that can only fail
+	// everything at once cannot express a caller that has to make that choice.
+	if err := m.beginOp("FrontierLen"); err != nil {
 		return 0, err
 	}
 	return int64(len(m.frontier)), nil
+}
+
+// PopFrontier mirrors the Lua script's semantics exactly, including the
+// found/exhausted distinction.
+//
+// The sort is by score descending with member order broken alphabetically, which
+// is how Redis orders a ZSET on equal scores. Matching that matters because the
+// script and this fake are expected to hand a test the same URL, and a fake that
+// ordered differently would hide a scoring bug rather than reproduce it.
+func (m *MemoryState) PopFrontier(ctx context.Context, budget int) (PopResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.beginOp("PopFrontier"); err != nil {
+		return PopResult{}, err
+	}
+	if budget < 1 {
+		budget = defaultPopBatch
+	}
+
+	order := m.frontierOrderLocked()
+	skipped := 0
+
+	for i := 0; i < budget; i++ {
+		if len(order) == 0 {
+			return PopResult{Exhausted: true, VisitedSkipped: skipped}, nil
+		}
+		url := order[0]
+		order = order[1:]
+		delete(m.frontier, url)
+
+		if _, visited := m.visited[url]; visited {
+			skipped++
+			continue
+		}
+		return PopResult{
+			URL:            url,
+			Found:          true,
+			VisitedSkipped: skipped,
+		}, nil
+	}
+
+	// Budget spent on visited entries only. Anything left in the frontier is
+	// still there, so this is deliberately not exhausted.
+	return PopResult{VisitedSkipped: skipped}, nil
+}
+
+func (m *MemoryState) PromoteDelayed(ctx context.Context, now time.Time, batch int) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.beginOp("PromoteDelayed"); err != nil {
+		return 0, err
+	}
+	if batch < 1 {
+		batch = defaultPromoteBatch
+	}
+
+	// Only entries actually due, and only as many as the batch allows. Sorting
+	// first makes the truncation deterministic; the Lua version's ZRANGEBYSCORE
+	// LIMIT breaks ties by member, which this matches by taking the lowest member
+	// among equal due times.
+	due := make([]string, 0, len(m.delayed))
+	for url, at := range m.delayed {
+		if !at.After(now) {
+			due = append(due, url)
+		}
+	}
+	sort.Strings(due)
+	if len(due) > batch {
+		due = due[:batch]
+	}
+
+	for _, url := range due {
+		// ZADD NX: a URL discovered again while parked keeps the score it
+		// earned from its inlinks rather than being reset to zero.
+		if _, exists := m.frontier[url]; !exists {
+			m.frontier[url] = 0
+		}
+		delete(m.delayed, url)
+	}
+	return len(due), nil
 }
 
 func (m *MemoryState) URLState(ctx context.Context, url string) (URLState, error) {

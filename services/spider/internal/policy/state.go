@@ -78,6 +78,18 @@ type State interface {
 	// crawl has work left.
 	FrontierLen(ctx context.Context) (int64, error)
 
+	// PopFrontier takes the highest-priority URL that has not been crawled,
+	// examining at most budget entries while looking for one. See PopResult for
+	// why the answer has to say more than "did you get one".
+	PopFrontier(ctx context.Context, budget int) (PopResult, error)
+	// PromoteDelayed moves URLs whose retry has come due into the frontier, at
+	// most batch per call, and returns how many were moved.
+	//
+	// The caller loops while the return value equals batch. There is no timer
+	// anywhere: a parked URL becomes available because the crawl happens to look,
+	// which is why this runs at the top of every crawl.
+	PromoteDelayed(ctx context.Context, now time.Time, batch int) (int, error)
+
 	// --- per-URL retry bookkeeping ---
 
 	// URLState reads a URL's retry record. A URL with no record is normal, not
@@ -228,6 +240,46 @@ func (h HostState) BudgetExhausted(globalMax int) bool {
 		return false
 	}
 	return h.PagesCrawled >= limit
+}
+
+// PopResult is the answer to one frontier pop.
+//
+// The distinction between "found nothing" and "there is nothing left" is the
+// whole point of this type, and getting it wrong is what made the original crawl
+// loop unbounded. The old script popped the highest-scoring entry, noticed it
+// had already been visited, and returned false -- discarding the entry it had
+// just popped. The caller could not tell that from an empty frontier, so it
+// looped up to maxRetry times burning entries per call, and every entry it
+// burned was gone from the frontier forever. A URL could be popped and silently
+// destroyed between being discovered and being crawled.
+//
+// So a pop has to report three things: the URL if it found one, whether the
+// frontier is now definitively empty, and how many already-visited entries it
+// consumed along the way.
+//
+//   - Found and URL set: crawl it.
+//   - Exhausted: the frontier is empty. The crawl is idle. Stop asking.
+//   - Neither: the scan budget ran out on entries that were all already visited.
+//     There may still be unvisited work behind them, so call again.
+type PopResult struct {
+	// URL is the highest-priority unvisited URL, when Found.
+	URL string
+
+	// Found reports whether URL was returned.
+	Found bool
+
+	// Exhausted reports that the frontier is now definitively empty, so the
+	// crawl has no work left. Distinct from "found nothing this call", which is
+	// what a budget-limited scan reports while leaving work behind.
+	Exhausted bool
+
+	// VisitedSkipped is how many entries this call consumed without producing a
+	// URL: already-visited ones, and the empty member that a write bypassing
+	// Enqueue can leave behind. It is the loop signal -- a non-zero value with
+	// Found false means entries were burned, so there may be more behind them.
+	// A persistently non-zero value means the frontier is mostly stale, which
+	// is worth knowing but not worth acting on beyond the pop itself.
+	VisitedSkipped int
 }
 
 // URLState is the per-URL retry bookkeeping: how many times we have tried, and

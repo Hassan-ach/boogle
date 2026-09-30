@@ -220,6 +220,18 @@ func DefaultBackoffConfig() BackoffConfig {
 type Config struct {
 	BackoffConfig
 
+	// RedisPrefix namespaces every key this package writes.
+	//
+	// It is configurable so that two spiders -- a production one and a test
+	// crawl against the same Redis -- do not share a visited set. If they did,
+	// the test crawl would silently do nothing: every URL it discovered would
+	// look already-visited to the other spider's record, and vice versa.
+	//
+	// The trailing colon is added by the keyspace, not stored here, so that
+	// "boogle:spider" and "boogle:spider:" are one namespace rather than two
+	// that differ by an invisible character.
+	RedisPrefix string
+
 	// MaxPagesPerHost is the page budget for one host *per window*. See
 	// AdmitBudget: a host that exhausts it goes cold, and its counter resets
 	// when the cold period ends. Treating it as a lifetime cap would mean the
@@ -268,6 +280,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		BackoffConfig:       DefaultBackoffConfig(),
+		RedisPrefix:         "boogle:spider",
 		MaxPagesPerHost:     5000,
 		HostColdPeriod:      time.Hour,
 		MinCrawlDelay:       time.Second,

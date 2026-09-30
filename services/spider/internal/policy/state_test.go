@@ -19,6 +19,17 @@ func newTestManager(t *testing.T) (*PolicyManager, *MemoryState) {
 	return New(DefaultConfig(), st, testLogger()), st
 }
 
+// newTestManagerAt is newTestManager with the manager and the state reading the
+// same fixed clock. They have to agree: the manager decides when a retry is due,
+// and the state stamps the entries it writes, so a manager running ahead of the
+// state promotes entries the state believes were written in the future.
+func newTestManagerAt(t *testing.T, now time.Time) (*PolicyManager, *MemoryState) {
+	t.Helper()
+	clock := func() time.Time { return now }
+	st := NewMemoryStateAt(clock)
+	return New(DefaultConfig(), st, testLogger()).WithClock(clock), st
+}
+
 // TestHostGateFailsClosed is the central safety property of the whole package.
 //
 // Redis holds the only record of what has been crawled. If an unreachable state

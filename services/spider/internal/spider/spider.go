@@ -27,6 +27,10 @@ type Spider struct {
 	store      *store.Store
 	mq         messaging.MessagingQueue
 	parser     *parser.Parser
+	// policy owns every decision about what to crawl. The loop below asks it
+	// what to fetch and what a fetch outcome means, and forms no opinion of its
+	// own.
+	policy *policy.PolicyManager
 
 	wg             sync.WaitGroup
 	ctx            context.Context
@@ -48,12 +52,24 @@ func NewSpider(conf *config.Config) *Spider {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// One cache connection, shared. The store needs it for host metadata and the
+	// policy manager needs it for the frontier and the visited set, and two
+	// connections would be two pools for one workload plus an argument about
+	// which of them owns Close.
+	cache := store.NewRedisClient(conf.Store.Cache)
+	policyState := policy.NewRedisState(
+		cache.Conn(),
+		conf.Policy.RedisPrefix,
+		conf.Policy.URLStateTTL,
+	)
+
 	s := &Spider{
 		config:         conf,
 		httpClient:     httpClient,
 		mq:             mq,
 		parser:         parser.NewParser(httpClient, logger),
-		store:          store.NewStore(conf.Store, logger),
+		store:          store.NewStore(conf.Store, logger, cache, policyState),
+		policy:         policy.New(conf.Policy, policyState, logger.Logger),
 		wg:             sync.WaitGroup{},
 		ctx:            ctx,
 		cancel:         cancel,
@@ -133,12 +149,19 @@ func (s *Spider) crawl(crawler_id int) {
 	}
 	defer func() { <-s.fetchpool }()
 
-	rawUrl, ok, err := s.store.GetNextUrl(ctx)
-	if err != nil || !ok {
-		// logger.Warn("Failed to fetch next URL from store", "error", err)
+	// TakeNext promotes due retries and then pops the highest-priority unvisited
+	// URL. Idle is a definitive "the frontier is empty", not a failure and not a
+	// reason to try again this round.
+	next, err := s.policy.TakeNext(ctx)
+	if err != nil {
+		logger.Warn("Could not take the next URL; skipping this round", "error", err)
+		return
+	}
+	if next.Idle {
 		return
 	}
 
+	rawUrl := next.URL
 	logger.Info("Fetched URL from store",
 		"url", rawUrl)
 
@@ -314,15 +337,11 @@ func (s *Spider) newHostMetaData(ctx context.Context, raw string) (host *entity.
 	)
 
 	// persist in store
-	cache := s.store.GetCache()
-	err = cache.AddHostMetaData(ctx, host.Name, host)
+	err = s.store.GetCache().AddHostMetaData(ctx, host.Name, host)
 	if err != nil {
 		s.logger.Error("Failed to store host metadata in cache", "error", err)
 	}
-	err = cache.AddUrls(ctx, sitemaps)
-	if err != nil {
-		s.logger.Error("Failed to add sitemap URLs to cache", "error", err)
-	}
+	s.policy.Discover(ctx, sitemaps)
 
 	return host, nil
 }
