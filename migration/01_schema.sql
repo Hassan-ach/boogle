@@ -13,7 +13,9 @@ CREATE TABLE pages (
     metadata JSONB NOT NULL DEFAULT '{}',
     indexed BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    last_index_attempt_at TIMESTAMP,
+    index_attempts INT NOT NULL DEFAULT 0
 );
 
 CREATE TABLE words (
