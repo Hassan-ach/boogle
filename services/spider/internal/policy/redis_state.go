@@ -221,6 +221,7 @@ func (s *RedisState) HostState(ctx context.Context, host string) (HostState, err
 	st.Status = fields[fieldStatus]
 	st.Allow = splitLines(fields[fieldAllow])
 	st.Disallow = splitLines(fields[fieldDisallow])
+	st.SiteMaps = splitLines(fields[fieldSitemaps])
 	st.WindowStartedAt = parseUnix(fields[fieldWindowStart])
 	st.RobotsFetchedAt = parseUnix(fields[fieldRobotsAt])
 	st.FirstSeen = parseUnix(fields[fieldFirstSeen])
@@ -262,6 +263,9 @@ func (s *RedisState) SaveHostState(ctx context.Context, host string, st HostStat
 	}
 	if len(st.Disallow) > 0 {
 		values[fieldDisallow] = strings.Join(st.Disallow, "\n")
+	}
+	if len(st.SiteMaps) > 0 {
+		values[fieldSitemaps] = strings.Join(st.SiteMaps, "\n")
 	}
 
 	if err := s.conn.HSet(ctx, s.keys.HostState(host), values).Err(); err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 )
 
@@ -39,6 +40,10 @@ type PolicyManager struct {
 	// now is injectable so that cooldowns, cold windows and backoffs can be
 	// tested by moving time rather than by sleeping through it.
 	now func() time.Time
+	// fetchRobots reads a robots.txt. It is a field rather than a direct call so
+	// tests can exercise host resolution without a network; New installs a real
+	// one and WithRobotsFetcher replaces it.
+	fetchRobots RobotsFetcher
 }
 
 // New returns a PolicyManager over the given state.
@@ -55,8 +60,33 @@ func New(cfg Config, state State, logger *slog.Logger) *PolicyManager {
 		state: state,
 		log:   logger,
 		now:   time.Now,
+		fetchRobots: newHTTPRobotsFetcher(
+			nil, defaultUserAgent(cfg)),
 	}
 }
+
+// defaultUserAgent builds the token the crawler identifies itself with.
+//
+// It is derived from Config.UserAgent when set, so the string a robots.txt is
+// matched against and the string sent on the wire are the same value. A site
+// writing "User-agent: BoogleBot" addresses us by that token, and the match
+// failing because the two strings were spelled differently is the kind of bug
+// that presents as "robots.txt ignores us" with nothing in the logs.
+func defaultUserAgent(cfg Config) string {
+	ua := strings.TrimSpace(cfg.UserAgent)
+	if ua == "" {
+		return defaultBotUserAgent
+	}
+	if strings.ContainsAny(ua, "/ \t") {
+		// Already a full header value; a robots.txt token is a prefix of it and
+		// matching is a substring test, so it is sent as written.
+		return ua
+	}
+	return ua + "/1.0 (+https://boogle.example/bot)"
+}
+
+// defaultBotUserAgent is the name the crawler answers to in robots.txt groups.
+const defaultBotUserAgent = "BoogleBot"
 
 // WithClock returns a copy of the manager reading time from now. It exists for
 // tests; production uses time.Now.
@@ -73,6 +103,24 @@ func (m *PolicyManager) Config() Config { return m.cfg }
 
 // Now reads the manager's clock.
 func (m *PolicyManager) Now() time.Time { return m.now() }
+
+// WithConfig returns a copy of the manager running a different configuration.
+//
+// It exists because the interesting configurations are not the shipped one. A
+// test that wants a budget of three cannot wait for five thousand pages, and a
+// test for a cold window cannot sleep for an hour; both are the same code path
+// with a smaller number in it. Production constructs Config once from the
+// environment.
+//
+// The robots fetcher is *not* rebuilt from the new configuration. It was built
+// with a user agent derived from the old one, and rebuilding it here would
+// silently repoint a fetcher a caller had already installed through
+// WithRobotsFetcher.
+func (m *PolicyManager) WithConfig(cfg Config) *PolicyManager {
+	cp := *m
+	cp.cfg = cfg
+	return &cp
+}
 
 // State exposes the underlying state, for the crawl loop's own use and for
 // tests asserting what was written.

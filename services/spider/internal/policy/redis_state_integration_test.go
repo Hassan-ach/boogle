@@ -289,6 +289,7 @@ func TestRedisStateHostStateRoundTrips(t *testing.T) {
 		LastSuccess:     first.Add(2 * time.Hour),
 		Allow:           []string{"/wiki/", "/docs"},
 		Disallow:        []string{"/private/", "/admin/"},
+		SiteMaps:        []string{"https://example.com/sitemap.xml", "https://example.com/news.xml"},
 	}
 	if err := st.SaveHostState(ctx, "example.com", saved); err != nil {
 		t.Fatal(err)
@@ -321,6 +322,12 @@ func TestRedisStateHostStateRoundTrips(t *testing.T) {
 	}
 	if strings.Join(got.Disallow, ",") != "/private/,/admin/" {
 		t.Errorf("Disallow = %v, want [/private/ /admin/]", got.Disallow)
+	}
+	// Sitemaps are collected rather than obeyed, because nothing consumes them
+	// yet -- but collecting them at all was the point of reading the file, and a
+	// round trip that drops them throws away the only copy.
+	if strings.Join(got.SiteMaps, ",") != "https://example.com/sitemap.xml,https://example.com/news.xml" {
+		t.Errorf("SiteMaps = %v, want both sitemaps in order", got.SiteMaps)
 	}
 }
 

@@ -154,7 +154,7 @@ func (m *MemoryState) MarkVisited(ctx context.Context, urls ...string) error {
 func (m *MemoryState) IsVisited(ctx context.Context, url string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.begin(); err != nil {
+	if err := m.beginOp("IsVisited"); err != nil {
 		return false, err
 	}
 	_, ok := m.visited[url]
@@ -407,7 +407,7 @@ func (m *MemoryState) IncrPagesCrawled(ctx context.Context, host string, n int64
 func (m *MemoryState) ResetWindow(ctx context.Context, host string, at time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.begin(); err != nil {
+	if err := m.beginOp("ResetWindow"); err != nil {
 		return err
 	}
 	st := m.host[host]

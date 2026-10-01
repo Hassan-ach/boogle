@@ -92,10 +92,31 @@ func LoadConfig() (*Config, error) {
 // "crawl no pages" -- and both look exactly like a crawl that has finished.
 func loadPolicyConfig() policy.Config {
 	c := policy.DefaultConfig()
+
 	c.RedisPrefix = getWithDefault("SPIDER_REDIS_PREFIX", c.RedisPrefix)
+	c.UserAgent = getWithDefault("SPIDER_USER_AGENT", c.UserAgent)
+
 	c.URLStateTTL = secondsWithDefault("URL_STATE_TTL_SEC", c.URLStateTTL)
+	c.RobotsTTL = secondsWithDefault("ROBOTS_TTL_SEC", c.RobotsTTL)
+	c.HostColdPeriod = secondsWithDefault("HOST_COLD_PERIOD_SEC", c.HostColdPeriod)
+	c.MinCrawlDelay = secondsWithDefault("MIN_CRAWL_DELAY_SEC", c.MinCrawlDelay)
+
+	c.DeadHostBase = secondsWithDefault("DEAD_HOST_BASE_SEC", c.DeadHostBase)
+	c.DeadProbeAfter = secondsWithDefault("DEAD_HOST_PROBE_AFTER_SEC", c.DeadProbeAfter)
+	c.DeadHostMaxExp = getIntWithDefault("DEAD_HOST_MAX_EXP", c.DeadHostMaxExp)
+
+	c.HostCooldownBase = secondsWithDefault("HOST_COOLDOWN_BASE_SEC", c.HostCooldownBase)
+	c.HostCooldownMaxExp = getIntWithDefault("HOST_COOLDOWN_MAX_EXP", c.HostCooldownMaxExp)
+
+	c.URLBackoffBase = secondsWithDefault("URL_BACKOFF_BASE_SEC", c.URLBackoffBase)
+	c.URLBackoffMax = secondsWithDefault("URL_BACKOFF_MAX_SEC", c.URLBackoffMax)
+
 	c.FrontierPopBatch = getIntWithDefault("FRONTIER_POP_BATCH", c.FrontierPopBatch)
 	c.DelayedPromoteBatch = getIntWithDefault("DELAYED_PROMOTE_BATCH", c.DelayedPromoteBatch)
+	c.MaxPagesPerHost = getIntWithDefault("MAX_PAGES_PER_HOST", c.MaxPagesPerHost)
+	c.URLMaxAttempts = getIntWithDefault("URL_MAX_ATTEMPTS", c.URLMaxAttempts)
+	c.MaxRedirects = getIntWithDefault("MAX_REDIRECTS", c.MaxRedirects)
+	c.MaxBodyBytes = getIntWithDefault("MAX_BODY_BYTES", c.MaxBodyBytes)
 	return c
 }
 

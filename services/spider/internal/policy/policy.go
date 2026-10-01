@@ -232,11 +232,33 @@ type Config struct {
 	// that differ by an invisible character.
 	RedisPrefix string
 
+	// UserAgent is the name the crawler answers to in robots.txt groups and the
+	// token it matches rules against.
+	//
+	// It matters more than it looks. The standard matches a group's agent token as
+	// a case-insensitive substring of the crawler's user-agent string, so a site
+	// that writes "User-agent: BoogleBot" and disallows everything addresses us
+	// directly -- and a mismatch here means we index the one site that asked us
+	// not to. A bare name is expanded into a full header value; a value that
+	// already looks like one is sent as written.
+	UserAgent string
+
+	// Rules is the set of skip tables the manager consults. A zero value means
+	// DefaultRules, so a caller building a Config literal gets the shipped
+	// rules rather than none.
+	Rules RuleSet
+
 	// MaxPagesPerHost is the page budget for one host *per window*. See
 	// AdmitBudget: a host that exhausts it goes cold, and its counter resets
 	// when the cold period ends. Treating it as a lifetime cap would mean the
 	// host re-cools the instant it wakes and is never crawled again.
 	MaxPagesPerHost int
+
+	// URLMaxAttempts is how many times one URL is fetched before it is given up
+	// on. Distinct from a host's failure count: a URL that 404s is not a host
+	// having a bad day, and a host that times out once has not made every one of
+	// its URLs unfetchable.
+	URLMaxAttempts int
 
 	// HostColdPeriod is how long an exhausted host stays cold.
 	HostColdPeriod time.Duration
@@ -281,7 +303,10 @@ func DefaultConfig() Config {
 	return Config{
 		BackoffConfig:       DefaultBackoffConfig(),
 		RedisPrefix:         "boogle:spider",
+		UserAgent:           defaultBotUserAgent,
+		Rules:               DefaultRules(),
 		MaxPagesPerHost:     5000,
+		URLMaxAttempts:      3,
 		HostColdPeriod:      time.Hour,
 		MinCrawlDelay:       time.Second,
 		RobotsTTL:           24 * time.Hour,

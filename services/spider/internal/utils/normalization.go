@@ -10,6 +10,17 @@ import (
 	"unicode/utf8"
 )
 
+// The rule tables below are duplicated in policy.RuleSet, which is the copy that
+// actually drives the crawl decision. These exist only for NormalizeUrl's skip
+// half, which policy.Admit supersedes; they are deleted once the last caller
+// moves.
+//
+// While both exist, policy's rules_test asserts they agree. Two tables that
+// cannot be observed to diverge is the whole point: an earlier version of
+// IsDisallowed existed here as two copies, one of which had no guard for an empty
+// rule, and since strings.HasPrefix(p, "") is true for every p a single blank
+// line in one robots.txt blocked an entire host. That bug survived a code review
+// because both copies looked correct and only one was reachable.
 var (
 	disallowPathPrefixes = []string{
 		"/login", "/logout", "/register", "/signup", "/password-reset",
@@ -49,7 +60,33 @@ var (
 	languageSubtagRE = regexp.MustCompile(`^[a-z]{2,8}(-[a-z]{2,8}){0,2}$`)
 )
 
+// NormalizeUrl canonicalises a URL and applies the three legacy skip rules.
+//
+// Deprecated: it decides crawl-worthiness, which is policy's job and not
+// identity's, and the decision belongs where it can be counted. Use
+// CanonicalizeUrl for identity and policy.Admit for the decision; this wrapper
+// survives only until the callers of the skip half are gone.
 func NormalizeUrl(raw string, baseHost string) (string, bool) {
+	return normalize(raw, baseHost, true)
+}
+
+// CanonicalizeUrl answers "what URL is this?" and nothing else.
+//
+// It is NormalizeUrl without the skip rules, and it is what the policy manager
+// calls: canonicalisation has to happen before the skip rules can run at all,
+// because "/admin/../public" and "/admin/x/../y" both clean to "/admin/y" and a
+// rule applied to the uncleaned path would miss them.
+//
+// The split matters more than it looks. A function that both answers "what URL is
+// this?" and "should we crawl it?" cannot be reasoned about, cannot be tested
+// without a policy opinion baked in, and cannot have its decisions counted -- a
+// caller has no way to learn that a URL was dropped rather than normalised, which
+// is why every skip here was invisible in the crawl log.
+func CanonicalizeUrl(raw string, baseHost string) (string, bool) {
+	return normalize(raw, baseHost, false)
+}
+
+func normalize(raw string, baseHost string, applySkips bool) (string, bool) {
 	if !utf8.ValidString(raw) || strings.HasPrefix(raw, "#") {
 		return "", false
 	}
@@ -75,20 +112,33 @@ func NormalizeUrl(raw string, baseHost string) (string, bool) {
 		u.Path = ""
 	}
 
-	if shouldSkipByPath(u.Path) {
-		return "", false
-	}
+	if applySkips {
+		normalizeURLParts(u, baseHost, hadTrailingSlash)
 
-	if shouldSkipByExtension(u.Path) {
-		return "", false
-	}
+		// Deliberately after the rest of canonicalisation, and specifically after
+		// the trailing-slash restoration. The decision has to be about the URL that
+		// will actually be requested: "/report.pdf" and "/report.pdf/" are one key
+		// after cleaning, but the slash comes back because the path holds a dot, so
+		// the document fetched is a directory listing and not the file. Checking
+		// first refused a directory for having a file's name, and checking in a
+		// different order from policy.Admit meant the two copies of this rule
+		// disagreed on exactly that case.
+		if shouldSkipByPath(u.Path) {
+			return "", false
+		}
 
-	if shouldSkipWikiLanguageSubpage(u.Path) {
-		return "", false
+		if shouldSkipByExtension(u.Path) {
+			return "", false
+		}
+
+		if shouldSkipWikiLanguageSubpage(u.Path) {
+			return "", false
+		}
+
+		return u.String(), true
 	}
 
 	normalizeURLParts(u, baseHost, hadTrailingSlash)
-
 	return u.String(), true
 }
 

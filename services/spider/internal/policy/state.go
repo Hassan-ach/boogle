@@ -205,6 +205,45 @@ type HostState struct {
 	// rule that would have unblocked it was the one being ignored.
 	Allow    []string
 	Disallow []string
+
+	// SiteMaps are the Sitemap: URLs from the same robots.txt.
+	//
+	// They are cached here rather than re-read because robots.txt is the only
+	// place a sitemap is advertised, and a host is generally read once and then
+	// crawled for hours. Re-fetching it to re-read a list that has not changed
+	// is a request per host for no information.
+	SiteMaps []string
+}
+
+// WithRobots returns a copy of h carrying a freshly read robots.txt, preserving
+// the counters a robots.txt knows nothing about.
+//
+// This exists because the two halves are rewritten by different events. A
+// robots.txt is re-read on a schedule measured in hours; the page count and the
+// consecutive-failure count are moved by every fetch. Overwriting the record
+// wholesale on a robots re-read silently reset both, which handed every host a
+// fresh page budget once a day and reset a host that had failed five times in a
+// row back to its first backoff -- neither of which anything had decided.
+//
+// fetchedAt is passed in rather than derived from the record because the record's
+// own RobotsFetchedAt is the *previous* read, not this one. Taking the window
+// start from it would date the first window to whenever the host was last seen,
+// which for a host read twice is the second read -- leaving a host whose window
+// start is never set at all, and a budget that can therefore never roll over.
+func (h HostState) WithRobots(name string, allow, disallow, siteMaps []string, crawlDelay time.Duration, fetchedAt time.Time) HostState {
+	out := h
+	out.Name = name
+	out.Allow = allow
+	out.Disallow = disallow
+	out.SiteMaps = siteMaps
+	out.CrawlDelay = crawlDelay
+	out.RobotsFetchedAt = fetchedAt
+	if out.WindowStartedAt.IsZero() {
+		// The first window begins when the host is first resolved, not when a
+		// later robots.txt arrives.
+		out.WindowStartedAt = fetchedAt
+	}
+	return out
 }
 
 // ToEntity renders the state as the in-memory mirror the rest of the spider

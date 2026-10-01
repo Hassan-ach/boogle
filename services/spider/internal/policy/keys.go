@@ -116,6 +116,7 @@ const (
 	fieldLastSuccess  = "last_success"
 	fieldAllow        = "allow"
 	fieldDisallow     = "disallow"
+	fieldSitemaps     = "sitemaps"
 )
 
 // URL state hash fields.
