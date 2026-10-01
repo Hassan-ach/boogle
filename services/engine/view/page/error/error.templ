@@ -8,26 +8,22 @@ templ ErrorPage(status int, message string) {
         <main class="flex-1 flex items-center justify-center px-4">
             <div class="max-w-2xl w-full">
                 <div class="text-center py-16">
-                    <!-- Error Icon -->
                     <div class="mb-6">
                         <svg class="w-32 h-32 mx-auto text-[#ff006e] drop-shadow-[0_0_10px_rgba(255,0,110,0.5)]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
                         </svg>
                     </div>
 
-                    <!-- Error Status Code -->
                     <div class="mb-4">
                         <h1 class="text-8xl font-bold text-[#ff006e] font-['Jersey_10'] tracking-widest drop-shadow-[0_0_10px_rgba(255,0,110,0.3)] animate-pulse">
                             { fmt.Sprintf("%d", status) }
                         </h1>
                     </div>
 
-                    <!-- Error Title -->
                     <h2 class="text-3xl font-medium text-[#ff006e] mb-6 font-['Jersey_10'] tracking-widest">
                         SYSTEM_ERROR: { getErrorTitle(status) }
                     </h2>
 
-                    <!-- Error Message -->
                     <div class="space-y-3 text-lg text-[#a89cc8] font-['VT323'] mb-8">
                         <p class="border-l-4 border-[#ff006e] pl-4 py-2 bg-[#1a0b2e]/50">
                             > ERROR_MSG: { message }
@@ -37,7 +33,6 @@ templ ErrorPage(status int, message string) {
                         </p>
                     </div>
 
-                    <!-- Action Buttons -->
                     <div class="flex justify-center gap-4 mt-8">
                         <a href="/" class="btn-hero">
                             [ Return Home ]
@@ -47,7 +42,6 @@ templ ErrorPage(status int, message string) {
                         </button>
                     </div>
 
-                    <!-- Additional Info -->
                     <div class="mt-12 text-sm text-[#6b5b95] font-['VT323'] space-y-1">
                         <p>> Suggestions: Try refreshing the page or go back to home</p>
                         <p>> If the problem persists, contact support</p>

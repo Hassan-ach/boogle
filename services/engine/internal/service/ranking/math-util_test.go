@@ -16,7 +16,7 @@ func TestDotProduct(t *testing.T) {
 			name:     "identical non-zero vectors",
 			vecA:     []float64{1.0, 2.0, 3.0},
 			vecB:     []float64{1.0, 2.0, 3.0},
-			expected: 14.0, // 1*1 + 2*2 + 3*3 = 14
+			expected: 14.0,
 		},
 		{
 			name:     "orthogonal vectors",

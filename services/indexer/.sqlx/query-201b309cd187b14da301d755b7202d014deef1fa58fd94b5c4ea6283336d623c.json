@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO page_word (page_id, word_id, tf)\n            SELECT $1, * FROM UNNEST($2::uuid[], $3::int4[])\n            ON CONFLICT (page_id, word_id) DO UPDATE SET tf = EXCLUDED.tf\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray",
+        "Int4Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "201b309cd187b14da301d755b7202d014deef1fa58fd94b5c4ea6283336d623c"
+}

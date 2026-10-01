@@ -37,7 +37,6 @@ func extrantMeta(n *html.Node) entity.MetaData {
 	return m
 }
 
-// findHtmlNode traverses top-level nodes to find the <html> ElementNode
 func findHtmlNode(n *html.Node) *html.Node {
 	if n.Type == html.ElementNode && strings.EqualFold(n.Data, "html") {
 		return n
@@ -49,27 +48,19 @@ func findHtmlNode(n *html.Node) *html.Node {
 	}
 	return nil
 }
-func skipNonEnglish(root *html.Node) bool {
+
+func documentLanguage(root *html.Node) string {
 	htmlNode := findHtmlNode(root)
 	if htmlNode == nil {
-		return false
+		return ""
 	}
-	var langValue string
 	for _, attr := range htmlNode.Attr {
 		key := strings.ToLower(attr.Key)
 		if key == "lang" || key == "xml:lang" {
-			langValue = attr.Val
-			break
+			return strings.TrimSpace(attr.Val)
 		}
 	}
-	if langValue != "" {
-		langLower := strings.ToLower(strings.TrimSpace(langValue))
-		// Allow "en", "en-US", "en-GB", etc.
-		if !strings.HasPrefix(langLower, "en") {
-			return true // Non-English content detected
-		}
-	}
-	return false
+	return ""
 }
 
 func traverse(n *html.Node, visit func(*html.Node)) {

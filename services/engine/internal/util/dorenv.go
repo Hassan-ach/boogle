@@ -1,6 +1,7 @@
 package util
 
 import (
+	"math"
 	"os"
 	"strconv"
 )
@@ -25,7 +26,7 @@ func GetIntWithDefault(key string, defaultValue int) int {
 func GetFloatWithDefault(key string, defaultValue float64) float64 {
 	k := GetWithDefault(key, "")
 	v, err := strconv.ParseFloat(k, 64)
-	if err != nil {
+	if err != nil || math.IsNaN(v) {
 		return defaultValue
 	}
 	return v

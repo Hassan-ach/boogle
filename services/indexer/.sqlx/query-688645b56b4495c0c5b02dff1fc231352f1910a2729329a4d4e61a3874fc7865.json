@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH released AS (\n                    UPDATE pages\n                    SET indexed = FALSE\n                    WHERE indexed = TRUE\n                        AND last_index_attempt_at IS NOT NULL\n                        AND last_index_attempt_at < NOW() - make_interval(secs => $1)\n                    RETURNING id\n                )\n                DELETE FROM page_word pw\n                USING released\n                WHERE pw.page_id = released.id",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "688645b56b4495c0c5b02dff1fc231352f1910a2729329a4d4e61a3874fc7865"
+}

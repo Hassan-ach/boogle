@@ -80,7 +80,6 @@ func TestRankingService_Rank(t *testing.T) {
 		id2 := uuid.New()
 		id3 := uuid.New()
 
-		// Page 1: high term frequency for query terms, high PageRank
 		page1 := &model.Page{
 			ID:       id1,
 			URL:      "https://high-relevance.com",
@@ -88,7 +87,6 @@ func TestRankingService_Rank(t *testing.T) {
 			Words:    map[string]int{"search": 10, "engine": 5},
 			MetaData: model.MetaData{Title: "High Relevance"},
 		}
-		// Page 2: medium term frequency, medium PageRank
 		page2 := &model.Page{
 			ID:       id2,
 			URL:      "https://medium-relevance.com",
@@ -96,7 +94,6 @@ func TestRankingService_Rank(t *testing.T) {
 			Words:    map[string]int{"search": 2, "engine": 1},
 			MetaData: model.MetaData{Title: "Medium Relevance"},
 		}
-		// Page 3: low relevance, low PageRank
 		page3 := &model.Page{
 			ID:       id3,
 			URL:      "https://low-relevance.com",
@@ -137,12 +134,10 @@ func TestRankingService_Rank(t *testing.T) {
 			t.Fatalf("expected 3 ranked pages, got %d", len(ranked))
 		}
 
-		// Verify page1 is ranked first because of highest relevance + PRScore
 		if ranked[0].URL != "https://high-relevance.com" {
 			t.Errorf("expected first ranked page to be high-relevance, got %s", ranked[0].URL)
 		}
 
-		// Verify every ranked page has GlobalScore calculated
 		for _, p := range ranked {
 			if p.GlobalScore < 0 {
 				t.Errorf("page %s has invalid global score %f", p.URL, p.GlobalScore)

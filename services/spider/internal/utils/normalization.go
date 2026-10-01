@@ -2,6 +2,7 @@ package utils
 
 import (
 	"net/url"
+	"path"
 	"regexp"
 	"slices"
 	"sort"
@@ -10,24 +11,11 @@ import (
 )
 
 var (
-	disallowPathPrefixes = []string{
-		"/login", "/logout", "/register", "/signup", "/password-reset",
-		"/account/", "/cart", "/checkout", "/order/", "/payment/",
-		"/search", "/filter/", "/admin/", "/dashboard/", "/settings/",
-		"/404", "/error/", "/maintenance", "/test/", "/print/", "/preview/", "/tag/",
-	}
-
+	// Pagination and sort parameters generate unbounded near-duplicate URLs for
+	// one page of content, so they are dropped during canonicalization instead of
+	// being crawled. The content parameter (id, p, article) is deliberately absent.
 	disallowQueryParams = []string{
 		"sort", "page", "filter", "q", "search",
-	}
-
-	skipFileExtensions = []string{
-		".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-		".zip", ".rar", ".7z", ".tar", ".gz", ".exe", ".msi", ".dmg", ".apk",
-		".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp", ".svg",
-		".mp3", ".wav", ".aac", ".ogg", ".flac",
-		".mp4", ".avi", ".mov", ".wmv", ".mkv", ".flv", ".webm",
-		".css", ".js", ".ico",
 	}
 
 	langSubdomainDomains = []string{
@@ -35,12 +23,22 @@ var (
 		"wikibooks.org",
 		"wikivoyage.org",
 	}
-	// Wiki-specific: blocks /Template:Foo/xx/, /Help:Bar/en/, etc.
-	wikiLangSubpageRE   = regexp.MustCompile(`(?i)/[a-z]{2,3}(-[a-z]{2,4})?/?$`)
-	wikiNoisyNamespaces = []string{"/Template:", "/Help:", "/Manual:", "/Extension:"}
+
+	languageSubtagRE = regexp.MustCompile(`^[a-z]{2,8}(-[a-z]{2,8}){0,2}$`)
 )
 
 func NormalizeUrl(raw string, baseHost string) (string, bool) {
+	return CanonicalizeUrl(raw, baseHost)
+}
+
+// CanonicalizeUrl reduces a URL to the single form the spider treats as "the
+// same page", which is what makes the visited set and the frontier deduplicate
+// work. Two links are the same page if they differ only in scheme, www, case,
+// default port, fragment, trailing slash or query-parameter order.
+//
+// The rewrite is aggressive on purpose: a crawler that treats /a and /a/ as
+// distinct pages fetches both and indexes duplicate content.
+func CanonicalizeUrl(raw string, baseHost string) (string, bool) {
 	if !utf8.ValidString(raw) || strings.HasPrefix(raw, "#") {
 		return "", false
 	}
@@ -50,76 +48,33 @@ func NormalizeUrl(raw string, baseHost string) (string, bool) {
 		return "", false
 	}
 
-	if shouldSkipByPath(u.Path) {
-		return "", false
+	hadTrailingSlash := strings.HasSuffix(u.Path, "/")
+	u.Path = path.Clean("/" + u.Path)
+	if u.Path == "/" {
+		u.Path = ""
 	}
 
-	if shouldSkipByExtension(u.Path) {
-		return "", false
-	}
-
-	if shouldSkipWikiLanguageSubpage(u.Path) {
-		return "", false
-	}
-
-	normalizeURLParts(u, baseHost)
-
+	normalizeURLParts(u, baseHost, hadTrailingSlash)
 	return u.String(), true
-}
-
-func shouldSkipByPath(path string) bool {
-	for _, prefix := range disallowPathPrefixes {
-		if path == prefix || strings.HasPrefix(path, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func shouldSkipByExtension(path string) bool {
-	pathLower := strings.ToLower(path)
-	for _, ext := range skipFileExtensions {
-		if strings.HasSuffix(pathLower, ext) {
-			return true
-		}
-	}
-	return false
 }
 
 func isValidQueryParam(q string) bool {
 	return !slices.Contains(disallowQueryParams, q)
 }
 
-func shouldSkipWikiLanguageSubpage(path string) bool {
-	if !wikiLangSubpageRE.MatchString(path) {
-		return false
-	}
-	for _, ns := range wikiNoisyNamespaces {
-		if strings.Contains(path, ns) {
-			return true
-		}
-	}
-	return false
-}
-
-func normalizeURLParts(u *url.URL, baseHost string) {
-	// Force HTTPS
+func normalizeURLParts(u *url.URL, baseHost string, hadTrailingSlash bool) {
 	u.Scheme = "https"
 
-	// Fill host if relative URL
 	if u.Host == "" && baseHost != "" {
 		u.Host = baseHost
 	}
 
-	// Clean host
 	u.Host = strings.TrimPrefix(strings.ToLower(u.Host), "www.")
 
 	forceEnglishSubdomain(u)
 
-	// Remove fragment
 	u.Fragment = ""
 
-	// Canonicalize query: sorted keys
 	if u.RawQuery != "" {
 		q := u.Query()
 		keys := make([]string, 0, len(q))
@@ -137,30 +92,22 @@ func normalizeURLParts(u *url.URL, baseHost string) {
 		u.RawQuery = sorted.Encode()
 	}
 
-	// Remove trailing slash
-	if len(u.Query()) == 0 &&
-		u.Path != "" &&
-		strings.HasSuffix(u.Path, "/") &&
-		!strings.Contains(u.Path, ".") {
-		u.Path = strings.TrimSuffix(u.Path, "/")
-	}
-}
-
-func NormalizeUrls(raws []string, baseHost string) []string {
-	result := make([]string, 0, len(raws))
-	for _, raw := range raws {
-		if norm, ok := NormalizeUrl(raw, baseHost); ok {
-			result = append(result, norm)
+	if hadTrailingSlash && u.Path != "" && !strings.HasSuffix(u.Path, "/") {
+		if len(u.Query()) > 0 || strings.Contains(u.Path, ".") {
+			u.Path += "/"
 		}
 	}
-	return result
 }
 
+// forceEnglishSubdomain rewrites fr.wikipedia.org to en.wikipedia.org, since
+// the index stores English only and the two are otherwise separate pages with
+// identical content. It is scoped to the Wikimedia hosts in langSubdomainDomains
+// rather than applied generally, because elsewhere a language subdomain is a
+// genuinely different site.
 func forceEnglishSubdomain(u *url.URL) {
 	u.Host = strings.ToLower(u.Host)
 	u.Host = strings.TrimPrefix(u.Host, "www.")
 
-	// Only act on known wiki-family domains
 	isKnownLangDomain := false
 	for _, d := range langSubdomainDomains {
 		if strings.HasSuffix(u.Host, d) {
@@ -181,15 +128,26 @@ func forceEnglishSubdomain(u *url.URL) {
 	rest := strings.Join(hostParts[1:], ".")
 
 	if potentialLang == "en" {
-		return // already English
+		return
 	}
 
-	isLang := len(potentialLang) >= 2 && len(potentialLang) <= 5 &&
-		regexp.MustCompile(`^[a-z]+(-[a-z]+)?$`).MatchString(potentialLang)
-
-	if isLang {
+	if languageSubtagRE.MatchString(potentialLang) {
 		u.Host = "en." + rest
 	}
+}
+
+func NormalizeUrls(raws []string, baseHost string) []string {
+	return CanonicalizeUrls(raws, baseHost)
+}
+
+func CanonicalizeUrls(raws []string, baseHost string) []string {
+	result := make([]string, 0, len(raws))
+	for _, raw := range raws {
+		if norm, ok := CanonicalizeUrl(raw, baseHost); ok {
+			result = append(result, norm)
+		}
+	}
+	return result
 }
 
 func ValidateLinks(links []string, disallowed []string) []string {
@@ -204,15 +162,13 @@ func ValidateLinks(links []string, disallowed []string) []string {
 	return normUrls.GetAll()
 }
 
-func isDisallowed(path string, disallowed []string) bool {
+func IsDisallowed(path string, disallowed []string) bool {
 	for _, d := range disallowed {
-		// detect if pattern looks like regex
+		if d == "" {
+			continue
+		}
 		if strings.ContainsAny(d, `.^$*+?[]|()`) {
-			matched, err := regexp.MatchString(d, path)
-			if err != nil {
-				continue
-			}
-			if matched {
+			if matched, err := regexp.MatchString(d, path); err == nil && matched {
 				return true
 			}
 		} else {
@@ -224,21 +180,6 @@ func isDisallowed(path string, disallowed []string) bool {
 	return false
 }
 
-func IsDisallowed(path string, disallowed []string) bool {
-	for _, d := range disallowed {
-		if d == "" {
-			continue
-		}
-		// Check for regex or prefix pattern
-		if strings.ContainsAny(d, `.^$*+?[]|()`) {
-			if matched, _ := regexp.MatchString(d, path); matched {
-				return true
-			}
-		} else {
-			if strings.HasPrefix(path, d) {
-				return true
-			}
-		}
-	}
-	return false
+func isDisallowed(p string, disallowed []string) bool {
+	return IsDisallowed(p, disallowed)
 }

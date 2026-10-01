@@ -36,11 +36,6 @@ func TestNormalizeTFIDF(t *testing.T) {
 
 	normalizeTFIDF(pages)
 
-	// Min is 10.0, Max is 30.0, Range is 20.0
-	// p1: (10-10)/20 = 0.0
-	// p2: (20-10)/20 = 0.5
-	// p3: (30-10)/20 = 1.0
-
 	if pages[p1] != 0.0 {
 		t.Errorf("expected p1 normalized to 0.0, got %f", pages[p1])
 	}
@@ -53,14 +48,12 @@ func TestNormalizeTFIDF(t *testing.T) {
 }
 
 func TestNormalizeTFIDF_EmptyAndEqual(t *testing.T) {
-	// Test empty map
 	emptyPages := map[*model.Page]float64{}
 	normalizeTFIDF(emptyPages)
 	if len(emptyPages) != 0 {
 		t.Errorf("expected empty map to remain empty")
 	}
 
-	// Test equal values (dom == 0)
 	p1 := &model.Page{ID: uuid.New()}
 	p2 := &model.Page{ID: uuid.New()}
 	equalPages := map[*model.Page]float64{

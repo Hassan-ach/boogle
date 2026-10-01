@@ -2,7 +2,6 @@ package util
 
 import "github.com/google/uuid"
 
-// Mapper defines the common interface
 type Mapper[k comparable] interface {
 	MapValue(id k)
 	GetIndex(id k) (int, bool)
@@ -11,13 +10,9 @@ type Mapper[k comparable] interface {
 	GetValueByIndex(idx int) (k, bool)
 }
 
-// ───────────────────────────────────────────────
-// PageMapper – maps uuid.UUID → dense index
-// ───────────────────────────────────────────────
-
 type PageMapper struct {
 	index     map[uuid.UUID]int
-	reverse   []uuid.UUID // allows GetValueByIndex
+	reverse   []uuid.UUID
 	nextIndex int
 }
 
@@ -43,7 +38,6 @@ func (m PageMapper) GetIndex(id uuid.UUID) (int, bool) {
 }
 
 func (m PageMapper) GetValues() []uuid.UUID {
-	// return copy to prevent external mutation
 	dst := make([]uuid.UUID, len(m.reverse))
 	copy(dst, m.reverse)
 	return dst
@@ -59,10 +53,6 @@ func (m PageMapper) GetValueByIndex(idx int) (uuid.UUID, bool) {
 	}
 	return m.reverse[idx], true
 }
-
-// ───────────────────────────────────────────────
-// WordMapper – maps string → dense index
-// ───────────────────────────────────────────────
 
 type WordMapper struct {
 	index   map[string]int

@@ -22,6 +22,10 @@ serde = { version = "1", features = ["derive"] }
 async-trait = "0.1.92"
 thiserror = "2.0.21"
 
+[dev-dependencies]
+# `full` does not include `test-util`, which `#[tokio::test(start_paused)]` needs.
+tokio = { version = "1.0", features = ["test-util"] }
+
 [profile.release]
 opt-level = 3
 lto = "fat"

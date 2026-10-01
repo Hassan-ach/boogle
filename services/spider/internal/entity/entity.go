@@ -5,13 +5,13 @@ import (
 )
 
 type Host struct {
-	MaxRetry        int      // Maximum retries per URL
-	MaxPages        int      // Maximum pages to crawl for this host
-	PagesCrawled    int      // Pages already crawled
-	Delay           int      // Delay between requests in seconds
-	Name            string   // Hostname
-	AllowedUrls     []string // URL patterns allowed to crawl
-	NotAllowedPaths []string // Paths disallowed to crawl (typo kept for backward compatibility)
+	MaxRetry        int
+	MaxPages        int
+	PagesCrawled    int
+	Delay           int
+	Name            string
+	AllowedUrls     []string
+	NotAllowedPaths []string
 }
 type MetaData struct {
 	URL         string    `json:"url"`
@@ -22,6 +22,7 @@ type MetaData struct {
 	Locale      string    `json:"locale,omitempty"`
 	Keywords    []string  `json:"keywords,omitempty"`
 	Icons       []string  `json:"icons,omitempty"`
+	Lang        string    `json:"lang,omitempty"`
 	CrawledAt   time.Time `json:"crawledAt"`
 }
 
@@ -33,9 +34,9 @@ type Robots struct {
 }
 
 type Page struct {
-	MetaData          // embeds MetaData
-	StatusCode int    // HTTP response code
-	HTML       []byte // Raw HTML content
+	MetaData
+	StatusCode int
+	HTML       []byte
 	Images     []string
 	Links      []string
 }

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pages\n                    SET indexed = FALSE,\n                    last_index_attempt_at = NOW(),\n                    index_attempts = index_attempts + 1\n                    WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4ade01f357525981be2afb9cf4fc808293a73aca825d0820f3a24aa3459825e1"
+}

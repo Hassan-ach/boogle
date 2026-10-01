@@ -19,9 +19,7 @@ type SQLClient struct {
 	conn *sql.DB
 }
 
-// NewDbClient creates and returns a PostgreSQL DB client.
 func NewDbClient(conf config.PSQLConfig) *SQLClient {
-	// fix this connection string construction
 	psqlconn := fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
 		conf.Host,
@@ -31,7 +29,6 @@ func NewDbClient(conf config.PSQLConfig) *SQLClient {
 		conf.DBname,
 	)
 
-	// Open connection. sql.Open does not establish a connection immediately, it validates arguments.
 	db, err := sql.Open("postgres", psqlconn)
 	if err != nil {
 		log.Fatalf(
@@ -40,7 +37,6 @@ func NewDbClient(conf config.PSQLConfig) *SQLClient {
 		)
 	}
 
-	// Ping ensures the database is reachable and the connection is valid.
 	err = db.Ping()
 	if err != nil {
 		log.Fatalf("Failed to ping postgres ERROR: %v", err)
@@ -61,7 +57,6 @@ func (c *SQLClient) Close() {
 	_ = c.conn.Close()
 }
 
-// WithTx executes a function within a database transaction.
 func (c *SQLClient) WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	tx, err := c.conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -80,7 +75,6 @@ func (c *SQLClient) WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error
 	return nil
 }
 
-// Page stores a crawled page in the "pages" table.
 func (c *SQLClient) InsertPage(ctx context.Context, tx *sql.Tx, page *entity.Page) (uuid.UUID, error) {
 	var url_id string
 	err := tx.QueryRowContext(ctx,
@@ -121,8 +115,6 @@ func (c *SQLClient) InsertPage(ctx context.Context, tx *sql.Tx, page *entity.Pag
 	return id, nil
 }
 
-// InsertGraphEdges from page id → many page ids
-// - batch-inserts edges using IDs
 func (c *SQLClient) InsertGraphEdges(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -155,7 +147,6 @@ func (c *SQLClient) InsertGraphEdges(
 	return nil
 }
 
-// InsertURLs inserts or gets existing IDs — returns []string [from_url_id, to_url_ids...]
 func (c *SQLClient) InsertURLs(ctx context.Context, tx *sql.Tx, urls []string) ([]string, error) {
 	if len(urls) == 0 {
 		return make([]string, 0), nil
@@ -203,10 +194,6 @@ func (c *SQLClient) InsertURLs(ctx context.Context, tx *sql.Tx, urls []string) (
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-
-	// if len(m) != len(urls) {
-	// 	return nil, fmt.Errorf("got %d ids back, expected %d", len(m), len(urls))
-	// }
 
 	return m, nil
 }

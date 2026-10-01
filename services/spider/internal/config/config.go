@@ -5,6 +5,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/Hassan-ach/boogle/services/spider/internal/policy"
 )
 
 type RabbitMqConfig struct {
@@ -20,8 +22,6 @@ type RedisConfig struct {
 	Password string
 	DB       int
 	Port     int
-	Delay    int
-	MaxRetry int
 }
 
 type PSQLConfig struct {
@@ -59,6 +59,7 @@ type Config struct {
 	App      AppConfig
 	Store    StoreConfig
 	RabbitMq RabbitMqConfig
+	Policy   policy.Config
 }
 
 func LoadConfig() (*Config, error) {
@@ -66,11 +67,62 @@ func LoadConfig() (*Config, error) {
 		App:      loadAppConfig(),
 		Store:    loadStoreConfig(),
 		RabbitMq: loadRabbitMqConfig(),
+		Policy:   loadPolicyConfig(),
 	}
 
 	fmt.Printf("%+v\n", c)
 
 	return c, nil
+}
+
+// loadPolicyConfig starts from policy.DefaultConfig and overrides only the fields
+// an operator can reasonably be expected to change, so a new policy knob is
+// usable without an environment variable and the two defaults cannot drift.
+func loadPolicyConfig() policy.Config {
+	c := policy.DefaultConfig()
+
+	c.RedisPrefix = getWithDefault("SPIDER_REDIS_PREFIX", c.RedisPrefix)
+	c.UserAgent = getWithDefault("SPIDER_USER_AGENT", c.UserAgent)
+
+	c.URLStateTTL = secondsWithDefault("URL_STATE_TTL_SEC", c.URLStateTTL)
+	c.RobotsTTL = secondsWithDefault("ROBOTS_TTL_SEC", c.RobotsTTL)
+	c.HostColdPeriod = secondsWithDefault("HOST_COLD_PERIOD_SEC", c.HostColdPeriod)
+	c.MinCrawlDelay = secondsWithDefault("MIN_CRAWL_DELAY_SEC", c.MinCrawlDelay)
+
+	c.DeadHostBase = secondsWithDefault("DEAD_HOST_BASE_SEC", c.DeadHostBase)
+	c.DeadProbeAfter = secondsWithDefault("DEAD_HOST_PROBE_AFTER_SEC", c.DeadProbeAfter)
+	c.DeadHostMaxExp = getIntWithDefault("DEAD_HOST_MAX_EXP", c.DeadHostMaxExp)
+
+	c.HostCooldownBase = secondsWithDefault("HOST_COOLDOWN_BASE_SEC", c.HostCooldownBase)
+	c.HostCooldownMaxExp = getIntWithDefault("HOST_COOLDOWN_MAX_EXP", c.HostCooldownMaxExp)
+
+	c.URLBackoffBase = secondsWithDefault("URL_BACKOFF_BASE_SEC", c.URLBackoffBase)
+	c.URLBackoffMax = secondsWithDefault("URL_BACKOFF_MAX_SEC", c.URLBackoffMax)
+
+	c.DelayedPromoteBatch = getIntWithDefault("DELAYED_PROMOTE_BATCH", c.DelayedPromoteBatch)
+	c.FrontierPopBatch = getIntWithDefault("FRONTIER_POP_BATCH",
+		getIntWithDefault("REDIS_MAX_RETRY", c.FrontierPopBatch))
+	c.MaxPagesPerHost = getIntWithDefault("MAX_PAGES_PER_HOST", c.MaxPagesPerHost)
+	c.URLMaxAttempts = getIntWithDefault("URL_MAX_ATTEMPTS", c.URLMaxAttempts)
+	c.MaxRedirects = getIntWithDefault("MAX_REDIRECTS", c.MaxRedirects)
+	c.MaxBodyBytes = getIntWithDefault("MAX_BODY_BYTES", c.MaxBodyBytes)
+	return c
+}
+
+// secondsWithDefault reads a duration expressed in whole seconds. A missing,
+// unparseable, zero or negative value silently falls back and says so on stdout:
+// a bad tuning value should not stop the spider from starting.
+func secondsWithDefault(key string, fallback time.Duration) time.Duration {
+	raw := getWithDefault(key, "")
+	if raw == "" {
+		return fallback
+	}
+	secs, err := strconv.Atoi(raw)
+	if err != nil || secs <= 0 {
+		fmt.Printf("%s=%q is not a positive number of seconds; using %s\n", key, raw, fallback)
+		return fallback
+	}
+	return time.Duration(secs) * time.Second
 }
 
 func loadRabbitMqConfig() RabbitMqConfig {
@@ -126,16 +178,12 @@ func loadRedisConfig() RedisConfig {
 	password := getWithDefault("REDIS_PASSWORD", "")
 	db := getIntWithDefault("REDIS_DB", 1)
 	port := getIntWithDefault("REDIS_PORT", 6379)
-	delay := getIntWithDefault("REDIS_DELAY", 5)
-	maxRetry := getIntWithDefault("REDIS_MAX_RETRY", 10)
 
 	return RedisConfig{
 		Addr:     addr,
 		Password: password,
 		Port:     port,
 		DB:       db,
-		Delay:    delay,
-		MaxRetry: maxRetry,
 	}
 }
 

@@ -21,6 +21,9 @@ type Store interface {
 	GetTotalPages(c context.Context, query []string) (int, error)
 }
 
+// Data is one query's worth of loaded state. The mappers come from the same load
+// as Pages, which is what lets the ranker index into a dense matrix and why it
+// panics on a missing entry rather than skipping.
 type Data struct {
 	Pages      []*model.Page
 	Idf        map[string]float64
@@ -32,6 +35,9 @@ type PsqlStore struct {
 	conf store.StoreConfig
 }
 
+// NewStore opens the pool and pings. Both failures are fatal: the engine serves
+// nothing without Postgres, and failing at boot surfaces the misconfiguration
+// instead of returning empty result pages to every query.
 func NewStore(conf store.StoreConfig) PsqlStore {
 	urls := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
 		conf.DB.Host, conf.DB.Port, conf.DB.User, conf.DB.Password, conf.DB.DBName)
@@ -55,6 +61,16 @@ func NewStore(conf store.StoreConfig) PsqlStore {
 	}
 }
 
+// GetData returns one page of results for the given query words.
+//
+// Ranking happens in SQL rather than in Go: the CTE groups by page, counts
+// distinct matching words and aggregates each page's tf/idf pairs, then orders by
+// that count. So the candidate set is narrowed to PageSize rows in the database,
+// and the Go side only re-ranks that window with cosine similarity. Ordering
+// here is the coarse pass (coverage, then PageRank); the engine's blend is the
+// fine one.
+//
+// pageNum is zero-based, so callers pass page-1 from the query string.
 func (s PsqlStore) GetData(c context.Context, words []string, pageNum int) (*Data, error) {
 	sql := `
 		WITH ranked AS (
@@ -151,6 +167,10 @@ func (s PsqlStore) GetData(c context.Context, words []string, pageNum int) (*Dat
 		pgs = append(pgs, page)
 	}
 
+	if err := rows.Err(); err != nil {
+		return nil, apperror.Internal(fmt.Errorf("failed while reading results: %w", err))
+	}
+
 	pageMapper := util.NewPageMapper()
 
 	for _, page := range pgs {
@@ -169,6 +189,9 @@ func (s PsqlStore) GetData(c context.Context, words []string, pageNum int) (*Dat
 	}, nil
 }
 
+// GetTotalPages counts every page matching any query word, not just the window
+// GetData returns. It therefore counts pages the SQL ranking would never surface,
+// so the page count is an upper bound on what a user can page through.
 func (s PsqlStore) GetTotalPages(c context.Context, query []string) (int, error) {
 	sql := `
 		SELECT COUNT(DISTINCT p.id)

@@ -5,3 +5,14 @@ dev:
 
 build:
     RUSTFLAGS="-C target-cpu=native" cargo build --release
+
+# Fast unit tests. No live services required.
+test:
+    cargo test
+
+test-cov:
+    cargo llvm-cov --summary-only || cargo test
+
+# Tests that need live Postgres (ignored by default; run with --ignored).
+test-integration:
+    cargo test -- --ignored --nocapture

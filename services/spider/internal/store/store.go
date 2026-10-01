@@ -9,17 +9,13 @@ import (
 
 	"github.com/Hassan-ach/boogle/services/spider/internal/config"
 	"github.com/Hassan-ach/boogle/services/spider/internal/entity"
+	"github.com/Hassan-ach/boogle/services/spider/internal/policy"
 	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
 
 type Cache interface {
 	AddHostMetaData(ctx context.Context, h string, host *entity.Host) error
 	GetHostMetaData(ctx context.Context, h string) (*entity.Host, bool, error)
-	GetUrl(ctx context.Context) (string, bool, error)
-	AddUrls(ctx context.Context, urls []string) error
-	MarkVisited(ctx context.Context, u string) error
-	AddToWaitedHost(ctx context.Context, h string, delay int) error
-	CountUrls(ctx context.Context) int64
 	Close()
 }
 type DB interface {
@@ -33,17 +29,16 @@ type DB interface {
 type Store struct {
 	db     DB
 	cache  Cache
+	state  policy.State
 	config *config.StoreConfig
 	log    *slog.Logger
 }
 
-func NewStore(conf config.StoreConfig, log *utils.Logger) *Store {
-	db := NewDbClient(conf.DB)
-	rd := NewRedisClient(conf.Cache)
-
+func NewStore(conf config.StoreConfig, log *utils.Logger, cache Cache, state policy.State) *Store {
 	return &Store{
-		db:     db,
-		cache:  rd,
+		db:     NewDbClient(conf.DB),
+		cache:  cache,
+		state:  state,
 		config: &conf,
 		log:    log.With("component", "store"),
 	}
@@ -96,32 +91,14 @@ func (s *Store) persistPage(ctx context.Context, page *entity.Page) (pageID uuid
 		s.log.Warn("", "url", page.URL, "err", err)
 		return pageID, err
 	}
-	err = s.cache.MarkVisited(ctx, page.URL)
-	if err != nil {
-		s.log.Warn("add URL to visited set", "url", page.URL, "error", err)
-		return pageID, err
-	}
-	err = s.cache.AddUrls(ctx, page.Links)
-	if err != nil {
-		s.log.Warn("add linked URLs to cache", "url", page.URL, "error", err)
-	}
 	return pageID, nil
 }
 
 func (s *Store) persistHost(ctx context.Context, host *entity.Host) {
-	err := s.cache.AddToWaitedHost(ctx, host.Name, host.Delay)
-	if err != nil {
-		s.log.Warn("add host to waited set", "host", host.Name, "error", err)
-	}
-	err = s.cache.AddHostMetaData(ctx, host.Name, host)
+	err := s.cache.AddHostMetaData(ctx, host.Name, host)
 	if err != nil {
 		s.log.Warn("add host metadata to cache", "host", host.Name, "error", err)
 	}
-}
-
-func (s *Store) GetNextUrl(ctx context.Context) (string, bool, error) {
-	// i need to handle err and fetching from db
-	return s.cache.GetUrl(ctx)
 }
 
 func (s *Store) GetHostMetaData(ctx context.Context, h string) (*entity.Host, bool, error) {
@@ -129,13 +106,22 @@ func (s *Store) GetHostMetaData(ctx context.Context, h string) (*entity.Host, bo
 }
 
 func (s *Store) Init(starters []string) error {
-	if s.cache.CountUrls(context.Background()) > 0 {
+	ctx := context.Background()
+
+	queued, err := s.state.FrontierLen(ctx)
+	if err != nil {
+		return fmt.Errorf("read frontier length: %w", err)
+	}
+	if queued > 0 {
+		s.log.Info("frontier already has work; not seeding",
+			"queued", queued, "starters", len(starters))
 		return nil
 	}
-	err := s.cache.AddUrls(context.Background(), starters)
-	if err != nil {
-		return err
+
+	if err := s.state.Enqueue(ctx, starters...); err != nil {
+		return fmt.Errorf("seed frontier: %w", err)
 	}
+	s.log.Info("frontier seeded", "starters", len(starters))
 	return nil
 }
 

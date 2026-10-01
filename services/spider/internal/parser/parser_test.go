@@ -73,3 +73,28 @@ func TestParseHTML(t *testing.T) {
 		t.Errorf("expected links to be parsed, got 0")
 	}
 }
+
+func TestAPageThatListsTheSameURLTwiceCrawlsItOnce(t *testing.T) {
+	html := `<!doctype html><html lang="en"><head><title>t</title></head><body>` +
+		`<a href="/about">about</a>` +
+		`<a href="https://example.com/about">about again</a>` +
+		`<a href="/about#team">about a third time</a>` +
+		`<a href="/other">other</a>` +
+		`</body></html>`
+
+	p := NewParser(nil, newTestLogger())
+	page, err := p.ParseHTML(strings.NewReader(html), "https://example.com/")
+	if err != nil {
+		t.Fatalf("ParseHTML failed: %v", err)
+	}
+
+	want := []string{"https://example.com/about", "https://example.com/other"}
+	if len(page.Links) != len(want) {
+		t.Fatalf("extracted %d links, want %d: %v", len(page.Links), len(want), page.Links)
+	}
+	for i := range want {
+		if page.Links[i] != want[i] {
+			t.Errorf("Links[%d] = %q, want %q", i, page.Links[i], want[i])
+		}
+	}
+}

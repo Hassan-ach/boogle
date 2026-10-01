@@ -38,8 +38,6 @@ func main() {
 	e.Use(echoMiddleware.Recover())
 	e.Use(echoMiddleware.RequestID())
 	e.Use(echoMiddleware.RequestLogger())
-	// e.Use(echoMiddleware.CORS())
-	// e.Use(echoMiddleware.Secure())
 	e.Use(echoMiddleware.GzipWithConfig(echoMiddleware.GzipConfig{Level: 5}))
 	e.Use(echoMiddleware.RateLimiter(echoMiddleware.NewRateLimiterMemoryStore(20)))
 

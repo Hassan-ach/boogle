@@ -1,4 +1,3 @@
-// tailwind.config.js
 module.exports = {
   content: [
     "./view/**/*.templ",

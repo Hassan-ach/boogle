@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO words (word)\n           SELECT * FROM UNNEST($1::text[])\n           ON CONFLICT (word) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b6b43cae25387baf62fd74cb95f9c77d7ce05dbfb5b16331bb68621074655147"
+}

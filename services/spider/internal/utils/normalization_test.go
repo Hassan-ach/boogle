@@ -6,11 +6,11 @@ import (
 
 func TestNormalizeUrl(t *testing.T) {
 	tests := []struct {
-		name         string
-		rawURL       string
-		baseHost     string
-		expectedURL  string
-		expectedOK   bool
+		name        string
+		rawURL      string
+		baseHost    string
+		expectedURL string
+		expectedOK  bool
 	}{
 		{
 			name:        "valid absolute URL",
@@ -27,18 +27,18 @@ func TestNormalizeUrl(t *testing.T) {
 			expectedOK:  true,
 		},
 		{
-			name:        "skip disallowed path prefix",
+			name:        "keeps a path the rules would refuse",
 			rawURL:      "http://example.com/login",
 			baseHost:    "example.com",
-			expectedURL: "",
-			expectedOK:  false,
+			expectedURL: "https://example.com/login",
+			expectedOK:  true,
 		},
 		{
-			name:        "skip disallowed file extension",
+			name:        "keeps an extension the rules would refuse",
 			rawURL:      "http://example.com/document.pdf",
 			baseHost:    "example.com",
-			expectedURL: "",
-			expectedOK:  false,
+			expectedURL: "https://example.com/document.pdf",
+			expectedOK:  true,
 		},
 		{
 			name:        "strip fragment",
