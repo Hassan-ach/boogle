@@ -22,5 +22,6 @@ jobs:
         env:
           SQLX_OFFLINE: "true"
         run: cargo test
+
       - name: Build executable
         run: cargo build

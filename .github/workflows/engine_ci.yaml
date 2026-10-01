@@ -21,11 +21,20 @@ jobs:
           go-version-file: services/engine/go.mod
           cache: true
 
+      - name: Install templ
+        run: go install github.com/a-h/templ/cmd/templ@v0.3.1020
+
+      - name: Generate templ
+        run: templ generate
+
       - name: Install dependencies
         run: go mod tidy
+
       - name: Run tests
         run: go test -v ./...
+
       - name: Build executable
         run: go build -v ./...
+
       - name: Run vet
         run: go vet -v ./...
