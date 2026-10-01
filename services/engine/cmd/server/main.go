@@ -31,6 +31,7 @@ func main() {
 
 	homeHandler := &handlers.HomeHandler{}
 	rankingHandler := handlers.NewSearchHandler(store, ranker, speller)
+	healthHandler := &handlers.HealthHandler{}
 
 	e := echo.New()
 
@@ -44,6 +45,7 @@ func main() {
 	e.Static("/public", "public")
 	e.GET("/", homeHandler.Handle)
 	e.GET("/search", rankingHandler.Handle)
+	e.GET("/health", healthHandler.Handle)
 	e.GET("/feeling-lucky", func(c *echo.Context) error {
 		return c.String(200, "GOOD FOR YOU")
 	})

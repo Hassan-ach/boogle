@@ -15,6 +15,7 @@ type RabbitMqConfig struct {
 	Password string
 	Host     string
 	Port     int
+	JobQueue string
 }
 
 type RedisConfig struct {
@@ -53,6 +54,8 @@ type AppConfig struct {
 
 	HttpTimeout    int
 	CrawlerTimeout int
+
+	JobQueue string
 }
 
 type Config struct {
@@ -132,6 +135,7 @@ func loadRabbitMqConfig() RabbitMqConfig {
 	password := getWithDefault("RABBITMQ_PASSWORD", "guest")
 	host := getWithDefault("RABBITMQ_HOST", "localhost")
 	port := getIntWithDefault("RABBITMQ_PORT", 5672)
+	jobQueue := getWithDefault("RABBITMQ_JOB_QUEUE", "indexer.job")
 
 	return RabbitMqConfig{
 		protocol,
@@ -139,6 +143,7 @@ func loadRabbitMqConfig() RabbitMqConfig {
 		password,
 		host,
 		port,
+		jobQueue,
 	}
 }
 
@@ -194,6 +199,7 @@ func loadAppConfig() AppConfig {
 	maxConcurrentFetch := getIntWithDefault("MAX_CONCURRENT_FETCH", 200)
 	logsPath := getWithDefault("LOGS_PATH", "./logs.json")
 	clawlerDelay := getIntWithDefault("CRAWLER_DELAY", 200)
+	jobQueue := getWithDefault("RABBITMQ_JOB_QUEUE", "indexer.job")
 	return AppConfig{
 		MaxCrawlers:        maxCrawlers,
 		CrawlerTimeout:     crawlerTimeout,
@@ -201,6 +207,7 @@ func loadAppConfig() AppConfig {
 		MaxConcurrentFetch: maxConcurrentFetch,
 		LogsPath:           logsPath,
 		ClawlerDelay:       clawlerDelay,
+		JobQueue:           jobQueue,
 	}
 }
 

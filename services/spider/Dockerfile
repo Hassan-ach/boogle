@@ -1,4 +1,4 @@
-FROM golang:tip-alpine3.23 AS go-builder
+FROM golang:1.27.1-alpine3.23 AS go-builder
 
 WORKDIR /app
 
@@ -17,8 +17,19 @@ RUN just build
 
 FROM alpine:3.23
 
+RUN addgroup -S app -g 10001 \
+    && adduser -S app -u 10001 -G app
+
 WORKDIR /app
 
-COPY --from=go-builder /app/spider .
+RUN mkdir -p /app/logs && chown app:app /app/logs
 
-CMD ["./spider"]
+COPY --from=go-builder --chown=app:app /app/spider .
+COPY --chown=app:app --chmod=0555 entrypoint.sh /entrypoint.sh
+
+USER 10001:10001
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD pgrep -x spider > /dev/null || exit 1
+
+ENTRYPOINT ["/entrypoint.sh"]
