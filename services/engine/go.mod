@@ -1,6 +1,6 @@
 module github.com/Hassan-ach/boogle/services/engine
 
-go 1.25.7
+go 1.27.1
 
 require (
 	github.com/a-h/templ v0.3.977
