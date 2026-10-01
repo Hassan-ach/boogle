@@ -1,12 +1,6 @@
 name: Engine CI
 
 on:
-  push:
-    branches:
-      - dev
-      - main
-    paths:
-      - "services/engine/**"
   pull_request:
     branches:
       - main

@@ -1,12 +1,6 @@
 name: Indexer CI
 
 on:
-  push:
-    branches:
-      - dev
-      - main
-    paths:
-      - "services/indexer/**"
   pull_request:
     branches:
       - main

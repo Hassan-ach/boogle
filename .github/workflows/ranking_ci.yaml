@@ -1,12 +1,6 @@
 name: Ranking CI
 
 on:
-  push:
-    branches:
-      - dev
-      - main
-    paths:
-      - "services/ranking/**"
   pull_request:
     branches:
       - main
