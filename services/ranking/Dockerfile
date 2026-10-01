@@ -26,10 +26,19 @@ COPY . .
 RUN pyinstaller --onefile src/main.py
 
 FROM alpine:3.23
+
+RUN addgroup -S app -g 10001 \
+ && adduser -S app -u 10001 -G app \
+ && apk add --no-cache zlib libstdc++ libpq
+
 WORKDIR /app
 
-RUN apk add --no-cache zlib libc6-compat libstdc++
+COPY --from=builder --chown=app:app /app/dist/main .
+COPY --chown=app:app --chmod=0555 entrypoint.sh /entrypoint.sh
 
-COPY --from=builder /app/dist/main .
+USER 10001:10001
 
-CMD ["./main"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD pgrep -x main > /dev/null || exit 1
+
+ENTRYPOINT ["/entrypoint.sh"]
