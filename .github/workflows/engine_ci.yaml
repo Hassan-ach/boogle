@@ -30,6 +30,11 @@ jobs:
       - name: Install dependencies
         run: go mod tidy
 
+      - name: Install aspell
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libaspell-dev aspell-en
+
       - name: Run tests
         run: go test -v ./...
 
