@@ -10,36 +10,24 @@ import (
 	"unicode/utf8"
 )
 
-// The rule tables below are duplicated in policy.RuleSet, which is the copy that
-// actually drives the crawl decision. These exist only for NormalizeUrl's skip
-// half, which policy.Admit supersedes; they are deleted once the last caller
-// moves.
+// The tables below are the ones canonicalisation needs and no more: query
+// parameters that identify a result set rather than a page, and the wiki language
+// subdomains that mirror the same text under three hundred hosts.
 //
-// While both exist, policy's rules_test asserts they agree. Two tables that
-// cannot be observed to diverge is the whole point: an earlier version of
-// IsDisallowed existed here as two copies, one of which had no guard for an empty
-// rule, and since strings.HasPrefix(p, "") is true for every p a single blank
-// line in one robots.txt blocked an entire host. That bug survived a code review
-// because both copies looked correct and only one was reachable.
+// The path, extension and wiki-namespace skip tables that used to live here are
+// gone. They were a second copy of policy.RuleSet, and a second copy of a rule is
+// one too many: an earlier version of IsDisallowed existed here as two copies, one
+// of which had no guard for an empty rule, and since strings.HasPrefix(p, "") is
+// true for every p a single blank line in one robots.txt blocked an entire host.
+// That bug survived a code review because both copies looked correct and only one
+// was reachable.
+//
+// A decision can also be counted, which a canonicalisation cannot do. Every URL
+// dropped here left no trace, so the crawl log could not say how much of a site
+// was being declined, or why.
 var (
-	disallowPathPrefixes = []string{
-		"/login", "/logout", "/register", "/signup", "/password-reset",
-		"/account/", "/cart", "/checkout", "/order/", "/payment/",
-		"/search", "/filter/", "/admin/", "/dashboard/", "/settings/",
-		"/404", "/error/", "/maintenance", "/test/", "/print/", "/preview/", "/tag/",
-	}
-
 	disallowQueryParams = []string{
 		"sort", "page", "filter", "q", "search",
-	}
-
-	skipFileExtensions = []string{
-		".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-		".zip", ".rar", ".7z", ".tar", ".gz", ".exe", ".msi", ".dmg", ".apk",
-		".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp", ".svg",
-		".mp3", ".wav", ".aac", ".ogg", ".flac",
-		".mp4", ".avi", ".mov", ".wmv", ".mkv", ".flv", ".webm",
-		".css", ".js", ".ico",
 	}
 
 	langSubdomainDomains = []string{
@@ -47,9 +35,6 @@ var (
 		"wikibooks.org",
 		"wikivoyage.org",
 	}
-	// Wiki-specific: blocks /Template:Foo/xx/, /Help:Bar/en/, etc.
-	wikiLangSubpageRE   = regexp.MustCompile(`(?i)/[a-z]{2,3}(-[a-z]{2,4})?/?$`)
-	wikiNoisyNamespaces = []string{"/Template:", "/Help:", "/Manual:", "/Extension:"}
 
 	// languageSubtagRE matches an IETF BCP-47 language tag: two to three
 	// subtags of two to eight alphanumerics, at least the first of them letters.
@@ -60,22 +45,26 @@ var (
 	languageSubtagRE = regexp.MustCompile(`^[a-z]{2,8}(-[a-z]{2,8}){0,2}$`)
 )
 
-// NormalizeUrl canonicalises a URL and applies the three legacy skip rules.
+// NormalizeUrl canonicalises a URL.
 //
-// Deprecated: it decides crawl-worthiness, which is policy's job and not
-// identity's, and the decision belongs where it can be counted. Use
-// CanonicalizeUrl for identity and policy.Admit for the decision; this wrapper
-// survives only until the callers of the skip half are gone.
+// Deprecated: it no longer applies the three skip rules it used to. Those rules are
+// policy's, they live in policy.RuleSet, and they are counted when they are
+// applied. Use CanonicalizeUrl for identity and policy.Admit for the decision.
+//
+// This wrapper survives one release so a caller outside this tree does not break on
+// the spot. It is the same function, not a reduced one -- so a URL that used to
+// vanish here now reaches Admit and is refused there with a reason attached, which
+// is the point of the change rather than a regression to be papered over.
 func NormalizeUrl(raw string, baseHost string) (string, bool) {
-	return normalize(raw, baseHost, true)
+	return CanonicalizeUrl(raw, baseHost)
 }
 
 // CanonicalizeUrl answers "what URL is this?" and nothing else.
 //
 // It is NormalizeUrl without the skip rules, and it is what the policy manager
-// calls: canonicalisation has to happen before the skip rules can run at all,
-// because "/admin/../public" and "/admin/x/../y" both clean to "/admin/y" and a
-// rule applied to the uncleaned path would miss them.
+// calls: canonicalisation has to happen before a rule can run at all, because
+// "/admin/../public" and "/admin/x/../y" both clean to "/admin/y" and a rule
+// applied to the uncleaned path would miss them.
 //
 // The split matters more than it looks. A function that both answers "what URL is
 // this?" and "should we crawl it?" cannot be reasoned about, cannot be tested
@@ -83,10 +72,6 @@ func NormalizeUrl(raw string, baseHost string) (string, bool) {
 // caller has no way to learn that a URL was dropped rather than normalised, which
 // is why every skip here was invisible in the crawl log.
 func CanonicalizeUrl(raw string, baseHost string) (string, bool) {
-	return normalize(raw, baseHost, false)
-}
-
-func normalize(raw string, baseHost string, applySkips bool) (string, bool) {
 	if !utf8.ValidString(raw) || strings.HasPrefix(raw, "#") {
 		return "", false
 	}
@@ -96,14 +81,12 @@ func normalize(raw string, baseHost string, applySkips bool) (string, bool) {
 		return "", false
 	}
 
-	// Resolve "." and ".." segments and collapse repeated slashes before any
-	// decision is made about the path. "/a/./b", "/a//b" and "/a/b" are the same
-	// document, and keying them separately splits a page's word counts and
-	// PageRank three ways. The skip checks then have to run on the cleaned path,
-	// or "/admin/../public" would slip past the /admin rule.
+	// Resolve "." and ".." segments and collapse repeated slashes. "/a/./b", "/a//b"
+	// and "/a/b" are the same document, and keying them separately splits a page's
+	// word counts and PageRank three ways.
 	//
 	// path.Clean also drops a trailing slash, which is load bearing for servers
-	// that distinguish "/a" from "/a/", so it is recorded and re-applied later.
+	// that distinguish "/a" from "/a/", so it is recorded and re-applied below.
 	hadTrailingSlash := strings.HasSuffix(u.Path, "/")
 	u.Path = path.Clean("/" + u.Path)
 	if u.Path == "/" {
@@ -112,86 +95,12 @@ func normalize(raw string, baseHost string, applySkips bool) (string, bool) {
 		u.Path = ""
 	}
 
-	if applySkips {
-		normalizeURLParts(u, baseHost, hadTrailingSlash)
-
-		// Deliberately after the rest of canonicalisation, and specifically after
-		// the trailing-slash restoration. The decision has to be about the URL that
-		// will actually be requested: "/report.pdf" and "/report.pdf/" are one key
-		// after cleaning, but the slash comes back because the path holds a dot, so
-		// the document fetched is a directory listing and not the file. Checking
-		// first refused a directory for having a file's name, and checking in a
-		// different order from policy.Admit meant the two copies of this rule
-		// disagreed on exactly that case.
-		if shouldSkipByPath(u.Path) {
-			return "", false
-		}
-
-		if shouldSkipByExtension(u.Path) {
-			return "", false
-		}
-
-		if shouldSkipWikiLanguageSubpage(u.Path) {
-			return "", false
-		}
-
-		return u.String(), true
-	}
-
 	normalizeURLParts(u, baseHost, hadTrailingSlash)
 	return u.String(), true
 }
 
-// shouldSkipByPath reports whether a path is one the crawler should not index.
-//
-// The comparison is on path *segments*, not on a raw string prefix. A plain
-// HasPrefix meant "/cart" also swallowed "/cartoon" and "/cartoonography",
-// "/search" swallowed "/searching" and "/search-archive", and "/login"
-// swallowed "/logins-archive" -- all ordinary content pages that then never
-// reached the index, with no error anywhere to say why.
-func shouldSkipByPath(path string) bool {
-	cleaned := strings.Trim(path, "/")
-	if cleaned == "" {
-		return false
-	}
-	for _, prefix := range disallowPathPrefixes {
-		trimmed := strings.Trim(prefix, "/")
-		if trimmed == "" {
-			continue
-		}
-		// Match when the rule is a whole leading path segment. "/admin" covers
-		// "/admin" and "/admin/users" but not "/administration".
-		if cleaned == trimmed || strings.HasPrefix(cleaned, trimmed+"/") {
-			return true
-		}
-	}
-	return false
-}
-
-func shouldSkipByExtension(path string) bool {
-	pathLower := strings.ToLower(path)
-	for _, ext := range skipFileExtensions {
-		if strings.HasSuffix(pathLower, ext) {
-			return true
-		}
-	}
-	return false
-}
-
 func isValidQueryParam(q string) bool {
 	return !slices.Contains(disallowQueryParams, q)
-}
-
-func shouldSkipWikiLanguageSubpage(path string) bool {
-	if !wikiLangSubpageRE.MatchString(path) {
-		return false
-	}
-	for _, ns := range wikiNoisyNamespaces {
-		if strings.Contains(path, ns) {
-			return true
-		}
-	}
-	return false
 }
 
 func normalizeURLParts(u *url.URL, baseHost string, hadTrailingSlash bool) {
@@ -241,16 +150,6 @@ func normalizeURLParts(u *url.URL, baseHost string, hadTrailingSlash bool) {
 	}
 }
 
-func NormalizeUrls(raws []string, baseHost string) []string {
-	result := make([]string, 0, len(raws))
-	for _, raw := range raws {
-		if norm, ok := NormalizeUrl(raw, baseHost); ok {
-			result = append(result, norm)
-		}
-	}
-	return result
-}
-
 func forceEnglishSubdomain(u *url.URL) {
 	u.Host = strings.ToLower(u.Host)
 	u.Host = strings.TrimPrefix(u.Host, "www.")
@@ -284,6 +183,40 @@ func forceEnglishSubdomain(u *url.URL) {
 	}
 }
 
+// NormalizeUrls canonicalises a batch, dropping the entries that will not parse.
+//
+// Deprecated: it never applied a skip rule of its own, but the name promises one
+// and the function it was named after did. Use CanonicalizeUrls.
+func NormalizeUrls(raws []string, baseHost string) []string {
+	return CanonicalizeUrls(raws, baseHost)
+}
+
+// CanonicalizeUrls is NormalizeUrls without the misleading name.
+//
+// It does not deduplicate. Dedup belongs to the caller's Set, and hiding it here
+// would hide how many times a site links to itself.
+func CanonicalizeUrls(raws []string, baseHost string) []string {
+	result := make([]string, 0, len(raws))
+	for _, raw := range raws {
+		if norm, ok := CanonicalizeUrl(raw, baseHost); ok {
+			result = append(result, norm)
+		}
+	}
+	return result
+}
+
+// ValidateLinks filters a batch of links against a site's own robots rules.
+//
+// Deprecated: it decides crawl-worthiness, which is policy's job. The replacement
+// is policy.AdmitLinks, which does the same filtering *and* records a reason per
+// refusal, so a link this drops is one an operator can find in the host's stats.
+//
+// The two do not answer the same question, which is worth being explicit about.
+// This one returns a list and nothing else, so the links it dropped left no trace:
+// a page with forty links and eleven PDFs put eleven entries in the frontier that
+// were later removed by a different function with no record of why, and the logs
+// said nothing about which eleven or why. Nobody could answer "why is this site
+// barely in the index".
 func ValidateLinks(links []string, disallowed []string) []string {
 	normUrls := NewSet[string]()
 	for _, x := range links {
@@ -297,6 +230,14 @@ func ValidateLinks(links []string, disallowed []string) []string {
 }
 
 // IsDisallowed reports whether a path is blocked by any of the given rules.
+//
+// Deprecated: robots rules are not prefixes here or anywhere else -- they are
+// matched with the wildcard and end-anchor semantics of RFC 9309, which is
+// policy.RobotsRules. This function treats a rule containing a regex
+// metacharacter as a regular expression and everything else as a raw string
+// prefix, so "/admin/" fails to match "/admin/x" on a site that asked for it to,
+// and "/admin$" matches nothing at all. It is kept for one release for callers
+// outside this tree.
 //
 // A rule containing a regex metacharacter is treated as a regular expression,
 // otherwise it is a path prefix. Two rules that used to live here as separate

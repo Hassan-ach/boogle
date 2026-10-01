@@ -105,24 +105,19 @@ func (s *Store) persistPage(ctx context.Context, page *entity.Page) (pageID uuid
 		s.log.Warn("", "url", page.URL, "err", err)
 		return pageID, err
 	}
-	// The page is marked visited, and only then are its links enqueued.
+	// Nothing here decides anything about the crawl any more.
 	//
-	// Note what this does and does not prevent. Enqueue does not consult the
-	// visited set -- the old AddUrls did, in a pipeline of SISMEMBERs, one extra
-	// round trip over every link on every page, to avoid queueing something the
-	// pop was going to discard anyway. So a page that links to itself does land
-	// back in the frontier. It is not crawled again because the pop checks the
-	// visited set before handing anything out, which is the same check, done once
-	// per pop instead of once per link.
-	err = s.state.MarkVisited(ctx, page.URL)
-	if err != nil {
-		s.log.Warn("add URL to visited set", "url", page.URL, "error", err)
-		return pageID, err
-	}
-	err = s.state.Enqueue(ctx, page.Links...)
-	if err != nil {
-		s.log.Warn("add linked URLs to frontier", "url", page.URL, "error", err)
-	}
+	// This function used to end by marking the page visited and enqueueing its
+	// links, and both of those were crawl decisions made by a database layer: a
+	// store that writes rows is not entitled to decide when a URL has been seen, or
+	// what the crawl should look at next. Two of them were, in particular, invisible
+	// -- nothing counted a refusal, because nothing here could refuse, and the
+	// frontier filled with links that a different function later removed.
+	//
+	// The loop does both now, through the policy manager, after this returns and
+	// only if the insert committed. A page that failed to store stays crawlable,
+	// which is the same rule as before and for the same reason: a page fetched and
+	// then lost to a database error is a page worth fetching again.
 	return pageID, nil
 }
 

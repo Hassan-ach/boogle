@@ -22,14 +22,19 @@ type RedisConfig struct {
 	Password string
 	DB       int
 	Port     int
-	// Delay and MaxRetry are dead. They configured the old frontier pop loop,
-	// which conflated a scan budget with a retry count and burned up to ten
-	// frontier entries per call. They are still read so an existing deployment
-	// does not fail to start, and they are read by nothing. Phases that consume
-	// FRONTIER_POP_BATCH and FRONTIER_POP_RETRY_MS remove them.
-	Delay    int
-	MaxRetry int
 }
+
+// Delay and MaxRetry used to live here, and both are gone.
+//
+// They configured the old frontier pop loop, and neither meant what its name said.
+// MaxRetry was read as a count of frontier entries one pop was allowed to burn
+// through, so a "retry budget" of ten silently became a scan of ten URLs every time
+// the loop woke up; it is now FRONTIER_POP_BATCH, which is only ever that. Delay was
+// the sleep between pops, and it was set to zero by every crawler that cared about
+// throughput -- so the crawl-delay it appeared to honour was not honoured at all,
+// which is how the spider ended up hammering hosts that asked for five seconds.
+// Both fields survive one release as env vars (REDIS_MAX_RETRY is still read as a
+// fallback for FRONTIER_POP_BATCH) and nothing reads them here any more.
 
 type PSQLConfig struct {
 	Host     string
@@ -111,8 +116,14 @@ func loadPolicyConfig() policy.Config {
 	c.URLBackoffBase = secondsWithDefault("URL_BACKOFF_BASE_SEC", c.URLBackoffBase)
 	c.URLBackoffMax = secondsWithDefault("URL_BACKOFF_MAX_SEC", c.URLBackoffMax)
 
-	c.FrontierPopBatch = getIntWithDefault("FRONTIER_POP_BATCH", c.FrontierPopBatch)
 	c.DelayedPromoteBatch = getIntWithDefault("DELAYED_PROMOTE_BATCH", c.DelayedPromoteBatch)
+	// FRONTIER_POP_BATCH supersedes REDIS_MAX_RETRY, which conflated a scan budget
+	// with a retry count and so burned up to ten frontier entries per pop. The old
+	// name stays as a fallback for one release so a deployment that only sets
+	// REDIS_MAX_RETRY does not change behaviour the day this ships; it is ignored as
+	// soon as the new name is set, so there is never a question of which wins.
+	c.FrontierPopBatch = getIntWithDefault("FRONTIER_POP_BATCH",
+		getIntWithDefault("REDIS_MAX_RETRY", c.FrontierPopBatch))
 	c.MaxPagesPerHost = getIntWithDefault("MAX_PAGES_PER_HOST", c.MaxPagesPerHost)
 	c.URLMaxAttempts = getIntWithDefault("URL_MAX_ATTEMPTS", c.URLMaxAttempts)
 	c.MaxRedirects = getIntWithDefault("MAX_REDIRECTS", c.MaxRedirects)
@@ -193,16 +204,12 @@ func loadRedisConfig() RedisConfig {
 	password := getWithDefault("REDIS_PASSWORD", "")
 	db := getIntWithDefault("REDIS_DB", 1)
 	port := getIntWithDefault("REDIS_PORT", 6379)
-	delay := getIntWithDefault("REDIS_DELAY", 5)
-	maxRetry := getIntWithDefault("REDIS_MAX_RETRY", 10)
 
 	return RedisConfig{
 		Addr:     addr,
 		Password: password,
 		Port:     port,
 		DB:       db,
-		Delay:    delay,
-		MaxRetry: maxRetry,
 	}
 }
 

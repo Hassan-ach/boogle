@@ -639,61 +639,128 @@ func TestSplitDirective(t *testing.T) {
 	}
 }
 
-// TestPolicyRulesAgreeWithUtils is the test that makes the duplication safe.
+// TestTheRuleTablesAreTheOnlyCopy is the test that replaced the one that compared
+// these rules against utils.NormalizeUrl.
 //
-// utils.NormalizeUrl still carries its own copies of the path, extension and wiki
-// tables until the callers of its skip half are moved. Two copies of a rule is one
-// too many, and an earlier version of this package had exactly that problem: two
-// copies of the robots matcher, one of which had no guard for an empty rule, and
-// the difference was invisible because only one of them was reachable.
+// That comparison existed because there were two copies: a path table, an extension
+// table and a wiki-namespace table here, and the same three in utils, applied inside
+// canonicalisation. The utils copies are gone -- a URL that used to vanish at
+// extraction time now arrives at Admit and is refused there with a reason -- and
+// with them goes the reason to keep checking that they agree.
 //
-// So this does not compare the tables. It compares the *outcomes*, over a corpus
-// built from the tables themselves and from their near misses -- the cases where
-// two implementations of the same rule actually disagree. If either copy gains,
-// loses or reorders an entry, this fails and says which path disagreed.
-func TestPolicyRulesAgreeWithUtils(t *testing.T) {
+// What replaces it pins the move rather than the agreement. Every path the rule
+// tables refuse must be refused by Admit, so the rules that used to hide in
+// canonicalisation are still being applied by the layer that can count them. A
+// table entry dropped during the move, or a reason that stopped being produced, is
+// silent otherwise: the URL reaches the frontier, the crawler fetches it, and
+// nothing in the logs says it should not have been.
+func TestTheRuleTablesAreTheOnlyCopy(t *testing.T) {
+	m, _ := newTestManager(t)
+	m = m.WithRobotsFetcher((&fakeRobots{
+		reply:  map[string]robotsResponse{"example.com": {body: ""}},
+		status: 200,
+	}).fetcher())
 	r := DefaultRules()
-	corpus := ruleCorpus(r)
 
-	for _, path := range corpus {
+	for _, path := range ruleCorpus(r) {
+		// The URL has to survive canonicalisation, or this test is asserting that a
+		// rule fired when in fact the URL was rejected before any rule was reached.
 		full := "https://example.com" + path
 		if path == "" {
 			full = "https://example.com/"
 		}
-
-		// NormalizeUrl's second return is "did this canonicalise", not "was this
-		// refused". Reading it as the latter inverts every row of this test, which
-		// is a good illustration of why the two functions are being merged: the
-		// meaning had to be looked up.
-		_, ok := utils.NormalizeUrl(full, "example.com")
-		refusedByUtils := !ok
-
 		canon, ok := utils.CanonicalizeUrl(full, "example.com")
 		if !ok {
-			t.Fatalf("CanonicalizeUrl(%q) failed while NormalizeUrl did not", full)
+			t.Errorf("CanonicalizeUrl(%q) rejected the URL, so this case is testing "+
+				"canonicalisation rather than the rule tables", full)
+			continue
 		}
 		u, err := url.Parse(canon)
 		if err != nil {
 			t.Fatalf("parse %q: %v", canon, err)
 		}
 
-		refusedByPolicy := r.SkipsPath(u.Path) ||
+		wantRefused := r.SkipsPath(u.Path) ||
 			r.SkipsExtension(u.Path) ||
 			r.SkipsWikiLanguageSubpage(u.Path)
-
-		if refusedByUtils != refusedByPolicy {
-			t.Errorf("path %q: utils refuses = %v, policy refuses = %v (canonical path %q)",
-				path, refusedByUtils, refusedByPolicy, u.Path)
+		v := mustAdmit(t, m, canon)
+		if wantRefused && v.Kind == Allow {
+			t.Errorf("path %q: the rule tables refuse it but Admit allows it", path)
+		}
+		if !wantRefused && v.Kind != Allow {
+			t.Errorf("path %q: Admit refused it for %q, but no rule covers it",
+				path, v.Reason)
 		}
 	}
 }
 
-// ruleCorpus builds the paths the agreement test runs over.
+// TestEveryRefusedPathCarriesAReason is what "counted" has to mean.
+//
+// Admit can refuse a URL for nine or ten reasons, and a refusal whose reason is not
+// one of them would be counted under the empty string -- a key no operator ever
+// queries. So for each path the tables refuse, the verdict has to name a reason,
+// and that reason has to be one of the rule reasons rather than something incidental
+// to the fixture.
+func TestEveryRefusedPathCarriesAReason(t *testing.T) {
+	m, st := newTestManager(t)
+	m = m.WithRobotsFetcher((&fakeRobots{
+		reply:  map[string]robotsResponse{"example.com": {body: ""}},
+		status: 200,
+	}).fetcher())
+	r := DefaultRules()
+
+	ruleReasons := map[Reason]bool{
+		ReasonPathDisallowed:     true,
+		ReasonExtensionSkipped:   true,
+		ReasonLanguageNotEnglish: true,
+	}
+
+	for _, path := range ruleCorpus(r) {
+		full := "https://example.com" + path
+		if path == "" {
+			full = "https://example.com/"
+		}
+		canon, ok := utils.CanonicalizeUrl(full, "example.com")
+		if !ok {
+			continue
+		}
+		u, err := url.Parse(canon)
+		if err != nil {
+			t.Fatalf("parse %q: %v", canon, err)
+		}
+		if !r.SkipsPath(u.Path) && !r.SkipsExtension(u.Path) && !r.SkipsWikiLanguageSubpage(u.Path) {
+			continue
+		}
+
+		v := mustAdmit(t, m, canon)
+		if v.Reason == "" {
+			t.Errorf("path %q was refused with no reason, so it is counted under "+
+				"the empty string", path)
+			continue
+		}
+		if !ruleReasons[v.Reason] {
+			t.Errorf("path %q was refused for %q, want one of the rule reasons %v",
+				path, v.Reason, ruleReasons)
+		}
+	}
+
+	// And the refusals really are counted, which is the whole reason they moved out
+	// of canonicalisation: a rule applied there could not be observed at all.
+	for _, reason := range []Reason{ReasonPathDisallowed, ReasonExtensionSkipped} {
+		if got := st.Stats("example.com")[reason]; got == 0 {
+			t.Errorf("no refusal counted under %q after admitting the corpus", reason)
+		}
+	}
+}
+
+// ruleCorpus builds the paths the rule-table tests run over.
 //
 // The shape of it is the point. A corpus of URLs I thought of would test the
 // cases I already know about; this one is built from the rule tables themselves
-// and from their near misses, so it covers the entries and, more usefully, the
-// boundaries next to them.
+// and from their near misses -- the cases where two implementations of the same
+// rule actually disagree. The near misses matter more than the entries: a rule
+// that matches too much is the failure mode nobody reports, because the pages it
+// eats look like pages that simply never existed.
 func ruleCorpus(r RuleSet) []string {
 	seen := map[string]struct{}{}
 	out := []string{}

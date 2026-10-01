@@ -63,7 +63,7 @@ func (p *Parser) ParseHTML(r io.Reader, baseURL string) (*entity.Page, error) {
 	return &entity.Page{
 		MetaData: c.Meta,
 		Links: utils.NewSetFromSlice(
-			utils.NormalizeUrls(c.Links, u.Host)).GetAll(),
+			utils.CanonicalizeUrls(c.Links, u.Host)).GetAll(),
 		Images: utils.NewSetFromSlice(c.Imags).GetAll(),
 	}, nil
 }

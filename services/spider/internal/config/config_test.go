@@ -52,12 +52,21 @@ var policyEnvVars = []struct {
 	{"MAX_BODY_BYTES", "1048576", 1048576},
 }
 
+// deprecatedEnvVars are variables still read, but no longer as the name of a
+// setting. They are cleared alongside the real ones because a developer's shell is
+// as likely to have REDIS_MAX_RETRY set as FRONTIER_POP_BATCH, and a test that
+// inherited either would be testing the shell.
+var deprecatedEnvVars = []string{"REDIS_MAX_RETRY"}
+
 // clearPolicyEnv unsets everything loadPolicyConfig reads, so a test starts from a
 // known-empty environment rather than inheriting whatever the developer's shell has.
 func clearPolicyEnv(t *testing.T) {
 	t.Helper()
 	for _, v := range policyEnvVars {
 		t.Setenv(v.key, "")
+	}
+	for _, key := range deprecatedEnvVars {
+		t.Setenv(key, "")
 	}
 }
 
@@ -164,6 +173,61 @@ func TestLoadPolicyConfigHasNoUnreachableField(t *testing.T) {
 			t.Errorf("policy.BackoffConfig.%s is zero with no environment set; "+
 				"either it has no default or loadPolicyConfig never assigns it", f.Name)
 		}
+	}
+}
+
+// TestTheOldPopBudgetIsStillHonouredWhenTheNewNameIsNot is the deprecation, tested.
+//
+// REDIS_MAX_RETRY was renamed to FRONTIER_POP_BATCH, and a rename with no fallback
+// changes behaviour on the day it ships: every deployment that only ever set the
+// old name would silently drop to the default batch, which is a different crawl.
+// The fallback exists so the rename is invisible, and it is only invisible while
+// both are read -- which is the thing that can regress, since nothing else in the
+// tree mentions REDIS_MAX_RETRY any more and a later refactor would not know to
+// keep it.
+func TestTheOldPopBudgetIsStillHonouredWhenTheNewNameIsNot(t *testing.T) {
+	clearPolicyEnv(t)
+	t.Setenv("REDIS_MAX_RETRY", "7")
+
+	if got := loadPolicyConfig().FrontierPopBatch; got != 7 {
+		t.Errorf("with only REDIS_MAX_RETRY=7 set, FrontierPopBatch = %d, want 7; a "+
+			"rename that changes behaviour the day it ships is not a rename", got)
+	}
+
+	// And the new name wins when both are present, so an operator who migrates
+	// gets what they typed rather than a value the fallback insists on.
+	t.Setenv("FRONTIER_POP_BATCH", "3")
+	if got := loadPolicyConfig().FrontierPopBatch; got != 3 {
+		t.Errorf("with both set, FrontierPopBatch = %d, want 3 from FRONTIER_POP_BATCH", got)
+	}
+}
+
+// TestRedisConfigHasNoDeadFields is the check that a field cannot come back.
+//
+// RedisConfig carried Delay and MaxRetry, and neither was read by anything after
+// the pop loop moved into the policy manager. A field like that is worse than an
+// absent one: it is a lever that looks connected to nothing, and RedisConfig.Delay
+// is how the spider spent its life ignoring the Crawl-delay it parsed out of every
+// robots.txt it fetched.
+func TestRedisConfigHasNoDeadFields(t *testing.T) {
+	clearPolicyEnv(t)
+
+	v := reflect.ValueOf(loadRedisConfig())
+	tp := v.Type()
+	want := map[string]bool{"Addr": true, "Password": true, "DB": true, "Port": true}
+
+	for i := range tp.NumField() {
+		f := tp.Field(i)
+		if f.PkgPath != "" {
+			continue // unexported
+		}
+		if !want[f.Name] {
+			t.Errorf("RedisConfig.%s is a field nothing reads; it will look like a "+
+				"setting and behave like a no-op", f.Name)
+		}
+	}
+	if tp.NumField() != len(want) {
+		t.Errorf("RedisConfig has %d fields, want exactly %d", tp.NumField(), len(want))
 	}
 }
 

@@ -2,6 +2,7 @@ package utils
 
 import (
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -208,15 +209,36 @@ func TestNormalizeUrlSortsQueryParameters(t *testing.T) {
 	}
 }
 
+// TestNormalizeUrlDropsPaginationAndSearchParams spells the list out rather than
+// reading it back from the table it is checking.
+//
+// It read it back, once. A test that iterates the exclusion table asserts only that
+// the parameters in it are excluded, which is true of any table including an empty
+// one -- so the mutation harness deleted four entries and this test went on passing,
+// having checked "sort" three hundred times. Spelling the list out makes the test
+// the specification and the table the implementation, which is the only arrangement
+// in which removing an entry is a failure rather than a quieter crawl.
+//
+// /p?page=1 through /p?page=50000 are one page, and a site search result set is an
+// infinite crawl. Each entry is a way a site says "this is a different document"
+// when it is not, and a parameter that quietly stops being excluded is not a slow
+// leak: it is a crawl with no end, reached through ordinary links, reported by
+// nothing.
 func TestNormalizeUrlDropsPaginationAndSearchParams(t *testing.T) {
-	// /p?page=1 through /p?page=50000 are one page, and a site search result
-	// set is an infinite crawl.
-	got, ok := NormalizeUrl("http://example.com/p?page=3&keep=1", "")
-	if !ok {
-		t.Fatal("rejected")
+	for _, param := range []string{"sort", "page", "filter", "q", "search"} {
+		t.Run(param, func(t *testing.T) {
+			got, ok := NormalizeUrl("http://example.com/p?"+param+"=3&keep=1", "")
+			if !ok {
+				t.Fatal("rejected")
+			}
+			if got != "https://example.com/p?keep=1" {
+				t.Errorf("NormalizeUrl() = %q, want %q dropped", got, param)
+			}
+		})
 	}
-	if got != "https://example.com/p?keep=1" {
-		t.Errorf("NormalizeUrl() = %q, want the pagination param dropped", got)
+
+	if got := strings.Join(disallowQueryParams, ","); got != "sort,page,filter,q,search" {
+		t.Errorf("disallowQueryParams = %q, want sort,page,filter,q,search", got)
 	}
 }
 
@@ -271,27 +293,97 @@ func TestNormalizeUrlKeepsATrailingSlashWhenThePathLooksLikeAFile(t *testing.T) 
 	}
 }
 
-func TestNormalizeUrlSkipsDisallowedPathPrefixes(t *testing.T) {
+// TestCanonicalizeUrlKeepsWhatTheRulesUsedToRefuse pins the move.
+//
+// These four tests used to assert that NormalizeUrl refused /login, /cart,
+// /file.pdf and /wiki/Template:Foo/fr. They do not any more, and that is the
+// point of the change rather than a loss of coverage: the skip tables were a
+// second copy of policy.RuleSet, applied inside canonicalisation, where a refusal
+// could not be counted and its reason had nowhere to go. A caller asking "what URL
+// is this?" got the answer "none, and by the way it was a PDF", and the second
+// half of that was the only part anyone could not have predicted.
+//
+// So canonicalisation now returns all of them, and policy.Admit refuses them with
+// a reason. The tests that assert they are still refused live in
+// policy/rules_tables_test.go, where the tables are. This one exists to catch the
+// other failure mode, which is silent and expensive: a table entry dropped during
+// the move. Nothing would complain -- the URL would reach the frontier, be
+// fetched, be indexed, and no log anywhere would say it should not have been.
+func TestCanonicalizeUrlKeepsWhatTheRulesUsedToRefuse(t *testing.T) {
 	for _, raw := range []string{
+		// The path table.
 		"http://example.com/login",
 		"http://example.com/admin/users",
 		"http://example.com/cart",
 		"http://example.com/search",
 		"http://example.com/settings/profile",
 		"http://example.com/404",
+		// The extension table.
+		"http://example.com/file.pdf",
+		"http://example.com/file.jpg",
+		"http://example.com/file.mp4",
+		"http://example.com/FILE.PDF",
+		"http://example.com/style.css",
+		// The wiki-namespace table.
+		"http://en.wikipedia.org/wiki/Template:Foo/fr",
+		"http://en.wikipedia.org/wiki/Help:Bar/en",
+		"http://en.wikipedia.org/wiki/Manual:Baz/en",
+		"http://en.wikipedia.org/wiki/Extension:Qux/de",
 	} {
 		t.Run(raw, func(t *testing.T) {
-			if got, ok := NormalizeUrl(raw, ""); ok {
-				t.Errorf("NormalizeUrl(%q) = %q, want rejection", raw, got)
+			got, ok := CanonicalizeUrl(raw, "")
+			if !ok {
+				t.Fatalf("CanonicalizeUrl(%q) refused the URL; the skip rules "+
+					"belong to policy.Admit, which can count them", raw)
+			}
+			if got == "" {
+				t.Errorf("CanonicalizeUrl(%q) returned an empty URL with ok=true", raw)
 			}
 		})
 	}
 }
 
-func TestNormalizeUrlKeepsOrdinaryPathsThatMerelyStartLikeADisallowedOne(t *testing.T) {
-	// A prefix match must not eat a legitimate path that happens to share a
-	// few leading characters. "cartoon" is a real word and "searching" is a
-	// real page; both start with a disallowed prefix.
+// TestNormalizeUrlIsCanonicalizeUrl pins the deprecated wrapper.
+//
+// The wrapper exists for one release so an out-of-tree caller does not break, and
+// its whole contract is that it is the same function. A wrapper that quietly kept
+// the old skip behaviour would be worse than no wrapper: a deployment would go on
+// dropping URLs before the policy manager saw them, so the reasons would still go
+// uncounted while the code read as though the fix had shipped.
+func TestNormalizeUrlIsCanonicalizeUrl(t *testing.T) {
+	for _, raw := range []string{
+		"http://example.com/login",
+		"http://example.com/file.pdf",
+		"http://en.wikipedia.org/wiki/Template:Foo/fr",
+		"http://example.com/a",
+		"#fragment",
+		"ht tp://example.com/x",
+	} {
+		wantURL, wantOK := CanonicalizeUrl(raw, "")
+		gotURL, gotOK := NormalizeUrl(raw, "")
+		if gotURL != wantURL || gotOK != wantOK {
+			t.Errorf("NormalizeUrl(%q) = (%q, %v), CanonicalizeUrl = (%q, %v); "+
+				"the deprecated wrapper must be the same function", raw,
+				gotURL, gotOK, wantURL, wantOK)
+		}
+	}
+}
+
+// TestNormalizeUrlKeepsOrdinaryPathsThatMerelyStartLikeADisallowedOne is now a
+// statement about identity rather than about rules.
+//
+// These are ordinary pages that happen to share a few leading characters with a
+// path in the skip table, and canonicalisation has no table and no opinion, so it
+// keeps them. The interesting version of this test -- that the *rule* matching
+// does not eat them either, because it matches whole path segments and not raw
+// prefixes -- is TestSkipsPathMatchesWholeSegments in the policy package, next to
+// the table it is about. Duplicating it here would be duplicating the rule.
+
+// A download endpoint is not necessarily a binary. The extension check runs on
+// the path, so ?file=a.pdf survives normalisation on purpose: the path has no
+// extension, and guessing at query values would drop real HTML pages whose URLs
+// happen to carry a "file" parameter. Documented rather than asserted either way.
+func TestCanonicalizeUrlKeepsOrdinaryPathsThatMerelyStartLikeADisallowedOne(t *testing.T) {
 	for _, raw := range []string{
 		"http://example.com/cartoon",
 		"http://example.com/searching",
@@ -299,39 +391,13 @@ func TestNormalizeUrlKeepsOrdinaryPathsThatMerelyStartLikeADisallowedOne(t *test
 		"http://example.com/settings-overview",
 	} {
 		t.Run(raw, func(t *testing.T) {
-			if _, ok := NormalizeUrl(raw, ""); !ok {
-				t.Errorf("NormalizeUrl(%q) was rejected by prefix matching", raw)
+			if _, ok := CanonicalizeUrl(raw, ""); !ok {
+				t.Errorf("CanonicalizeUrl(%q) was rejected", raw)
 			}
 		})
 	}
 }
 
-func TestNormalizeUrlSkipsBinaryAndMediaExtensions(t *testing.T) {
-	for _, ext := range []string{
-		".pdf", ".doc", ".docx", ".zip", ".tar", ".gz", ".exe", ".dmg", ".apk",
-		".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
-		".mp3", ".wav", ".flac", ".mp4", ".mkv", ".webm",
-		".css", ".js", ".ico",
-	} {
-		t.Run(ext, func(t *testing.T) {
-			if got, ok := NormalizeUrl("http://example.com/file"+ext, ""); ok {
-				t.Errorf("NormalizeUrl(%q) = %q, want rejection", ext, got)
-			}
-		})
-	}
-}
-
-func TestNormalizeUrlSkipsExtensionsCaseInsensitively(t *testing.T) {
-	// Servers serve /file.PDF and /file.pdf the same way.
-	if got, ok := NormalizeUrl("http://example.com/FILE.PDF", ""); ok {
-		t.Errorf("NormalizeUrl() = %q, want rejection for an uppercase extension", got)
-	}
-}
-
-// A download endpoint is not necessarily a binary. The extension check runs on
-// the path, so ?file=a.pdf survives normalisation on purpose: the path has no
-// extension, and guessing at query values would drop real HTML pages whose URLs
-// happen to carry a "file" parameter. Documented rather than asserted either way.
 func TestNormalizeUrlDoesNotGuessAtQueryStringContents(t *testing.T) {
 	got, ok := NormalizeUrl("http://example.com/download?file=a.pdf", "")
 	if !ok {
@@ -393,23 +459,6 @@ func TestNormalizeUrlLeavesNonWikiHostsAlone(t *testing.T) {
 	}
 }
 
-func TestNormalizeUrlSkipsWikiNamespacePages(t *testing.T) {
-	// /Template:Foo/de and /Help:Bar/en are documentation about a page, not
-	// the page itself, and there are tens of thousands of them.
-	for _, raw := range []string{
-		"http://en.wikipedia.org/wiki/Template:Foo/de",
-		"http://en.wikipedia.org/wiki/Help:Bar/en",
-		"http://en.wikipedia.org/wiki/Manual:Baz/en",
-		"http://en.wikipedia.org/wiki/Extension:Qux/de",
-	} {
-		t.Run(raw, func(t *testing.T) {
-			if got, ok := NormalizeUrl(raw, ""); ok {
-				t.Errorf("NormalizeUrl(%q) = %q, want rejection", raw, got)
-			}
-		})
-	}
-}
-
 func TestNormalizeUrlRejectsAMalformedURL(t *testing.T) {
 	for _, raw := range []string{
 		"://missing-scheme",
@@ -428,6 +477,9 @@ func TestNormalizeUrlRejectsAMalformedURL(t *testing.T) {
 // ── NormalizeUrls ────────────────────────────────────────────────────────────
 
 func TestNormalizeUrlsDropsTheRejectedEntries(t *testing.T) {
+	// The rejected entries are now only the ones that are not URLs. A /login or a
+	// .pdf in a batch is a URL the policy manager will refuse with a reason, not
+	// one this function gets to silently omit.
 	got := NormalizeUrls([]string{
 		"http://example.com/a",
 		"http://example.com/login",
@@ -436,7 +488,12 @@ func TestNormalizeUrlsDropsTheRejectedEntries(t *testing.T) {
 		"http://example.com/c.pdf",
 	}, "")
 
-	want := []string{"https://example.com/a", "https://example.com/b"}
+	want := []string{
+		"https://example.com/a",
+		"https://example.com/login",
+		"https://example.com/b",
+		"https://example.com/c.pdf",
+	}
 	if len(got) != len(want) {
 		t.Fatalf("NormalizeUrls() = %v, want %v", got, want)
 	}
@@ -490,7 +547,7 @@ func TestNormalizeUrlsOnEmptyInput(t *testing.T) {
 }
 
 func TestNormalizeUrlsOnAllRejected(t *testing.T) {
-	got := NormalizeUrls([]string{"#a", "http://example.com/login", "#b"}, "")
+	got := NormalizeUrls([]string{"#a", "ht tp://example.com/x", "#b"}, "")
 	if len(got) != 0 {
 		t.Errorf("NormalizeUrls() = %v, want an empty slice", got)
 	}

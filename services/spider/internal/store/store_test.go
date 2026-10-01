@@ -173,18 +173,27 @@ func TestStoreInitFailsClosedOnAnUnreadableFrontier(t *testing.T) {
 	}
 }
 
-// TestStorePersistPageCrawlsASelfLinkingPageOnlyOnce is the self-link case, and it
-// is worth being precise about what prevents the second crawl.
+// TestStorePersistPageDecidesNothingAboutTheCrawl is the test that pins where the
+// crawl decisions are not.
 //
-// A page that links to itself -- a nav bar, a footer, a tag list -- does get its
-// own URL back into the frontier, because Enqueue deliberately does not consult
-// the visited set. Marking it visited first does not change that; the two
-// operations are independent. What prevents the re-crawl is the pop, which checks
-// the visited set before handing anything out.
+// This function used to end by marking the page visited and enqueueing its links,
+// and both were crawl decisions made by a database layer. A store that writes rows
+// is not entitled to decide when a URL has been seen or what the crawl should look
+// at next, and doing it here had costs that only showed in aggregate: nothing
+// counted a refusal, because nothing here could refuse; the decision could not be
+// retried, observed or reasoned about from anywhere except the function that
+// happened to insert the row; and a URL the gate would have refused still cost a
+// Redis write on its way to being discarded at the pop.
 //
-// So the property is end-to-end and the test is too: the self-link may enter the
-// frontier, and it must never come out of it as work.
-func TestStorePersistPageCrawlsASelfLinkingPageOnlyOnce(t *testing.T) {
+// So the loop does both now, through the policy manager, after this returns and only
+// if the insert committed. What is left here is a row.
+//
+// The properties those two writes carried are not lost with them. A self-linking
+// page is still crawled once and not twice --
+// TestTheLoopDoesNotFetchAPageTwiceWhenItIsAlreadyVisited, at the layer that now
+// owns it -- and a visited link is still queued and then dropped at the pop --
+// TestDiscoverQueuesAURLItHasAlreadyCrawled, likewise.
+func TestStorePersistPageDecidesNothingAboutTheCrawl(t *testing.T) {
 	s, st := newTestStore(t)
 	ctx := context.Background()
 
@@ -198,23 +207,17 @@ func TestStorePersistPageCrawlsASelfLinkingPageOnlyOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if visited, err := st.IsVisited(ctx, url); err != nil {
-		t.Fatal(err)
-	} else if !visited {
-		t.Fatal("the page was not marked visited")
-	}
-
-	// Drain the frontier the way the crawl would. The page must not come out.
-	got, err := st.PopFrontier(ctx, 64)
+	visited, err := st.IsVisited(ctx, url)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Found && got.URL == url {
-		t.Fatal("a self-linking page was handed out a second time")
+	if visited {
+		t.Error("the store marked a stored page visited; the loop does that, once " +
+			"the insert has committed and through a call that can be counted")
 	}
-	// Its links did, which is the point of the whole thing.
-	if got.Found && got.URL != "https://example.com/a" {
-		t.Errorf("pop = %q, want the first real link", got.URL)
+	if got := len(st.Frontier()); got != 0 {
+		t.Errorf("the store enqueued %d links; the loop does that, and only the "+
+			"links policy.AdmitLinks approved", got)
 	}
 }
 
@@ -286,44 +289,5 @@ func TestStoreGetHostMetaData(t *testing.T) {
 		t.Fatal(err)
 	} else if found {
 		t.Error("a host that was never written was reported as found")
-	}
-}
-
-// TestStoreEnqueueDoesNotRaceVisitedEntries is the reason Enqueue is allowed to
-// queue a visited URL.
-//
-// The old AddUrls checked the visited set for every link before queueing it, in a
-// pipeline of SISMEMBERs -- a full extra round trip over every link on every page,
-// to avoid queueing something the pop would discard anyway. The pop already skips
-// visited entries, so the check bought nothing and cost a round trip per page. Now
-// that is the pop's job, and the store enqueues unconditionally.
-func TestStorePersistPageEnqueuesLinksThatAreAlreadyVisited(t *testing.T) {
-	s, st := newTestStore(t)
-	ctx := context.Background()
-
-	const seen = "https://example.com/old"
-	if err := st.MarkVisited(ctx, seen); err != nil {
-		t.Fatal(err)
-	}
-
-	page := &entity.Page{URL: "https://example.com/page", Links: []string{seen}}
-	if _, err := s.persistPage(ctx, page); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, ok := st.Frontier()[seen]; !ok {
-		t.Fatal("the link was not enqueued; the visited check has moved to the pop")
-	}
-
-	// Which means the pop has to drop it, and this is the end of that path.
-	got, err := st.PopFrontier(ctx, 16)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Found {
-		t.Errorf("the pop handed out %q, which was already crawled", got.URL)
-	}
-	if !got.Exhausted {
-		t.Error("Exhausted = false once the only entry was discarded as visited")
 	}
 }

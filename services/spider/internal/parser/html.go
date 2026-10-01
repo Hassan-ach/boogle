@@ -91,7 +91,7 @@ func (c *htmlCollector) mergeMeta(other entity.MetaData) entity.MetaData {
 
 func (c *htmlCollector) maybeAddLink(rawURL string) {
 	if _, err := url.Parse(rawURL); err == nil {
-		u, ok := utils.NormalizeUrl(rawURL, "")
+		u, ok := utils.CanonicalizeUrl(rawURL, "")
 		if !ok {
 			return
 		}

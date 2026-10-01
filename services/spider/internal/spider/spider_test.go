@@ -687,7 +687,12 @@ func TestAPageThatFailsToPersistStaysCrawlable(t *testing.T) {
 	clock := &testClock{t: time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)}
 	s := newSite(t)
 	const path = "/good"
-	s.serve(path, englishPage)
+	// A page with a link, so the assertion about the frontier below has something
+	// to be wrong about. A page with no links leaves the frontier empty whichever
+	// way the loop goes, which is what makes this kind of assertion so easy to get
+	// wrong by accident: it passes, and it proves nothing.
+	s.serve(path, `<!doctype html><html lang="en"><head><title>t</title></head>`+
+		`<body><a href="/child">child</a></body></html>`)
 
 	ch := &fakeChannel{}
 	h := newHarness(t, s, nil, clock)
@@ -714,6 +719,98 @@ func TestAPageThatFailsToPersistStaysCrawlable(t *testing.T) {
 	if visited {
 		t.Error("a page that was never stored was marked visited; a database outage " +
 			"would then delete every page fetched during it, silently and for ever")
+	}
+
+	// And the same for its links, which is the other half of the same ordering. A
+	// page that was not stored is a page whose links have not been seen at all, so
+	// discovering them would widen the crawl with pages whose parent does not exist
+	// -- and on a repeated database outage, forever: nothing would mark the parent
+	// seen either, so every round would queue the same neighbourhood again.
+	if got := h.frontierLen(t); got != 0 {
+		t.Errorf("frontier holds %d urls after a page that failed to persist was "+
+			"expanded; its links are discovered only once the page itself is stored", got)
+	}
+}
+
+// TestAStoredPageIsRetiredAndItsLinksDiscovered is the counterpart, and it covers
+// the two crawl decisions that moved out of the store.
+//
+// persistPage used to end by marking the page visited and enqueueing its links.
+// Both are now the loop's, and both are conditional on the same thing: the insert
+// committed. They are asserted together because in the code they are three
+// consecutive statements with nothing between them, and either could move without
+// the other being noticed.
+//
+// The link side is where the counting has to be visible. The links are no longer
+// filtered by utils.ValidateLinks, which returned one list and no explanation, so
+// a page with an /admin link and a PDF produced no record that either was declined.
+// Now both refusals are counted against the host, which is the only way to answer
+// "why is this site barely in the index" -- and a reason that stopped being
+// recorded would be silent: the frontier would simply be smaller.
+func TestAStoredPageIsRetiredAndItsLinksDiscovered(t *testing.T) {
+	clock := &testClock{t: time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)}
+	s := newSite(t)
+	const path = "/index"
+	s.serve(path, `<!doctype html><html lang="en"><head><title>t</title></head><body>`+
+		`<a href="/child">child</a>`+
+		`<a href="/admin/panel">panel</a>`+
+		`<a href="/report.pdf">report</a>`+
+		`<a href="/second">second</a>`+
+		`</body></html>`)
+
+	h := newHarness(t, s, nil, clock)
+	h.enqueue(t, s.pageURL(path))
+	h.crawl(t)
+
+	// The page is stored, so it is no longer a crawl candidate.
+	visited, err := h.state.IsVisited(context.Background(), s.pageURL(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !visited {
+		t.Error("a page that was stored was not marked visited, so the next round " +
+			"fetches it again and indexes it twice")
+	}
+
+	// Its links are work, and only the approved ones are.
+	frontier := h.state.Frontier()
+	for _, want := range []string{"/child", "/second"} {
+		if _, ok := frontier[s.pageURL(want)]; !ok {
+			t.Errorf("%s was not discovered; the frontier holds %v", want, frontier)
+		}
+	}
+	for _, refused := range []string{"/admin/panel", "/report.pdf"} {
+		if _, ok := frontier[s.pageURL(refused)]; ok {
+			t.Errorf("%s reached the frontier, so a page the rules refuse is one "+
+				"round trip away from being fetched", refused)
+		}
+	}
+
+	// And the refusals are counted, which is the entire reason they moved.
+	stats := h.state.Stats(hostOf(s.srv.URL))
+	for reason, what := range map[policy.Reason]string{
+		policy.ReasonPathDisallowed:   "/admin/panel",
+		policy.ReasonExtensionSkipped: "/report.pdf",
+	} {
+		if stats[reason] == 0 {
+			t.Errorf("nothing counted under %q after %s was declined; the stats "+
+				"hash is the only record of why a site is under-indexed",
+				reason, what)
+		}
+	}
+
+	// The stored page carries the approved set too, because that is what the graph
+	// edges are built from. A stored page whose links include a refused one puts
+	// PageRank into a URL the crawler decided not to fetch.
+	pages := h.store.persisted()
+	if len(pages) != 1 {
+		t.Fatalf("persisted %d pages, want 1", len(pages))
+	}
+	for _, link := range pages[0].Links {
+		if strings.Contains(link, "/admin/") || strings.HasSuffix(link, ".pdf") {
+			t.Errorf("the stored page links to %q, which the gate refused; the "+
+				"graph would then credit a page the crawl never fetched", link)
+		}
 	}
 }
 

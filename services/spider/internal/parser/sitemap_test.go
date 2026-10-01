@@ -252,6 +252,15 @@ func TestFetchSitemapReportsAMalformedDocument(t *testing.T) {
 // TestFetchSitemapSkipsUnusableLocsRatherThanFailingTheWholeSitemap is the
 // behavioural requirement: a sitemap with one junk entry is extremely common,
 // and returning an error made the spider discard every good URL in it.
+//
+// What counts as unusable has narrowed, and that is the change worth pinning. It
+// used to mean "did not canonicalise, or matched a skip rule" -- so a /login entry
+// and a .pdf entry were dropped here, silently, with nothing recorded about either.
+// Now it means only "is not a URL at all": a relative loc is resolved against the
+// advertising host, and /login and skipme.pdf are returned for the policy manager
+// to refuse with a reason attached. A sitemap is the one place a site states its
+// own inventory, so discarding its entries without a word is the worst possible
+// place to be deciding they do not exist.
 func TestFetchSitemapSkipsUnusableLocsRatherThanFailingTheWholeSitemap(t *testing.T) {
 	srv, _ := sitemapServer(t, `<urlset>
   <url><loc>https://example.com/good-one</loc></url>
@@ -259,6 +268,8 @@ func TestFetchSitemapSkipsUnusableLocsRatherThanFailingTheWholeSitemap(t *testin
   <url><loc>https://example.com/good-two</loc></url>
   <url><loc>https://example.com/skipme.pdf</loc></url>
   <url><loc>#fragment</loc></url>
+  <url><loc></loc></url>
+  <url><loc>ht tp://example.com/space</loc></url>
 </urlset>`, http.StatusOK)
 
 	host, _ := url.Parse("https://example.com")
@@ -267,7 +278,16 @@ func TestFetchSitemapSkipsUnusableLocsRatherThanFailingTheWholeSitemap(t *testin
 		t.Fatalf("fetchSitemap() error: %v; one bad loc must not discard the sitemap", err)
 	}
 
-	want := []string{"https://example.com/good-one", "https://example.com/good-two"}
+	// The two unusable ones -- a bare fragment and an empty loc -- are gone. The
+	// empty loc is skipped by the explicit check before parsing; the fragment by
+	// canonicalisation, which rejects anything starting with "#" because there is
+	// no document to refer to. The malformed one cannot be parsed at all.
+	want := []string{
+		"https://example.com/good-one",
+		"https://example.com/login",
+		"https://example.com/good-two",
+		"https://example.com/skipme.pdf",
+	}
 	if len(got) != len(want) {
 		t.Fatalf("fetchSitemap() = %v, want %v", got, want)
 	}

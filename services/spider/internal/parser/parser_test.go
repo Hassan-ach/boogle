@@ -73,3 +73,42 @@ func TestParseHTML(t *testing.T) {
 		t.Errorf("expected links to be parsed, got 0")
 	}
 }
+
+// TestAPageThatListsTheSameURLTwiceCrawlsItOnce covers the dedup, which is easy to
+// lose and expensive to lose.
+//
+// Almost every page links to its own header and footer. The three spellings below
+// are one document -- an absolute URL, a root-relative one and the same root-
+// relative one with a fragment -- and they reach the collector as three separate
+// hrefs. Canonicalisation collapses all three to the same key, which is the point
+// of canonicalising first: two URLs that differ only in spelling are one page, and
+// keying them separately splits its word counts and its PageRank between them.
+//
+// The frontier is a set, so a duplicate is harmless there. It is not harmless
+// before it: every duplicate costs an admission, a state read and a counter
+// increment, on every page that has a nav bar, and the refusals among them are
+// counted twice -- so a site's stats overstate how much of it was declined.
+func TestAPageThatListsTheSameURLTwiceCrawlsItOnce(t *testing.T) {
+	html := `<!doctype html><html lang="en"><head><title>t</title></head><body>` +
+		`<a href="/about">about</a>` +
+		`<a href="https://example.com/about">about again</a>` +
+		`<a href="/about#team">about a third time</a>` +
+		`<a href="/other">other</a>` +
+		`</body></html>`
+
+	p := NewParser(nil, newTestLogger())
+	page, err := p.ParseHTML(strings.NewReader(html), "https://example.com/")
+	if err != nil {
+		t.Fatalf("ParseHTML failed: %v", err)
+	}
+
+	want := []string{"https://example.com/about", "https://example.com/other"}
+	if len(page.Links) != len(want) {
+		t.Fatalf("extracted %d links, want %d: %v", len(page.Links), len(want), page.Links)
+	}
+	for i := range want {
+		if page.Links[i] != want[i] {
+			t.Errorf("Links[%d] = %q, want %q", i, page.Links[i], want[i])
+		}
+	}
+}

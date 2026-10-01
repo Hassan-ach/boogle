@@ -235,6 +235,50 @@ func TestDrainFrontierRespectsItsLimit(t *testing.T) {
 	}
 }
 
+// TestDiscoverQueuesAURLItHasAlreadyCrawled is the property that made Enqueue
+// cheap, now that Discover is the only thing calling it.
+//
+// The old AddUrls checked the visited set for every link before queueing it, in a
+// pipeline of SISMEMBERs -- a full extra round trip over every link on every page,
+// to avoid queueing something the pop was going to discard anyway. So a visited
+// link is queued, and the pop drops it. Enqueue does not consult the visited set,
+// deliberately: a page that links to itself, through a nav bar or a footer, must
+// come back into the frontier and be recognised there, because the pop is where
+// "seen" is decided and nowhere else.
+//
+// It matters which of the two does the work. A self-linking page crawled twice is a
+// duplicate row and a duplicated contribution to PageRank; a visited link never
+// queued is a page the crawler has seen once and will not see again, which is how a
+// crawl quietly loses the interior of a site. So the queue is allowed to be
+// untidy and the pop is not.
+func TestDiscoverQueuesAURLItHasAlreadyCrawled(t *testing.T) {
+	m, st := newTestManager(t)
+	ctx := context.Background()
+
+	const seen = "https://example.com/old"
+	if err := st.MarkVisited(ctx, seen); err != nil {
+		t.Fatal(err)
+	}
+
+	m.Discover(ctx, []string{seen})
+	if _, ok := st.Frontier()[seen]; !ok {
+		t.Fatal("Discover dropped a visited link; the pop's check is the one that " +
+			"was meant to decide this")
+	}
+
+	// And the pop is what actually stops it, which is the end of that path.
+	got, err := st.PopFrontier(ctx, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Found {
+		t.Errorf("the pop handed out %q, which had already been crawled", got.URL)
+	}
+	if !got.Exhausted {
+		t.Error("Exhausted = false once the only entry was discarded as visited")
+	}
+}
+
 func TestDiscoverQueuesLinksAndToleratesAFailure(t *testing.T) {
 	m, st := newTestManager(t)
 	ctx := context.Background()

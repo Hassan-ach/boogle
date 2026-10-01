@@ -322,18 +322,49 @@ func (s *Spider) crawl(crawler_id int) {
 		len(page.Images),
 	)
 
-	page.Links = utils.ValidateLinks(page.Links, host.NotAllowedPaths)
+	// The page's links go through the same gate as everything else, so a link this
+	// crawler declines is declined with a reason rather than silently dropped.
+	//
+	// It used to be utils.ValidateLinks, which returned one list and no
+	// explanation: the links it removed left no trace, so a page with forty links
+	// and eleven PDFs produced eleven entries that a later function removed with
+	// nothing recorded, and the crawl log could not say how much of a site was
+	// being declined. AdmitLinks counts each refusal against the host as it goes.
+	admitted, refused := s.policy.AdmitLinks(ctx, page.Links)
+	byReason := make(map[policy.Reason]int, len(refused))
+	for _, reason := range refused {
+		byReason[reason]++
+	}
+	for reason, n := range byReason {
+		logger.Info("Page links declined", "url", rawUrl, "reason", reason, "count", n)
+	}
+	page.Links = admitted
 
 	pageId := s.store.Persist(ctx, page, host)
 	if pageId == uuid.Nil() {
-		// Not indexed, so not visited: the store marks the page visited only once
-		// the insert has committed, and a page that failed to be stored is a page
-		// worth fetching again. The host's page count has already moved, which is
-		// the safe direction to be wrong in -- it spends budget rather than
-		// granting it.
+		// Not indexed, so not visited: the page is retired only once the insert
+		// has committed, and a page that failed to be stored is a page worth
+		// fetching again. The host's page count has already moved, which is the
+		// safe direction to be wrong in -- it spends budget rather than granting it.
 		logger.Warn("Page was not persisted; leaving it crawlable", "url", page.URL)
 		return
 	}
+
+	// In the index, so no longer a crawl candidate. This used to be the last two
+	// lines of store.persistPage, which is the wrong place for it: a store that
+	// writes to the database is not entitled to decide when a URL has been seen,
+	// and doing it there meant the decision could not be counted, retried or
+	// reasoned about from anywhere except the function that happened to insert the
+	// row.
+	if err := s.policy.Retire(ctx, rawUrl); err != nil {
+		logger.Error("Could not mark a stored page visited", "url", rawUrl, "error", err)
+	}
+
+	// And the links it found are the crawl's next round of work. Enqueue does not
+	// consult the visited set, so a page that links to itself comes back round
+	// once; it is not crawled twice because the pop asks Admit first, which is the
+	// same check done once per pop instead of once per link on every page.
+	s.policy.Discover(ctx, page.Links)
 
 	if err := queue.Publish(
 		"indexer.jobs",

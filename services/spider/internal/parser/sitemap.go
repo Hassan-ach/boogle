@@ -75,7 +75,7 @@ func fetchSitemap(ctx context.Context, client *http.Client, sitemapURL string, h
 		if entry.Loc == "" {
 			continue
 		}
-		x, ok := utils.NormalizeUrl(entry.Loc, host.Host)
+		x, ok := utils.CanonicalizeUrl(entry.Loc, host.Host)
 		if !ok {
 			continue
 		}
