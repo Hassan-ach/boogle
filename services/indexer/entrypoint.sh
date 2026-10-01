@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+# Required
+: "${DATABASE_URL:?DATABASE_URL is not set}"
+: "${RABBITMQ_URL:?RABBITMQ_URL is not set}"
+: "${RABBITMQ_QUEUE:?RABBITMQ_QUEUE is not set}"
+: "${RABBITMQ_CONFIRMATION_QUEUE:?RABBITMQ_CONFIRMATION_QUEUE is not set}"
+
+# Optional, with defaults
+export LOG_PATH="${LOG_PATH:-./logs/indexer.log}"
+
+export PG_MAX_CONNECTIONS="${PG_MAX_CONNECTIONS:-10}"
+export PG_MIN_CONNECTIONS="${PG_MIN_CONNECTIONS:-2}"
+export ACQUIRE_TIMEOUT_SECONDS="${ACQUIRE_TIMEOUT_SECONDS:-5}"
+export PG_LOCK_TIMEOUT_MS="${PG_LOCK_TIMEOUT_MS:-5000}"
+export PG_STATEMENT_TIMEOUT_MS="${PG_STATEMENT_TIMEOUT_MS:-60000}"
+
+export WORD_BATCH_SIZE="${WORD_BATCH_SIZE:-1000}"
+export PAGE_WORD_BATCH_SIZE="${PAGE_WORD_BATCH_SIZE:-500}"
+export MAX_RETRIES="${MAX_RETRIES:-3}"
+
+export SWEEP_INTERVAL_SECONDS="${SWEEP_INTERVAL_SECONDS:-300}"
+export SWEEP_GRACE_SECONDS="${SWEEP_GRACE_SECONDS:-600}"
+
+# Ensure the log directory exists
+mkdir -p "$(dirname "$LOG_PATH")"
+
+exec ./indexer "$@"
