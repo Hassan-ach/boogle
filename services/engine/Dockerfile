@@ -14,7 +14,7 @@ RUN just tailwind-build-prod
 RUN just js-prod
 
 
-FROM golang:tip-alpine3.23 AS go-builder
+FROM golang:1.27.1-alpine3.23 AS go-builder
 
 WORKDIR /app
 
@@ -23,7 +23,7 @@ RUN apk add --no-cache \
     aspell-dev \
     just
 
-RUN go install github.com/a-h/templ/cmd/templ@latest
+RUN go install github.com/a-h/templ/cmd/templ@v0.3.1020
 
 COPY go.mod go.sum ./
 RUN go mod download
@@ -36,13 +36,21 @@ RUN just build-emb
 
 FROM alpine:3.23
 
+RUN apk add --no-cache aspell aspell-en \
+ && addgroup -S app -g 10001 \
+ && adduser -S app -u 10001 -G app
+
 WORKDIR /app
 
-COPY --from=go-builder /app/boogle .
-COPY --from=builder /app/public ./public
+COPY --from=go-builder --chown=app:app /app/boogle .
+COPY --from=builder --chown=app:app /app/public ./public
+COPY --chown=app:app entrypoint.sh /entrypoint.sh
+RUN chmod 0555 /entrypoint.sh
 
-RUN apk add --no-cache aspell aspell-en
+USER 10001:10001
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget -q --spider http://localhost:1323/health || exit 1
 
 EXPOSE 1323
-
-CMD ["./boogle"]
+ENTRYPOINT ["/entrypoint.sh"]
