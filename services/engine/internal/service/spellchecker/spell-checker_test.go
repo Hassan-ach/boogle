@@ -6,13 +6,9 @@ import (
 	"testing"
 )
 
-// fakeDict is a stand-in for aspell so the suggestion rules can be tested
-// without depending on the C library or on which dictionary is installed.
 type fakeDict struct {
 	correct map[string]bool
 	suggs   map[string][]string
-	// ordered records every word Check was asked about, so tests can assert the
-	// query was actually split rather than passed through whole.
 	ordered []string
 }
 
@@ -40,9 +36,6 @@ func TestSuggestionsAreSortedAndDeduplicated(t *testing.T) {
 
 	got := suggestionsFor("zebra mispeled apple", d, 3)
 
-	// "zebra" is correct, and is also a suggestion for "mispeled", so it must
-	// appear exactly once. "mispeled" is here because the word as typed is always
-	// a candidate -- see TestAnUnknownWordIsNotDroppedFromTheQuery.
 	want := []string{"apple", "mispeled", "zapping", "zebra", "zulu"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("suggestionsFor() = %v, want %v", got, want)
@@ -50,9 +43,6 @@ func TestSuggestionsAreSortedAndDeduplicated(t *testing.T) {
 }
 
 func TestSuggestionsAreDeterministicAcrossCalls(t *testing.T) {
-	// Regression: the result came out of a map, so Go's randomised iteration
-	// order leaked into the response and the same query answered differently
-	// every time.
 	d := newFake([]string{}, map[string][]string{
 		"qeury": {"query", "queue", "quay", "quick"},
 	})
@@ -92,8 +82,6 @@ func TestCorrectWordsAreKeptAsIs(t *testing.T) {
 }
 
 func TestCorrectWordsAreLowercased(t *testing.T) {
-	// The index is lowercased by the tokenizer, so a suggestion with different
-	// casing would never match anything.
 	d := newFake([]string{"GoLang"}, nil)
 
 	got := suggestionsFor("GoLang", d, 3)
@@ -116,8 +104,6 @@ func TestSuggestionsAreLowercased(t *testing.T) {
 }
 
 func TestAtMostThreeSuggestionsPerMisspelledWord(t *testing.T) {
-	// An unbounded list swamps the result page and costs a full aspell pass. The
-	// cap is on suggestions, not on the word itself, which is always kept.
 	d := newFake([]string{}, map[string][]string{
 		"mispeled": {"one", "two", "three", "four", "five"},
 	})
@@ -130,8 +116,6 @@ func TestAtMostThreeSuggestionsPerMisspelledWord(t *testing.T) {
 }
 
 func TestTheLimitIsRespectedPerWordNotInTotal(t *testing.T) {
-	// Each misspelled word gets its own budget, so a long query is not starved
-	// by the first word's suggestions.
 	d := newFake([]string{}, map[string][]string{
 		"aaaa": {"a1", "a2", "a3", "a4"},
 		"bbbb": {"b1", "b2", "b3", "b4"},
@@ -146,7 +130,6 @@ func TestTheLimitIsRespectedPerWordNotInTotal(t *testing.T) {
 }
 
 func TestApostrophesAreFilteredOut(t *testing.T) {
-	// Aspell loves returning possessives, which are noise in a query box.
 	d := newFake([]string{}, map[string][]string{
 		"john": {"john's", "john", "jon"},
 	})
@@ -164,7 +147,6 @@ func TestApostrophesAreFilteredOut(t *testing.T) {
 }
 
 func TestBlankWordsAreDropped(t *testing.T) {
-	// Repeated and leading spaces would otherwise be "correct" empty words.
 	d := newFake([]string{"alpha", "beta"}, nil)
 
 	got := suggestionsFor("  alpha   beta  ", d, 3)
@@ -192,7 +174,6 @@ func TestWhitespaceOnlySuggestionsAreDropped(t *testing.T) {
 }
 
 func TestTheQueryIsSplitOnSpaces(t *testing.T) {
-	// Suggesting for the whole query string at once returns nothing useful.
 	d := newFake([]string{}, map[string][]string{
 		"alpha": {"alfa"},
 		"beta":  {"bta"},
@@ -224,19 +205,6 @@ func TestQueryOfOnlySpacesReturnsNothing(t *testing.T) {
 	}
 }
 
-// TestAnUnknownWordIsNotDroppedFromTheQuery is a regression test.
-//
-// The word as typed used to be kept only if the dictionary recognised it, and
-// otherwise replaced by whatever `Suggest` returned. A word aspell has never
-// heard of -- a product name, a username, an identifier, anything coined since
-// its word list was written -- has no suggestions, so it was dropped from the
-// query entirely. Searching for a term that really was on an indexed page
-// returned nothing, with no error and nothing in the logs, because the query had
-// been silently rewritten into a shorter one.
-//
-// Keeping the original is strictly additive here: the store matches with
-// `word = ANY($1)`, which is an OR, so an extra term can only widen the
-// candidate set.
 func TestAnUnknownWordIsNotDroppedFromTheQuery(t *testing.T) {
 	d := newFake([]string{}, map[string][]string{})
 
@@ -247,9 +215,6 @@ func TestAnUnknownWordIsNotDroppedFromTheQuery(t *testing.T) {
 	}
 }
 
-// The typed word is kept, but a suggestion that is nothing but whitespace still
-// has to go, or the result set fills up with entries that can never match
-// anything in the index.
 func TestAWordWithNoSuggestionsDoesNotProduceABlankEntry(t *testing.T) {
 	d := newFake([]string{}, map[string][]string{})
 
@@ -272,8 +237,6 @@ func TestRepeatedWordsAppearOnce(t *testing.T) {
 	}
 }
 
-// TestAspellResultsAreStable exercises the real C library, so it is skipped
-// when aspell is not installed rather than failing the whole suite.
 func TestAspellResultsAreStable(t *testing.T) {
 	speller, err := NewAspellSpellingService()
 	if err != nil {

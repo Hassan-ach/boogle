@@ -1,28 +1,3 @@
-"""`RankingCalculator` against a real PostgreSQL.
-
-The unit tests for `calculator.py` assert on the SQL text and drive it through a
-fake connection. That pins the *shape* of the queries but not their
-*arithmetic*, and the arithmetic is where both defects lived:
-
-  * `pages.id` and the document-frequency count are both `bigint`, so the ratio
-    was computed by integer division. 378 / 352 truncated to 1, and LOG(1) is 0,
-    so every word appearing on more than half the corpus was stored with an IDF
-    of exactly zero -- weighted as if it carried no information at all.
-  * On an empty corpus the argument to LOG was 0, which raises "cannot take
-    logarithm of zero". That is not a retryable error, so it took the ranking
-    pipeline down rather than degrading.
-
-Neither is visible until the statement actually runs, which is what this file
-does.
-
-The adapter below is a fake in exactly one respect and it is deliberate: it does
-not honour `commit()`. Everything else is psycopg, the real driver. Suppressing
-the commit keeps the fixture rows inside the test's transaction so teardown can
-roll the whole thing back -- without it every test would leave its graph behind
-for the next one. That `commit` is called, and is called on the failure path
-too, is asserted in the unit tests against the fake connection.
-"""
-
 from __future__ import annotations
 
 import math
@@ -38,11 +13,7 @@ from .graph import GraphBuilder
 pytestmark = pytest.mark.integration
 
 
-# ── asyncpg-shaped adapter over psycopg ──────────────────────────────────────
-
-
 class _Cursor:
-    """Exposes the handful of asyncpg methods the calculator uses."""
 
     def __init__(self, raw: Any) -> None:
         self._raw = raw
@@ -72,7 +43,6 @@ class _Connection:
         return _Cursor(self._raw.cursor())
 
     async def commit(self) -> None:
-        # Not honoured on purpose; see the module docstring.
         self.commits += 1
 
     async def rollback(self) -> None:
@@ -93,13 +63,6 @@ class _ConnectionContext:
 
 
 class LiveDBManager:
-    """A `DatabaseManager` whose connections are real but never committed.
-
-    Every call to `get_connection()` hands back the *same* underlying
-    connection, so the rows a test fixture writes and the rows the calculator
-    sees live in one transaction. A real pool would hand out different sessions;
-    what these tests care about is the SQL, not session isolation.
-    """
 
     def __init__(self, dsn: str) -> None:
         self._dsn = dsn
@@ -116,11 +79,6 @@ class LiveDBManager:
         return _ConnectionContext(self._connection())
 
     def open_cursor(self) -> Any:
-        """A plain psycopg cursor sharing the same transaction.
-
-        The graph fixtures need psycopg's synchronous API, which is the one
-        `GraphBuilder` is written against.
-        """
         return self._connection().cursor()
 
     def close(self) -> None:
@@ -143,7 +101,7 @@ def db_manager(dsn: str) -> Iterator[LiveDBManager]:
 
 @pytest.fixture
 def calculator(db_manager: LiveDBManager) -> RankingCalculator:
-    return RankingCalculator(db_manager)  # type: ignore[arg-type]
+    return RankingCalculator(db_manager)
 
 
 @pytest.fixture
@@ -160,12 +118,6 @@ def _idf(builder: GraphBuilder) -> dict[str, float]:
     return {word: float(idf) for word, idf in builder._cursor.fetchall()}
 
 
-# ── the integer-division defect ──────────────────────────────────────────────
-
-# test_idfIsNonZeroForACommonWord is the regression test for the bigint
-# truncation. The word is on 352 of 378 pages, so n/df is a little above 1 and
-# the IDF is a small positive number. Integer division produced exactly 1, and
-# LOG(1) is exactly 0, so the word was weighted as if it appeared nowhere.
 async def test_idfIsNonZeroForACommonWord(
     calculator: RankingCalculator, graph: GraphBuilder
 ) -> None:
@@ -184,16 +136,6 @@ async def test_idfIsNonZeroForACommonWord(
     ), f"idf['common'] = {idf['common']}, want log10(378/352)"
 
 
-# test_idfIsNeverNegative is the regression test for the smoothed-denominator
-# leak.
-#
-# The formula used to divide by (df + 1), which for a word on every page of a
-# small corpus gives n/(n+1) < 1 and therefore a negative IDF. The engine
-# multiplies tf by idf, so a negative weight does not merely fail to help, it
-# subtracts from the page's score. A fresh crawl is exactly when this bites: the
-# index starts at a handful of pages, so words present in all of them are
-# everywhere, and a site-wide navigation label is a negative weight on every
-# result.
 async def test_idfIsNeverNegative(
     calculator: RankingCalculator, graph: GraphBuilder
 ) -> None:
@@ -209,11 +151,6 @@ async def test_idfIsNeverNegative(
         assert value >= 0.0, f"{word} has a negative idf: {value}"
 
 
-# test_idfIsZeroOnlyForAWordOnEveryPage pins where the floor kicks in. The
-# ratio is floored at 1 and LOG(1) is 0, so only a word on *every* page scores
-# zero. A word on all but one still carries some information -- 4/3 against a
-# corpus of 4 -- and is deliberately kept positive; the smoothing that would
-# have pushed it below zero is exactly what made it a penalty.
 async def test_idfIsZeroOnlyForAWordOnEveryPage(
     calculator: RankingCalculator, graph: GraphBuilder
 ) -> None:
@@ -254,8 +191,6 @@ async def test_idfOrdersWordsByRarity(
 async def test_idfGrowsWithCorpusSize(
     calculator: RankingCalculator, graph: GraphBuilder
 ) -> None:
-    # The same word on the same number of pages is rarer -- and so more
-    # informative -- in a bigger corpus. That is the whole point of IDF.
     for i in range(8):
         graph.page(f"p-{i}")
     graph.word("fixed", page_names=["p-0"])
@@ -267,15 +202,9 @@ async def test_idfGrowsWithCorpusSize(
     assert idf["fixed"] > idf["growing"], idf
 
 
-# ── the empty-corpus defect ──────────────────────────────────────────────────
-
-# test_idfOnAnEmptyCorpusDoesNotRaise is the regression test for LOG(0).
-# "cannot take logarithm of zero" is raised as a plain Error, which the retry
-# decorator does not retry and the pipeline does not survive.
 async def test_idfOnAnEmptyCorpusDoesNotRaise(
     calculator: RankingCalculator, graph: GraphBuilder
 ) -> None:
-    # A word row exists but no page does, so the corpus size is 0.
     graph.word("orphan", page_names=[])
 
     affected = await calculator.compute_idf()
@@ -286,8 +215,6 @@ async def test_idfOnAnEmptyCorpusDoesNotRaise(
 async def test_idfOnACorpusOfOnePage(
     calculator: RankingCalculator, graph: GraphBuilder
 ) -> None:
-    # n == df == 1, so the ratio is 1 and the IDF is 0: the only word on the
-    # only page cannot distinguish that page from any other.
     graph.page("only")
     graph.word("word", page_names=["only"])
 
@@ -297,14 +224,9 @@ async def test_idfOnACorpusOfOnePage(
     assert math.isclose(idf["word"], 0.0, abs_tol=TOLERANCE), idf
 
 
-# ── bookkeeping ──────────────────────────────────────────────────────────────
-
 async def test_idfLeavesAWordWithNoOccurrencesAlone(
     calculator: RankingCalculator, graph: GraphBuilder
 ) -> None:
-    # A word row can exist with doc_frequency 0 between the indexer inserting it
-    # and its page_word rows landing. The UPDATE joins on doc_freq, so it must
-    # leave the default alone rather than computing log(n/1) for it.
     graph.page("p-0")
     graph._cursor.execute("INSERT INTO words (word, idf) VALUES ('untouched', 42.0)")
 
@@ -317,8 +239,6 @@ async def test_idfLeavesAWordWithNoOccurrencesAlone(
 async def test_idfCountsDistinctPagesNotOccurrences(
     calculator: RankingCalculator, graph: GraphBuilder
 ) -> None:
-    # A word repeated on one page has tf > 1 but df == 1. Counting occurrences
-    # instead of pages would make a heavily-repeated word look common.
     for i in range(10):
         graph.page(f"p-{i}")
     graph.word("repeated", page_names=["p-0"], tf=50)
@@ -344,8 +264,6 @@ async def test_idfIsStableWhenRecomputed(
 
     assert first == second, (first, second)
 
-
-# ── update_pagerank ──────────────────────────────────────────────────────────
 
 async def test_update_pagerankReportsTheRowsItTouched(
     calculator: RankingCalculator, graph: GraphBuilder

@@ -5,9 +5,6 @@ import (
 	"sort"
 )
 
-// ordered is the constraint on T needed for GetAll to hand back a stable order.
-// It is narrower than `comparable`, so a Set over an unordered comparable (a
-// struct, say) would need this widened to cmp.Ordered.
 type ordered interface {
 	~int | ~int8 | ~int16 | ~int32 | ~int64 |
 		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr |
@@ -30,8 +27,6 @@ func NewSetFromSlice[T ordered](slice []T) *Set[T] {
 	return s
 }
 
-// Add inserts t and reports whether it was already present. The name suggests
-// the opposite, so it is spelled out here; no caller reads the result today.
 func (s *Set[T]) Add(t T) bool {
 	_, alreadyPresent := s.elements[t]
 	s.elements[t] = true
@@ -39,18 +34,11 @@ func (s *Set[T]) Add(t T) bool {
 }
 
 func (s *Set[T]) BatchAdd(t ...T) {
-	//
 	for _, v := range t {
 		s.elements[v] = true
 	}
 }
 
-// GetAll returns every element in ascending order.
-//
-// The order is part of the contract, not an accident. The spider drains this
-// list against a per-host page budget, so ranging over the map meant which
-// links got crawled before the budget ran out changed on every process start,
-// and re-running a crawl produced a different index.
 func (s *Set[T]) GetAll() []T {
 	t := make([]T, 0, len(s.elements))
 	for v := range s.elements {
@@ -76,7 +64,6 @@ func (s Set[T]) Len() int {
 	return len(s.elements)
 }
 
-// GetSize is Len under the name the rest of the utils in this package uses.
 func (s *Set[T]) GetSize() int {
 	return len(s.elements)
 }

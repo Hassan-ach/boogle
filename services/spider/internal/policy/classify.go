@@ -5,43 +5,20 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"net"
+	"net/url"
 	"strings"
 	"syscall"
 	"time"
 )
 
-// ErrRedirectLoop is returned by the transport when a redirect chain exceeds the
-// configured limit. It is declared here rather than in utils because it is a
-// policy signal: the transport detects it, but only the policy decides it is
-// fatal.
 var ErrRedirectLoop = errors.New("redirect limit exceeded")
 
-// classify turns an observed fetch into a decision. It is pure: no Redis, no
-// clock, no network. Everything that touches state happens in Classify, which
-// calls this first and only then acts on the answer.
-//
-// The order of the two failure paths matters and is not arbitrary:
-//
-//   - A status code, when present, is the server's final answer and outranks any
-//     transport error. A redirect chain that ends in a 404 is a 404, even though
-//     the client reported an error reaching it.
-//   - With no status at all, the error is the only evidence there is.
 func classify(out Outcome, attempts, maxRetry int, cfg *Config) *Action {
 	kind, reason := categorize(out, cfg)
 
-	// The attempt ceiling applies to retries only. A permanent outcome is
-	// permanent whatever the history: a 404 on the tenth try is exactly as
-	// final as a 404 on the first, and gating it behind the attempt count would
-	// re-fetch a page we have already proven is gone.
-	//
-	// maxRetry is the total number of attempts allowed, not the number of
-	// retries after the first. No clamp is needed for a bad value: attempts+1 is
-	// at least 1, so a maxRetry of 0 or -7 already reads as "at most one attempt"
-	// and this attempt was that one.
 	if kind == ActBackoff && attempts+1 >= maxRetry {
-		// This was the last attempt we were willing to make, and it failed.
-		// Parking it again would mean retrying forever, so retire it.
 		return &Action{Kind: ActPermanent, Reason: ReasonAttemptsExhausted}
 	}
 
@@ -52,12 +29,7 @@ func classify(out Outcome, attempts, maxRetry int, cfg *Config) *Action {
 	return act
 }
 
-// categorize maps one Outcome to a kind and a reason, with no side effects.
 func categorize(out Outcome, cfg *Config) (ActionKind, Reason) {
-	// A redirect loop is checked before the status because the transport may
-	// have stopped on a 302 that is itself a symptom of the loop. A bare
-	// Redirects count over the limit is kept as a backstop for transports that
-	// report the count but not a sentinel.
 	if errors.Is(out.Err, ErrRedirectLoop) {
 		return ActPermanent, ReasonRedirectLoop
 	}
@@ -73,24 +45,17 @@ func categorize(out Outcome, cfg *Config) (ActionKind, Reason) {
 		return categorizeError(out.Err)
 	}
 
-	// No status and no error means the transport told us nothing, which should
-	// be impossible. Backoff is the safe answer: the attempt ceiling above
-	// guarantees this terminates rather than spinning, so the worst case is a
-	// few wasted delays rather than a URL that is dropped or a crawl that hangs.
 	return ActBackoff, ReasonTimeout
 }
 
-// categorizeStatus maps an HTTP status to a decision.
+// categorizeStatus decides from the status code alone. A 2xx is only accepted
+// after the body-size and content-type gates pass, so those two checks belong
+// inside the success branch rather than before the switch.
 func categorizeStatus(out Outcome, cfg *Config) (ActionKind, Reason) {
 	code := out.StatusCode
 
 	switch {
 	case code >= 200 && code < 300:
-		// A body that hit the cap is a truncated page, and indexing half a page
-		// is worse than not indexing it: the text runs off mid-sentence and
-		// every term frequency downstream is wrong. The transport reads one
-		// byte past the cap specifically so "exactly at the cap" and "truncated
-		// at the cap" can be told apart.
 		if cfg.MaxBodyBytes > 0 && out.BytesRead > cfg.MaxBodyBytes {
 			return ActPermanent, ReasonBodyTooLarge
 		}
@@ -100,14 +65,9 @@ func categorizeStatus(out Outcome, cfg *Config) (ActionKind, Reason) {
 		return ActSuccess, ReasonFetchOK
 
 	case code == 304:
-		// Not modified. We do not send conditional requests, so this is odd,
-		// but it is a statement that the content is fine rather than a failure.
 		return ActSuccess, ReasonFetchOK
 
 	case code >= 300 && code < 400:
-		// The transport follows redirects, so a 3xx surfacing here means the
-		// chain stopped at this response. Retrying walks the same chain and
-		// lands in the same place.
 		return ActPermanent, ReasonRedirectLoop
 
 	case code == 400 || code == 405 || code == 451:
@@ -117,9 +77,6 @@ func categorizeStatus(out Outcome, cfg *Config) (ActionKind, Reason) {
 		return ActPermanent, ReasonUnauthorized
 
 	case code == 403:
-		// Permanent for this URL: the same credentials will not appear on the
-		// retry. Note that a host answering 403 to a robots.txt fetch is a
-		// different matter and is handled by EnsureHost, not here.
 		return ActPermanent, ReasonForbidden
 
 	case code == 404:
@@ -129,37 +86,25 @@ func categorizeStatus(out Outcome, cfg *Config) (ActionKind, Reason) {
 		return ActPermanent, ReasonGone
 
 	case code == 429:
-		// The server is explicitly asking us to slow down. This is the one 4xx
-		// that is genuinely transient, and treating it as permanent would
-		// abandon a page that exists.
 		return ActBackoff, ReasonRateLimited
 
 	case code >= 500 && code < 600:
 		return ActBackoff, ReasonServerError
 
 	case code >= 400 && code < 500:
-		// An unlisted 4xx is still a client error. Repeating the request
-		// cannot change the answer, and repeating a 4xx is what gets a crawler
-		// blocked.
 		return ActPermanent, ReasonBadRequest
 
 	default:
-		// 1xx, or a code outside every range. We have no idea what this means,
-		// so try again later rather than discarding the URL.
 		return ActBackoff, ReasonServerError
 	}
 }
 
-// categorizeError maps a transport error to a decision.
-//
-// The single most important distinction in this function: timeout and
-// connection-refused both mean "no response", but a timeout means *slow* and a
-// refused connection means *gone*. Marking a slow host dead would exclude a
-// perfectly good site for an hour because it once took 30 seconds to answer.
+// categorizeError maps a transport failure to a retry decision. Each TLS error
+// type is matched twice, in value and pointer form, because net/http and crypto
+// tls return whichever one the failing layer produced and errors.As needs both
+// target types to see them. The final fallback is ActBackoff, so an
+// unrecognised error never permanently retires a URL.
 func categorizeError(err error) (ActionKind, Reason) {
-	// Timeouts first, and before DNS. A DNS lookup that times out also reports
-	// itself as a *net.DNSError, so testing DNS first would classify every slow
-	// resolver as a dead host.
 	if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
 		return ActBackoff, ReasonTimeout
 	}
@@ -169,10 +114,6 @@ func categorizeError(err error) (ActionKind, Reason) {
 		return ActBackoff, ReasonDNSFailure
 	}
 
-	// Certificate problems mean the host is there but not offering what we asked
-	// for. Worth a bounded number of retries in case it is a misconfigured edge
-	// node, not worth retrying to the point of the attempt ceiling being the
-	// only thing that stops us.
 	var unknownAuthority x509.UnknownAuthorityError
 	if errors.As(err, &unknownAuthority) {
 		return ActBackoff, ReasonTLSError
@@ -210,9 +151,6 @@ func categorizeError(err error) (ActionKind, Reason) {
 		return ActBackoff, ReasonTLSError
 	}
 
-	// Reached the host, or could not. Both mean the host is not serving, so
-	// both are grounds for a dead marker. These arrive wrapped in *net.OpError
-	// from the dialer, which errors.Is unwraps.
 	if errors.Is(err, syscall.ECONNREFUSED) ||
 		errors.Is(err, syscall.ECONNRESET) ||
 		errors.Is(err, syscall.EHOSTUNREACH) ||
@@ -221,31 +159,18 @@ func categorizeError(err error) (ActionKind, Reason) {
 		return ActBackoff, ReasonConnectionRefused
 	}
 
-	// Anything else is unrecognised. Back off rather than give up: an
-	// unrecognised error is more often a transient library-level problem than a
-	// definitive answer, and the attempt ceiling bounds the cost of being wrong.
 	return ActBackoff, ReasonServerError
 }
 
-// isTimeout reports whether err is a network timeout, at any depth of wrapping.
 func isTimeout(err error) bool {
 	var netErr net.Error
 	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
-// acceptableContentType reports whether a body is worth indexing.
-//
-// An empty content type is accepted. Plenty of real servers omit it, and
-// rejecting on absence would drop pages that are perfectly crawlable; the body
-// is parsed as HTML and simply yields no links if it is not. What matters is
-// refusing a body that positively identifies itself as something else -- a PDF
-// served with a 200, which is how a crawler ends up with a PDF's raw bytes in
-// the index.
 func acceptableContentType(ct string) bool {
 	if ct == "" {
 		return true
 	}
-	// The header may carry parameters: "text/html; charset=utf-8".
 	if i := strings.IndexByte(ct, ';'); i >= 0 {
 		ct = ct[:i]
 	}
@@ -256,14 +181,6 @@ func acceptableContentType(ct string) bool {
 	return false
 }
 
-// retryAfterFor picks the schedule that matches the failure.
-//
-// Three schedules exist because the failures have different shapes. A dead host
-// is not the failure of one URL, so its retry time has to outlast the host's own
-// dead marker -- otherwise the URL returns while the host is still dead, gets
-// skipped as terminal, and the domain is never probed again. That is the one
-// case where getting the number wrong loses the domain entirely, so it takes the
-// maximum of the two.
 func retryAfterFor(reason Reason, attempts int, cfg *Config) (d time.Duration) {
 	switch reason {
 	case ReasonDNSFailure, ReasonConnectionRefused, ReasonTLSError:
@@ -279,4 +196,169 @@ func retryAfterFor(reason Reason, attempts int, cfg *Config) (d time.Duration) {
 	default:
 		return cfg.URLBackoff(attempts)
 	}
+}
+
+var (
+	errEmptyURL        = errors.New("empty url")
+	errNoDiscardReason = errors.New("a discarded page must say why")
+)
+
+func (m *PolicyManager) Classify(ctx context.Context, rawURL string, out Outcome) (*Action, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil, errEmptyURL
+	}
+	host := hostOfURL(rawURL)
+
+	urlState, err := m.state.URLState(ctx, rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("read the retry record for %s: %w", rawURL, err)
+	}
+
+	act := classify(out, urlState.Attempts, m.cfg.URLMaxAttempts, &m.cfg)
+
+	m.countReason(ctx, host, act.Reason)
+
+	switch act.Kind {
+	case ActSuccess:
+		if err := m.recordSuccess(ctx, host, rawURL); err != nil {
+			return nil, err
+		}
+	case ActBackoff:
+		if err := m.recordBackoff(ctx, host, rawURL, act); err != nil {
+			return nil, err
+		}
+	case ActPermanent:
+		if err := m.recordPermanent(ctx, host, rawURL); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("classify returned an unknown action %v for %s", act.Kind, rawURL)
+	}
+	return act, nil
+}
+
+func (m *PolicyManager) recordSuccess(ctx context.Context, host, url string) error {
+	if host != "" {
+		if err := m.state.RecordSuccess(ctx, host, m.now()); err != nil {
+			return fmt.Errorf("record a successful page on %s: %w", host, err)
+		}
+	}
+	if err := m.state.ClearURLState(ctx, url); err != nil {
+		return fmt.Errorf("clear the retry record for %s: %w", url, err)
+	}
+	return nil
+}
+
+func (m *PolicyManager) recordBackoff(ctx context.Context, host, url string, act *Action) error {
+	if _, err := m.state.BumpAttempts(ctx, url); err != nil {
+		return fmt.Errorf("count a failed attempt at %s: %w", url, err)
+	}
+
+	if host != "" {
+		failures, err := m.state.RecordFailure(ctx, host)
+		if err != nil {
+			return fmt.Errorf("record a failure on %s: %w", host, err)
+		}
+		if failures < 1 {
+			failures = 1
+		}
+		if err := m.markAfterFailure(ctx, host, act.Reason, failures); err != nil {
+			return err
+		}
+	}
+
+	due := m.now().Add(act.RetryAfter)
+	if err := m.Park(ctx, url, due); err != nil {
+		return fmt.Errorf("park %s until %s: %w", url, due.UTC().Format("2006-01-02T15:04:05Z07:00"), err)
+	}
+	return nil
+}
+
+func (m *PolicyManager) markAfterFailure(ctx context.Context, host string, reason Reason, failures int) error {
+	var (
+		marker MarkerKind
+		ttl    time.Duration
+	)
+	switch reason {
+	case ReasonDNSFailure, ReasonConnectionRefused, ReasonTLSError:
+		marker = MarkerDead
+		ttl = m.cfg.DeadHostTTL(failures)
+	case ReasonTimeout, ReasonRateLimited, ReasonServerError:
+		st, err := m.state.HostState(ctx, host)
+		if err != nil {
+			return fmt.Errorf("read host state to cool %s down: %w", host, err)
+		}
+		marker = MarkerCooldown
+		ttl = m.cfg.HostCooldown(failures, st.CrawlDelay)
+	default:
+		return nil
+	}
+
+	if err := m.state.SetMarker(ctx, host, marker, ttl); err != nil {
+		return fmt.Errorf("mark %s %s: %w", host, marker, err)
+	}
+	m.log.Info("host marked after a failed fetch",
+		"host", host, "marker", marker, "ttl", ttl, "reason", reason, "failures", failures)
+	return nil
+}
+
+func (m *PolicyManager) recordPermanent(ctx context.Context, host, url string) error {
+	if err := m.state.MarkVisited(ctx, url); err != nil {
+		return fmt.Errorf("retire %s: %w", url, err)
+	}
+	if err := m.state.ClearURLState(ctx, url); err != nil {
+		return fmt.Errorf("clear the retry record for %s: %w", url, err)
+	}
+	return nil
+}
+
+func (m *PolicyManager) Discard(ctx context.Context, url string, reason Reason) error {
+	host := hostOfURL(url)
+	if reason == "" {
+		return errNoDiscardReason
+	}
+	m.countReason(ctx, host, reason)
+	if err := m.state.MarkVisited(ctx, url); err != nil {
+		return fmt.Errorf("discard %s: %w", url, err)
+	}
+	m.log.Info("page discarded after a successful fetch",
+		"url", url, "host", host, "reason", reason)
+	return nil
+}
+
+func (m *PolicyManager) countReason(ctx context.Context, host string, reason Reason) {
+	if host == "" || reason == "" {
+		return
+	}
+	if err := m.state.CountReason(ctx, host, reason); err != nil {
+		m.log.Warn("could not record a refusal reason",
+			"host", host, "reason", reason, "error", err)
+	}
+}
+
+func hostOfURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	return hostKey(u)
+}
+
+// hostKey is the identity used for every per-host decision and every host key.
+// It lowercases the host and drops a default port for the scheme, so https://x:443
+// and https://x share one budget instead of being treated as two hosts.
+func hostKey(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	host := strings.ToLower(u.Host)
+	port := u.Port()
+	if port == "" {
+		return host
+	}
+	if (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
+		return strings.TrimSuffix(host, ":"+port)
+	}
+	return host
 }

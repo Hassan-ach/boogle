@@ -1,16 +1,5 @@
 //go:build integration
 
-// Integration tests for the engine's PostgreSQL store.
-//
-// These need a live database and are excluded from the default `go test` run by
-// the `integration` build tag. `just test-integration` runs them after creating
-// and migrating an isolated `boogle_test` database; point them somewhere else
-// with TEST_DATABASE_URL.
-//
-// What they cover that nothing else does: that the query in store.go is valid
-// SQL, that its column list matches migration/01_schema.sql, and that the JSON
-// columns it aggregates actually decode. A store that compiles, passes a review,
-// and throws a syntax error at the first search is not a store that works.
 package store
 
 import (
@@ -31,8 +20,6 @@ import (
 	_ "github.com/lib/pq"
 )
 
-// dsn is the connection string, preferring TEST_DATABASE_URL and falling back to
-// the host's default so a developer can just run the tests.
 func dsn() string {
 	if v := os.Getenv("TEST_DATABASE_URL"); v != "" {
 		return v
@@ -40,11 +27,6 @@ func dsn() string {
 	return "postgres://admin:1234@localhost:5432/boogle_test?sslmode=disable"
 }
 
-// connect opens a raw handle, skipping the test when there is nothing to talk to.
-//
-// This deliberately does not go through NewStore: that panics on a failed Open
-// and calls log.Fatalln on a failed Ping, so an absent database would take the
-// whole test binary down instead of skipping one test.
 func connect(t *testing.T) *sql.DB {
 	t.Helper()
 	conn, err := sql.Open("postgres", dsn())
@@ -59,8 +41,6 @@ func connect(t *testing.T) *sql.DB {
 	return conn
 }
 
-// storeConfig builds a StoreConfig pointing at the same database, since
-// NewStore assembles its own DSN from discrete fields rather than a URL.
 func storeConfig(t *testing.T) store.StoreConfig {
 	t.Helper()
 	u, err := url.Parse(dsn())
@@ -94,17 +74,15 @@ func storeConfig(t *testing.T) store.StoreConfig {
 
 func newStore(t *testing.T) PsqlStore {
 	t.Helper()
-	connect(t) // skip early, before NewStore can log.Fatal on us
+	connect(t)
 	return NewStore(storeConfig(t))
 }
 
-// page is a seeded page, kept so the test can clean it up.
 type page struct {
 	urlID  string
 	pageID string
 }
 
-// seed creates an indexed page with a rank and returns handles to both.
 func seed(t *testing.T, conn *sql.DB, name string, rank float64) page {
 	t.Helper()
 	u := fmt.Sprintf("https://%s-%s.test/", name, strings.ReplaceAll(t.Name(), "/", "-"))
@@ -115,8 +93,6 @@ func seed(t *testing.T, conn *sql.DB, name string, rank float64) page {
 		t.Fatalf("insert url: %v", err)
 	}
 
-	// The metadata column is what GetData unmarshals into model.MetaData, so seed
-	// it with a realistic shape rather than the default '{}'.
 	meta, err := json.Marshal(map[string]any{
 		"url":         u,
 		"title":       "seeded " + name,
@@ -149,7 +125,6 @@ func seed(t *testing.T, conn *sql.DB, name string, rank float64) page {
 	return page{urlID: urlID, pageID: pageID}
 }
 
-// indexWords gives the page a set of words with known frequencies.
 func indexWords(t *testing.T, conn *sql.DB, p page, tf map[string]int) {
 	t.Helper()
 	for word, count := range tf {
@@ -169,8 +144,6 @@ func indexWords(t *testing.T, conn *sql.DB, p page, tf map[string]int) {
 		}
 	}
 }
-
-// ── GetData ─────────────────────────────────────────────────────────────────
 
 func TestGetDataReturnsTheMatchingPageWithItsWords(t *testing.T) {
 	conn := connect(t)
@@ -217,9 +190,6 @@ func TestGetDataReturnsTheMatchingPageWithItsWords(t *testing.T) {
 	}
 }
 
-// A page that matches none of the query words must not come back. The query
-// joins on `w.word = ANY($1)`, so a missing WHERE or a bad join would surface
-// here as the entire index being returned for any search.
 func TestGetDataExcludesPagesThatMatchNoQueryWord(t *testing.T) {
 	conn := connect(t)
 	s := newStore(t)
@@ -244,9 +214,6 @@ func TestGetDataExcludesPagesThatMatchNoQueryWord(t *testing.T) {
 	}
 }
 
-// Ordering is the whole ranking contract: more distinct query words first, then
-// PageRank. If the tie-breaks regressed, a page that mentions every term would
-// rank below one that mentions one of them.
 func TestGetDataOrdersByWordCountThenByPageRank(t *testing.T) {
 	conn := connect(t)
 	s := newStore(t)
@@ -289,9 +256,6 @@ func TestGetDataOrdersByWordCountThenByPageRank(t *testing.T) {
 	}
 }
 
-// The Idf map is the other half of the Data the ranker consumes, and a word with
-// no stored idf (a word the indexer never got to) still has to appear, with
-// whatever the column holds.
 func TestGetDataCollectsTheIdfOfEveryWordItReturns(t *testing.T) {
 	conn := connect(t)
 	s := newStore(t)
@@ -318,8 +282,6 @@ func TestGetDataCollectsTheIdfOfEveryWordItReturns(t *testing.T) {
 	}
 }
 
-// An empty query must not return the whole index. `w.word = ANY('{}')` matches
-// nothing, and the intent is a search with no terms, not a full table scan.
 func TestGetDataWithNoWordsReturnsNothing(t *testing.T) {
 	conn := connect(t)
 	s := newStore(t)
@@ -334,8 +296,6 @@ func TestGetDataWithNoWordsReturnsNothing(t *testing.T) {
 	}
 }
 
-// Paging is `OFFSET pageNum * PageSize`, so page 0 is the first page. An
-// off-by-one would silently return the second page to every first-page request.
 func TestGetDataPagesThroughTheResultSet(t *testing.T) {
 	conn := connect(t)
 
@@ -374,8 +334,6 @@ func TestGetDataPagesThroughTheResultSet(t *testing.T) {
 		t.Error("paging through the result set returned nothing at all")
 	}
 }
-
-// ── GetTotalPages ───────────────────────────────────────────────────────────
 
 func TestGetTotalPagesCountsEveryMatchNotJustOnePage(t *testing.T) {
 	conn := connect(t)
@@ -417,22 +375,10 @@ func TestGetTotalPagesWithNoWordsIsZero(t *testing.T) {
 	}
 }
 
-// A store failure must arrive as an *apperror.AppError carrying a generic
-// user-facing message, with the real cause reachable only through Unwrap.
-//
-// This is the boundary that keeps internals off the wire. `AppError.Error()`
-// renders `Message` and not `Err`, so a handler that writes err.Error() into a
-// response sends the user "internal server error" and nothing else. A store that
-// returned the raw driver error instead would put the host, the port and the
-// failure text of the live database in the browser -- which is exactly what the
-// search handler used to do.
 func TestGetDataReportsQueryFailuresAsAnAppError(t *testing.T) {
 	connect(t)
 	s := newStore(t)
 
-	// Closing the pool makes every subsequent query fail, which is the closest
-	// thing to a database going away mid-request. The store's own pool has to be
-	// closed, not the one `connect` opened for seeding.
 	if err := s.conn.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -450,12 +396,10 @@ func TestGetDataReportsQueryFailuresAsAnAppError(t *testing.T) {
 		t.Errorf("Code = %d, want %d", appErr.Code, http.StatusInternalServerError)
 	}
 
-	// What a handler writes into the response body.
 	if got := err.Error(); got != "internal server error" {
 		t.Errorf("rendered error = %q, want the generic message", got)
 	}
 
-	// The cause has to survive for the logs, or the 500 is unexplainable.
 	if appErr.Err == nil {
 		t.Fatal("AppError.Err is nil; the cause is lost and the 500 is unexplainable")
 	}
@@ -467,8 +411,6 @@ func TestGetDataReportsQueryFailuresAsAnAppError(t *testing.T) {
 	}
 }
 
-// The same contract for the count query, which takes a different code path and
-// therefore needs its own coverage.
 func TestGetTotalPagesReportsQueryFailuresAsAnAppError(t *testing.T) {
 	connect(t)
 	s := newStore(t)

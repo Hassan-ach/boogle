@@ -27,9 +27,6 @@ func TestNormalizeUrl(t *testing.T) {
 			expectedOK:  true,
 		},
 		{
-			// A crawl-worthiness question, so no longer asked here. policy.Admit
-			// refuses this path and counts the refusal; canonicalisation's only
-			// remaining say is what the URL is.
 			name:        "keeps a path the rules would refuse",
 			rawURL:      "http://example.com/login",
 			baseHost:    "example.com",

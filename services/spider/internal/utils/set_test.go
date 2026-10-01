@@ -5,13 +5,6 @@ import (
 	"testing"
 )
 
-// TestGetAllIsDeterministic is the regression test for the crawler's frontier
-// order.
-//
-// GetAll ranged over a map, so its order was Go's randomised iteration order.
-// That mattered because the spider drains the returned link list against a
-// per-host page budget: which links got crawled before the budget ran out
-// changed on every run, and re-running a crawl produced a different index.
 func TestGetAllIsDeterministic(t *testing.T) {
 	build := func() *Set[string] {
 		s := NewSet[string]()
@@ -38,7 +31,6 @@ func TestGetAllIsDeterministic(t *testing.T) {
 				t.Fatalf("run %d: element set changed: %v vs %v", i, gotSorted, want)
 			}
 		}
-		// Order, not just membership, must be stable.
 		for j := range first {
 			if got[j] != first[j] {
 				t.Fatalf("run %d: position %d = %q, want %q\n got %v\nwant %v",
@@ -72,8 +64,6 @@ func TestGetAllOnAnEmptySet(t *testing.T) {
 }
 
 func TestGetAllDoesNotAliasInternalState(t *testing.T) {
-	// A caller that sorts or truncates the returned slice must not corrupt the
-	// set it came from.
 	s := NewSet[string]()
 	s.BatchAdd("a", "b", "c")
 
@@ -91,10 +81,6 @@ func TestGetAllDoesNotAliasInternalState(t *testing.T) {
 	}
 }
 
-// TestAddReportsWhetherTheValueWasAlreadyPresent pins the existing contract:
-// Add returns true when the element was already in the set, which is the
-// opposite of what the method name suggests. It used to return true on insert
-// and true on duplicate, so the return value carried no information at all.
 func TestAddReportsWhetherTheValueWasAlreadyPresent(t *testing.T) {
 	s := NewSet[string]()
 

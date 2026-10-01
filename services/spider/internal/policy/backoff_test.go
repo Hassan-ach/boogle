@@ -6,24 +6,17 @@ import (
 	"time"
 )
 
-// The three schedules are asserted value by value rather than just for
-// monotonicity. A backoff that doubles from the wrong base is still monotonic,
-// still backs off, and still passes a "did it grow" test while being wrong by
-// three orders of magnitude.
-
 func TestDeadHostTTL(t *testing.T) {
 	c := DefaultBackoffConfig()
 
 	want := map[int]time.Duration{
-		0: 60 * time.Second,
-		1: 120 * time.Second,
-		2: 240 * time.Second,
-		3: 480 * time.Second,
-		4: 960 * time.Second,
-		5: 1920 * time.Second,
-		6: 3840 * time.Second,
-		// Capped at exponent 6. A long outage must not push a host out for
-		// weeks, at which point nobody remembers it was ever crawled.
+		0:  60 * time.Second,
+		1:  120 * time.Second,
+		2:  240 * time.Second,
+		3:  480 * time.Second,
+		4:  960 * time.Second,
+		5:  1920 * time.Second,
+		6:  3840 * time.Second,
 		7:  3840 * time.Second,
 		20: 3840 * time.Second,
 	}
@@ -33,8 +26,6 @@ func TestDeadHostTTL(t *testing.T) {
 		}
 	}
 
-	// A negative counter is reachable from a corrupt Redis value and must
-	// behave like zero, not produce a negative TTL.
 	if got := c.DeadHostTTL(-5); got != 60*time.Second {
 		t.Errorf("DeadHostTTL(-5) = %v, want %v", got, 60*time.Second)
 	}
@@ -55,22 +46,13 @@ func TestHostCooldown(t *testing.T) {
 		{"fourth failure doubles again", 3, 0, 80 * time.Second},
 		{"fifth is capped at exponent 3", 4, 0, 80 * time.Second},
 
-		// robots.txt asking for a longer pause raises the floor. A server that
-		// says "wait 5s between requests" must not have that shortened to 2s by
-		// a failure on the very first try -- that is the request that earns the
-		// ban.
 		{"crawl-delay raises the floor", 0, 30 * time.Second, 30 * time.Second},
 		{"crawl-delay raises the floor and still doubles", 1, 30 * time.Second, 60 * time.Second},
 		{"a long crawl-delay still doubles from itself", 2, 30 * time.Second, 120 * time.Second},
 
-		// Once the exponential term is past the floor, a large crawl-delay must
-		// not inflate it further. A 30s crawl-delay should not become a 7-hour
-		// cooldown.
 		{"a large crawl-delay does not outrun the backoff", 3, 30 * time.Second, 240 * time.Second},
 		{"a short crawl-delay does not lower the backoff", 3, time.Second, 80 * time.Second},
 
-		// The configured base is a floor too, not a starting point that a
-		// smaller crawl-delay can undercut. Both are minimums; the larger wins.
 		{"a crawl-delay below the base does not lower it", 0, 5 * time.Second, 10 * time.Second},
 		{"a crawl-delay of zero does not lower it", 0, 0, 10 * time.Second},
 		{"a negative crawl-delay does not lower it", 0, -time.Hour, 10 * time.Second},
@@ -89,13 +71,11 @@ func TestURLBackoff(t *testing.T) {
 	c := DefaultBackoffConfig()
 
 	want := map[int]time.Duration{
-		0: 30 * time.Second,
-		1: 60 * time.Second,
-		2: 120 * time.Second,
-		3: 240 * time.Second,
-		4: 480 * time.Second,
-		// 960s is past the 900s clamp. One page must not drift out to an hour
-		// and be assumed abandoned by an operator rather than by the policy.
+		0:  30 * time.Second,
+		1:  60 * time.Second,
+		2:  120 * time.Second,
+		3:  240 * time.Second,
+		4:  480 * time.Second,
 		5:  900 * time.Second,
 		50: 900 * time.Second,
 	}
@@ -110,23 +90,12 @@ func TestURLBackoff(t *testing.T) {
 	}
 }
 
-// TestSchedulesAreMonotonic guards the property the schedules exist for: more
-// consecutive failures never means a shorter wait.
-//
-// Non-decreasing overall, because all three schedules clamp and a clamp is a
-// plateau, not a regression. Strictly increasing up to each clamp, because a
-// schedule that stopped growing early would be hitting a constant rate against a
-// host that is failing us.
 func TestSchedulesAreMonotonic(t *testing.T) {
 	c := DefaultBackoffConfig()
 
 	type schedule struct {
-		name string
-		at   func(int) time.Duration
-		// growBelow is the attempt past which the schedule has clamped and is
-		// flat. Each derives from that schedule's own clamp, which differ:
-		// URLBackoff clamps on a duration (900s, reached at attempt 5), while
-		// the other two clamp on an exponent.
+		name      string
+		at        func(int) time.Duration
 		growBelow int
 	}
 	schedules := []schedule{
@@ -152,9 +121,6 @@ func TestSchedulesAreMonotonic(t *testing.T) {
 	}
 }
 
-// TestSchedulesAreTotal checks the arithmetic cannot produce a non-positive
-// duration from any input, because a non-positive due time is immediately due
-// forever and a negative one is a hot loop wearing a backoff's clothes.
 func TestSchedulesAreTotal(t *testing.T) {
 	bases := []time.Duration{0, -time.Second, time.Nanosecond, time.Second, time.Hour, math.MaxInt64 / 4}
 	attempts := []int{-100, -1, 0, 1, 30, 61, 62, 63, 64, 1000}
@@ -170,10 +136,6 @@ func TestSchedulesAreTotal(t *testing.T) {
 	}
 }
 
-// TestScaleDoesNotOverflow is why scale shifts an integer instead of calling
-// math.Pow. base is nanoseconds, so a float multiply that exceeds ~2^62 loses
-// precision in a way that would surface as a nonsense TTL weeks into a long
-// crawl rather than immediately.
 func TestScaleDoesNotOverflow(t *testing.T) {
 	huge := time.Duration(math.MaxInt64 / 2)
 
@@ -184,17 +146,12 @@ func TestScaleDoesNotOverflow(t *testing.T) {
 		}
 	}
 
-	// A zero base would make every backoff zero, turning the whole mechanism
-	// into a busy loop, so it falls back to a second.
 	if got := scale(0, 0, 6); got != time.Second {
 		t.Errorf("scale(0, 0, 6) = %v, want %v", got, time.Second)
 	}
 }
 
 func TestDefaultConfigIsUsable(t *testing.T) {
-	// Every field has a value so a Config built with no environment set behaves
-	// correctly. A zero here means a silent zero somewhere hot, and the plan
-	// defaults are the only numbers anyone has agreed to.
 	c := DefaultConfig()
 
 	if c.MaxPagesPerHost != 5000 {
@@ -223,9 +180,6 @@ func TestDefaultConfigIsUsable(t *testing.T) {
 	}
 }
 
-// TestDeadProbeFloorExceedsDeadBase documents the relationship the two settings
-// depend on: a URL parked for less than the dead marker would come back to a
-// host that is still dead.
 func TestDeadProbeFloorExceedsDeadBase(t *testing.T) {
 	c := DefaultBackoffConfig()
 

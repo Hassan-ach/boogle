@@ -36,9 +36,6 @@ func (p *Parser) ParseHTML(r io.Reader, baseURL string) (*entity.Page, error) {
 	u, _ := url.Parse(baseURL)
 
 	c := newHtmlCollector(u)
-	// Report the declared language; do not act on it. Whether a non-English
-	// page is worth indexing is a policy decision (policy.IsEnglish), and
-	// making it here meant a refusal looked like a fetch failure in the logs.
 	c.Meta.Lang = documentLanguage(doc)
 	traverse(doc, c.Visit)
 

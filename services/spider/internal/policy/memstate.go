@@ -7,22 +7,9 @@ import (
 	"time"
 )
 
-// MemoryState is an in-memory State for tests.
-//
-// It exists because the policy rules are the interesting part of this package
-// and they cannot be tested against a real Redis without one running. It is
-// deliberately hand-written rather than pulled from a module: the repository
-// carries no test dependencies, and adding one to fake a map with a TTL is a poor
-// trade.
-//
-// Nothing in production constructs this. The spider wires RedisState; a
-// MemoryState reaching a binary is a wiring mistake.
-//
-// It is a faithful fake, not a convenient one. TTLs are honoured against an
-// injectable clock rather than assumed away, SetMarker does not extend an
-// existing marker, and FrontierLen counts what is really enqueued. A fake that
-// lied about any of those would let the exact bugs this package exists to fix
-// pass their tests.
+// MemoryState is the in-process State implementation, used by tests and by
+// single-node runs. mu is not a RWMutex because expired() mutates the marker
+// maps it inspects, so even reads need the write lock.
 type MemoryState struct {
 	mu sync.Mutex
 
@@ -36,27 +23,21 @@ type MemoryState struct {
 	markers  map[string]map[MarkerKind]time.Time
 	stats    map[string]map[Reason]int
 
-	// FailWith, when set, makes every method return it. This is how the
-	// fail-closed contract gets tested: a caller that treats an unreachable
-	// state as "no state, carry on" has to fail.
+	// FailWith and FailOn are fault-injection hooks: FailWith fails every
+	// operation, FailOn fails the named ones. beginOp consults them so a test
+	// can exercise error paths without a broken Redis. Production leaves both
+	// nil/empty.
 	FailWith error
 
-	// FailOn fails a single named operation, keyed by the method name. FailWith
-	// cannot express "the marker read works but the host-state read does not",
-	// and that distinction is what proves the gate reads markers first.
 	FailOn map[string]error
 
 	closed bool
 }
 
-// NewMemoryState returns an empty MemoryState reading time from now.
 func NewMemoryState() *MemoryState {
 	return NewMemoryStateAt(time.Now)
 }
 
-// NewMemoryStateAt returns a MemoryState whose notion of time is whatever now
-// returns. Tests that exercise a TTL, a cooldown or a cold window drive this
-// clock directly instead of sleeping.
 func NewMemoryStateAt(now func() time.Time) *MemoryState {
 	if now == nil {
 		now = time.Now
@@ -74,19 +55,13 @@ func NewMemoryStateAt(now func() time.Time) *MemoryState {
 	}
 }
 
-// Advance moves the clock forward. Expiry is evaluated lazily on read, so
-// nothing needs to sweep.
 func (m *MemoryState) Advance(d time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// The new clock reads the previous one once, then returns a fixed instant.
-	// Capturing m.now directly would deadlock: the closure would take the lock
-	// that is already held, and sync.Mutex is not reentrant.
 	next := m.now().Add(d)
 	m.now = func() time.Time { return next }
 }
 
-// SetClock replaces the clock outright.
 func (m *MemoryState) SetClock(now func() time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -103,7 +78,9 @@ func (m *MemoryState) begin() error {
 	return m.beginOp("")
 }
 
-// beginOp is begin with the operation name, for FailOn.
+// beginOp is the single gate every operation passes through. It must be called
+// while holding mu, because it reads FailWith, FailOn and closed. begin() is
+// the same gate for operations that need no named fault.
 func (m *MemoryState) beginOp(op string) error {
 	if m.FailWith != nil {
 		return m.FailWith
@@ -117,7 +94,9 @@ func (m *MemoryState) beginOp(op string) error {
 	return nil
 }
 
-// expired reports whether a marker's deadline has passed, deleting it if so.
+// expired reports whether a marker has lapsed, deleting it as a side effect so
+// the map cannot grow without bound. Callers hold mu; a true return means the
+// marker is gone, not merely due for deletion.
 func (m *MemoryState) expired(host string, kind MarkerKind) bool {
 	set, ok := m.markers[host]
 	if !ok {
@@ -202,23 +181,12 @@ func (m *MemoryState) EnqueueDelayed(ctx context.Context, url string, due time.T
 func (m *MemoryState) FrontierLen(ctx context.Context) (int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Named, so a test can fail this read alone. That distinction matters for
-	// the store's seeding decision, which has to tell "the frontier is empty"
-	// from "I could not read the frontier" -- and a fake that can only fail
-	// everything at once cannot express a caller that has to make that choice.
 	if err := m.beginOp("FrontierLen"); err != nil {
 		return 0, err
 	}
 	return int64(len(m.frontier)), nil
 }
 
-// PopFrontier mirrors the Lua script's semantics exactly, including the
-// found/exhausted distinction.
-//
-// The sort is by score descending with member order broken alphabetically, which
-// is how Redis orders a ZSET on equal scores. Matching that matters because the
-// script and this fake are expected to hand a test the same URL, and a fake that
-// ordered differently would hide a scoring bug rather than reproduce it.
 func (m *MemoryState) PopFrontier(ctx context.Context, budget int) (PopResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -251,8 +219,6 @@ func (m *MemoryState) PopFrontier(ctx context.Context, budget int) (PopResult, e
 		}, nil
 	}
 
-	// Budget spent on visited entries only. Anything left in the frontier is
-	// still there, so this is deliberately not exhausted.
 	return PopResult{VisitedSkipped: skipped}, nil
 }
 
@@ -266,10 +232,6 @@ func (m *MemoryState) PromoteDelayed(ctx context.Context, now time.Time, batch i
 		batch = defaultPromoteBatch
 	}
 
-	// Only entries actually due, and only as many as the batch allows. Sorting
-	// first makes the truncation deterministic; the Lua version's ZRANGEBYSCORE
-	// LIMIT breaks ties by member, which this matches by taking the lowest member
-	// among equal due times.
 	due := make([]string, 0, len(m.delayed))
 	for url, at := range m.delayed {
 		if !at.After(now) {
@@ -282,8 +244,6 @@ func (m *MemoryState) PromoteDelayed(ctx context.Context, now time.Time, batch i
 	}
 
 	for _, url := range due {
-		// ZADD NX: a URL discovered again while parked keeps the score it
-		// earned from its inlinks rather than being reset to zero.
 		if _, exists := m.frontier[url]; !exists {
 			m.frontier[url] = 0
 		}
@@ -343,19 +303,6 @@ func (m *MemoryState) HostState(ctx context.Context, host string) (HostState, er
 	return HostState{Name: host}, nil
 }
 
-// SaveHostState stores the record, counters included.
-//
-// The fake keeps the whole struct where RedisState writes only the fields a
-// robots resolution owns. That asymmetry is the fake's one simplification, and
-// it is worth stating rather than hiding: it lets a test assert a record after a
-// merge without a Redis.
-//
-// The one field the fake does not take from its argument is the sitemap claim,
-// because taking it there would make the fake clobber something RedisState
-// deliberately leaves alone -- and a fake that clobbers more than the real thing
-// is worse than one that clobbers less, because the divergence is invisible until
-// a test written against the fake passes and the real one fails. Preserving it here
-// is what lets the concurrency test below mean what it says.
 func (m *MemoryState) SaveHostState(ctx context.Context, host string, st HostState) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -371,7 +318,6 @@ func (m *MemoryState) SaveHostState(ctx context.Context, host string, st HostSta
 	return nil
 }
 
-// RecordSuccess counts a page, clears the failure count and stamps the host.
 func (m *MemoryState) RecordSuccess(ctx context.Context, host string, at time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -391,7 +337,6 @@ func (m *MemoryState) RecordSuccess(ctx context.Context, host string, at time.Ti
 	return nil
 }
 
-// RecordFailure counts a failure and marks the host degraded.
 func (m *MemoryState) RecordFailure(ctx context.Context, host string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -409,12 +354,6 @@ func (m *MemoryState) RecordFailure(ctx context.Context, host string) (int, erro
 	return st.ConsecFailures, nil
 }
 
-// ClaimSiteMaps hands the claim to exactly one caller.
-//
-// The whole comparison happens under the lock, which is the property HSETNX gives
-// Redis and the reason the claim is a timestamp rather than a flag: a read, a
-// comparison and a write have to be one indivisible step, or two workers resolving
-// the same new host both see an unclaimed site and both queue it.
 func (m *MemoryState) ClaimSiteMaps(ctx context.Context, host string, at time.Time) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -484,8 +423,6 @@ func (m *MemoryState) SetMarker(ctx context.Context, host string, kind MarkerKin
 	if ttl <= 0 {
 		return m.clearMarkerLocked(host, kind)
 	}
-	// NX semantics: an existing marker keeps its deadline. Twenty workers
-	// marking one host dead must not push the deadline out to whoever ran last.
 	if m.expired(host, kind) {
 		if m.markers[host] == nil {
 			m.markers[host] = map[MarkerKind]time.Time{}
@@ -540,9 +477,6 @@ func (m *MemoryState) Close() error {
 	return nil
 }
 
-// --- inspection helpers, for tests only ---
-
-// Stats returns a copy of the per-host reason counters.
 func (m *MemoryState) Stats(host string) map[Reason]int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -553,7 +487,6 @@ func (m *MemoryState) Stats(host string) map[Reason]int {
 	return out
 }
 
-// StatsTotal sums every reason counter for a host.
 func (m *MemoryState) StatsTotal(host string) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -564,7 +497,6 @@ func (m *MemoryState) StatsTotal(host string) int {
 	return total
 }
 
-// Frontier returns the enqueued URLs with their priorities.
 func (m *MemoryState) Frontier() map[string]float64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -575,8 +507,6 @@ func (m *MemoryState) Frontier() map[string]float64 {
 	return out
 }
 
-// FrontierOrder returns the frontier's URLs from highest to lowest priority,
-// with member order broken alphabetically so the result is deterministic.
 func (m *MemoryState) FrontierOrder() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -597,7 +527,6 @@ func (m *MemoryState) frontierOrderLocked() []string {
 	return out
 }
 
-// Delayed returns the parked URLs and their due times.
 func (m *MemoryState) Delayed() map[string]time.Time {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -608,7 +537,6 @@ func (m *MemoryState) Delayed() map[string]time.Time {
 	return out
 }
 
-// Visited returns the terminal URL set.
 func (m *MemoryState) Visited() map[string]struct{} {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -619,7 +547,6 @@ func (m *MemoryState) Visited() map[string]struct{} {
 	return out
 }
 
-// Hosts returns the hosts with a stored record.
 func (m *MemoryState) Hosts() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -8,11 +8,6 @@ import (
 	"github.com/Hassan-ach/boogle/services/spider/internal/policy"
 )
 
-// ParseHTML used to return an error for a non-English document, and the crawl
-// loop logged that error as "failed to fetch and parse page". A language filter
-// was therefore indistinguishable from a network failure in the logs, and
-// neither was countable. The parser now reports what the document claims and
-// policy.IsEnglish judges, so these tests pin the reporting half.
 func TestParseHTMLReportsDeclaredLanguage(t *testing.T) {
 	tests := []struct {
 		name string
@@ -65,9 +60,6 @@ func TestParseHTMLReportsDeclaredLanguage(t *testing.T) {
 	}
 }
 
-// A non-English page must parse cleanly. The refusal now belongs to the policy
-// layer, and the parse still has to produce the page that layer judges --
-// otherwise the policy has nothing to look at.
 func TestParseHTMLDoesNotRefuseNonEnglish(t *testing.T) {
 	p := NewParser(nil, newTestLogger())
 
@@ -84,20 +76,15 @@ func TestParseHTMLDoesNotRefuseNonEnglish(t *testing.T) {
 	if len(page.Links) != 2 {
 		t.Errorf("extracted %d links, want 2: %v", len(page.Links), page.Links)
 	}
-	// The description is every text node the collector saw, title included, so
-	// assert containment rather than equality.
 	if !strings.Contains(page.Description, "Ein Absatz auf Deutsch.") {
 		t.Errorf("Description = %q, want it to contain the paragraph text", page.Description)
 	}
 
-	// And the policy layer, given the same evidence, declines it.
 	if policy.IsEnglish(page.Lang) {
 		t.Error("policy.IsEnglish accepted a document declaring lang=de")
 	}
 }
 
-// TestParserAndPolicyAgreeOnEnglish walks the same documents through both
-// halves, so the two cannot drift into disagreeing about what "en" means.
 func TestParserAndPolicyAgreeOnEnglish(t *testing.T) {
 	p := NewParser(nil, newTestLogger())
 
@@ -127,9 +114,6 @@ func TestParserAndPolicyAgreeOnEnglish(t *testing.T) {
 	}
 }
 
-// A document with no <html> element at all is malformed but still parses. The
-// old code walked to find the element, found none, and let the page through, so
-// this must keep working.
 func TestParseHTMLWithoutHTMLRoot(t *testing.T) {
 	p := NewParser(nil, newTestLogger())
 

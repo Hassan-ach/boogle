@@ -96,7 +96,6 @@ mod tests {
 
     #[test]
     fn serde_errors_become_serde_errors() {
-        // Produced by `serde_json::from_slice` on a malformed queue payload.
         let json_err = serde_json::from_slice::<Job>(b"{not json").unwrap_err();
         let err: AppError = json_err.into();
 
@@ -124,9 +123,6 @@ mod tests {
 
     #[test]
     fn lapin_errors_become_messaging_errors() {
-        // `lapin::Error` cannot be built directly (its module is private), so the
-        // conversion is exercised through the public `From<io::Error>` impl, which is
-        // how lapin itself produces transport failures.
         let io_err = io::Error::new(io::ErrorKind::BrokenPipe, "broker hung up");
         let lapin_err: lapin::Error = io_err.into();
         let err: AppError = AppError::from(lapin_err);
@@ -165,8 +161,6 @@ mod tests {
 
     #[test]
     fn database_and_messaging_wrappers_are_transparent() {
-        // `#[error(transparent)]` must forward both the message and the source,
-        // otherwise error logs lose the underlying cause.
         let inner = DatabaseError::NotFoundError("page 42".into());
         let expected = inner.to_string();
         let wrapped: IndexerError = inner.into();

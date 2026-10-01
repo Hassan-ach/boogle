@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 
 class JsonFormatter(logging.Formatter):
-    """Custom JSON log formatter."""
 
     def format(self, record: logging.LogRecord) -> str:
         payload = {
@@ -29,7 +28,6 @@ class JsonFormatter(logging.Formatter):
 
 
 class RankingService:
-    """Main application orchestrator for the Ranking Service."""
 
     def __init__(self):
         self.db_manager = DatabaseManager(min_conn=2, max_conn=10)
@@ -53,7 +51,6 @@ class RankingService:
 
     @staticmethod
     def validate_environment() -> None:
-        """Validate required environment variables."""
         required_vars = [
             "PG_HOST",
             "PG_PORT",
@@ -81,7 +78,6 @@ class RankingService:
         logger.info("Environment variables validated successfully")
 
     def setup_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Configure graceful shutdown signal handlers."""
 
         for signame in {signal.SIGINT, signal.SIGTERM}:
             loop.add_signal_handler(
@@ -96,7 +92,6 @@ class RankingService:
         await self.db_manager.close()
 
     async def start(self) -> None:
-        """Initialize resources, bind handlers, and start service consumer loop."""
         self.configure_logging()
         load_dotenv()
         self.validate_environment()
@@ -107,7 +102,6 @@ class RankingService:
         loop = asyncio.get_running_loop()
         self.setup_signal_handlers(loop)
 
-        # Register calculator pipeline to messaging threshold callback
         self.messaging.register_pipeline_handler(self.calculator.run_pipeline)
 
         logger.info("Starting Ranking Service FastStream Consumer...")

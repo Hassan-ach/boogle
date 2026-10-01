@@ -29,6 +29,8 @@ func NewSearchHandler(
 	}
 }
 
+// Handle dispatches on the requested tab. The "images" and "graph" tabs render
+// empty placeholders; only "all" queries the store and the ranker.
 func (h SearchingHandler) Handle(c *echo.Context) error {
 	query := c.QueryParam("query")
 	filter := c.QueryParam("tab")
@@ -53,18 +55,6 @@ func (h SearchingHandler) handleAllTab(c *echo.Context, sugs []string) error {
 
 	currentPage := getPageNum(c)
 
-	// The error is returned rather than written to the response. Writing it here
-	// looked harmless and was not:
-	//
-	//     return c.String(http.StatusInternalServerError, fmt.Sprint("err: %w", err))
-	//
-	// `%w` is only meaningful to fmt.Errorf, so Sprint printed the verb
-	// literally -- the body read "err: %wdial tcp 127.0.0.1:5432: connect:
-	// connection refused" -- and the whole driver error, host and port included,
-	// went to the browser. Returning the error hands it to HandleError, which
-	// logs the cause and renders only the user-facing message, which is the whole
-	// reason AppError keeps `Err` separate from `Message`. The store already
-	// returns an *apperror.AppError, so there is nothing left to wrap.
 	totalPages, err := h.Store.GetTotalPages(ctx, sugs)
 	if err != nil {
 		return err
@@ -80,6 +70,8 @@ func (h SearchingHandler) handleAllTab(c *echo.Context, sugs []string) error {
 		return err
 	}
 
+	// htmx sets HX-Request on its partial swaps; the view returns a fragment
+	// instead of a full page when it is set.
 	isHtmx := c.Request().Header.Get("HX-Request") == "true"
 
 	return render(c, result.ShowAll(pages, totalPages, currentPage, isHtmx))
@@ -95,6 +87,9 @@ func handleGraphTab(c *echo.Context) error {
 	return render(c, result.ShowGraph(nil, isHtmx))
 }
 
+// getPageNum returns a 1-based page number, defaulting to 1. A missing,
+// unparseable or non-positive value falls back rather than erroring, so a
+// hand-edited or stale pagination link still returns results.
 func getPageNum(c *echo.Context) int {
 	page := c.QueryParam("page")
 	pageNum := 1

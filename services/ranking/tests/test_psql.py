@@ -1,10 +1,3 @@
-"""Retry semantics of `retry_on_db_error`.
-
-The decorator is the only thing standing between a flaky database connection and
-a dead ranking pipeline, so its attempt count, backoff, and -- most importantly --
-which errors it treats as retryable are all pinned here.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -30,7 +23,6 @@ class Recorder:
 
 
 class Boom:
-    """An error the decorator must never swallow or retry."""
 
     def __init__(self) -> None:
         self.calls = 0
@@ -42,7 +34,6 @@ class Boom:
 
 @pytest.fixture(autouse=True)
 def no_real_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    """Record requested delays instead of actually waiting."""
     delays: list[float] = []
 
     async def fake_sleep(seconds: float) -> None:
@@ -72,13 +63,6 @@ async def test_transient_failure_is_retried_until_success(no_real_sleeps: list[f
 async def test_max_retries_means_retries_after_the_first_attempt(
     no_real_sleeps: list[float],
 ) -> None:
-    """`max_retries=3` must allow four calls in total, not three.
-
-    The Rust `retry_async` in the indexer counts the *first* call as an attempt,
-    so `max_retries=3` there means three calls. The two services disagree, which
-    is a genuine footgun: this test locks in the Python convention (N+1 calls)
-    so it cannot be changed silently.
-    """
     recorder = Recorder(fail_times=99, error=OperationalError())
     wrapped = retry_on_db_error(max_retries=3, delay=0.0)(recorder)
 
@@ -166,11 +150,6 @@ async def test_both_documented_retryable_types_are_covered(retryable: Any) -> No
 
 
 async def test_concurrent_calls_do_not_share_a_delay_counter() -> None:
-    """`current_delay` is local to each wrapper invocation.
-
-    A shared counter would let one coroutine's backoff inflate another's and
-    make retry timing depend on unrelated traffic.
-    """
     calls: dict[str, int] = {"a": 0, "b": 0}
 
     @retry_on_db_error(max_retries=1, delay=1.0, backoff=2.0)

@@ -7,15 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
 )
 
-// timeoutErr is a net.Error that reports itself as a timeout. It exists because
-// the single most consequential rule in classify is that a slow host is not a
-// dead host, and that rule is only reachable through a real net.Error -- a
-// context.DeadlineExceeded alone would not exercise it.
 type timeoutErr struct{ msg string }
 
 func (e timeoutErr) Error() string   { return e.msg }
@@ -33,7 +30,6 @@ func TestClassify(t *testing.T) {
 		wantKind ActionKind
 		wantWhy  Reason
 	}{
-		// --- success ---
 		{
 			name:     "200 is a success",
 			out:      Outcome{StatusCode: 200, ContentType: "text/html", BytesRead: 4096},
@@ -56,8 +52,6 @@ func TestClassify(t *testing.T) {
 			wantWhy:  ReasonFetchOK,
 		},
 		{
-			// An empty content type is the overwhelmingly common case and must
-			// not be a refusal, or most of the web disappears.
 			name:     "absent content type is accepted",
 			out:      Outcome{StatusCode: 200, ContentType: ""},
 			maxRetry: 5,
@@ -72,7 +66,6 @@ func TestClassify(t *testing.T) {
 			wantWhy:  ReasonFetchOK,
 		},
 
-		// --- permanent: the server gave a final answer ---
 		{
 			name:     "404 is permanent",
 			out:      Outcome{StatusCode: 404},
@@ -130,9 +123,6 @@ func TestClassify(t *testing.T) {
 			wantWhy:  ReasonBadRequest,
 		},
 		{
-			// A 404 after nine attempts is exactly as final as a 404 after one.
-			// Gating permanence behind the attempt count would re-fetch a page
-			// we have already proven is gone.
 			name:     "permanence is not gated by attempt count",
 			out:      Outcome{StatusCode: 404},
 			attempts: 9,
@@ -141,9 +131,6 @@ func TestClassify(t *testing.T) {
 			wantWhy:  ReasonNotFound,
 		},
 		{
-			// Same for a body too large to index, one attempt short of the
-			// ceiling. Truncation is a property of the page, not of how many
-			// times we have asked for it.
 			name:     "a permanent body verdict survives an exhausted budget",
 			out:      Outcome{StatusCode: 200, ContentType: "application/pdf"},
 			attempts: 4,
@@ -152,7 +139,6 @@ func TestClassify(t *testing.T) {
 			wantWhy:  ReasonContentTypeRejected,
 		},
 
-		// --- backoff: the server is answering but unhappy ---
 		{
 			name:     "429 backs off rather than abandoning a page that exists",
 			out:      Outcome{StatusCode: 429},
@@ -189,7 +175,6 @@ func TestClassify(t *testing.T) {
 			wantWhy:  ReasonServerError,
 		},
 
-		// --- backoff: no response at all ---
 		{
 			name:     "dns failure is a dead host",
 			out:      Outcome{Err: &net.DNSError{Err: "no such host", Name: "nope.invalid", IsNotFound: true}},
@@ -247,9 +232,6 @@ func TestClassify(t *testing.T) {
 			wantWhy:  ReasonTLSError,
 		},
 		{
-			// Go 1.20 wrapped certificate verification failures in a dedicated
-			// type, so a TLS problem can arrive as this rather than as the bare
-			// x509 errors above.
 			name:     "a wrapped verification failure is a tls failure",
 			out:      Outcome{Err: &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}},
 			maxRetry: 5,
@@ -264,10 +246,7 @@ func TestClassify(t *testing.T) {
 			wantWhy:  ReasonServerError,
 		},
 
-		// --- timeouts: slow is not gone ---
 		{
-			// This is the rule most worth stating twice. A host that once took
-			// 30 seconds to answer must not vanish for an hour because of it.
 			name:     "a net timeout is not a dead host",
 			out:      Outcome{Err: timeoutErr{msg: "i/o timeout"}},
 			maxRetry: 5,
@@ -282,9 +261,6 @@ func TestClassify(t *testing.T) {
 			wantWhy:  ReasonTimeout,
 		},
 		{
-			// A DNS lookup that times out also reports itself as a *net.DNSError.
-			// Testing DNS before timeouts would classify every slow resolver as
-			// a dead domain.
 			name:     "a timing-out dns lookup is a timeout, not a dead host",
 			out:      Outcome{Err: &net.DNSError{Err: "i/o timeout", Name: "slow.example", IsTimeout: true}},
 			maxRetry: 5,
@@ -299,7 +275,6 @@ func TestClassify(t *testing.T) {
 			wantWhy:  ReasonTimeout,
 		},
 
-		// --- redirect loops ---
 		{
 			name:     "a redirect loop is permanent",
 			out:      Outcome{Err: ErrRedirectLoop, StatusCode: 302},
@@ -308,10 +283,6 @@ func TestClassify(t *testing.T) {
 			wantWhy:  ReasonRedirectLoop,
 		},
 		{
-			// The case that isolates the sentinel. A chain like
-			// 301 -> 200 -> 301 -> 200 leaves the last response a 200, so
-			// without reading the sentinel a redirect loop would be classified
-			// as a success and indexed.
 			name:     "a redirect loop ending on a 200 is still permanent",
 			out:      Outcome{StatusCode: 200, ContentType: "text/html", Err: ErrRedirectLoop},
 			maxRetry: 5,
@@ -319,8 +290,6 @@ func TestClassify(t *testing.T) {
 			wantWhy:  ReasonRedirectLoop,
 		},
 		{
-			// Same isolation for the count-based backstop: a 200 with a hop
-			// count over the limit is a loop wearing a success's status.
 			name:     "an over-limit hop count beats a 200 status",
 			out:      Outcome{StatusCode: 200, ContentType: "text/html", Redirects: 11},
 			maxRetry: 5,
@@ -335,8 +304,6 @@ func TestClassify(t *testing.T) {
 			wantWhy:  ReasonRedirectLoop,
 		},
 		{
-			// Exactly at the limit is within it. Off-by-one here would break
-			// every legitimately long redirect chain.
 			name:     "a redirect count exactly at the limit is allowed",
 			out:      Outcome{StatusCode: 200, ContentType: "text/html", Redirects: 10},
 			maxRetry: 5,
@@ -344,8 +311,6 @@ func TestClassify(t *testing.T) {
 			wantWhy:  ReasonFetchOK,
 		},
 		{
-			// The transport follows redirects, so a 3xx surfacing means the chain
-			// stopped here. Retrying walks the same chain to the same place.
 			name:     "a surfaced 3xx is permanent",
 			out:      Outcome{StatusCode: 301},
 			maxRetry: 5,
@@ -353,10 +318,7 @@ func TestClassify(t *testing.T) {
 			wantWhy:  ReasonRedirectLoop,
 		},
 
-		// --- bodies we should not index ---
 		{
-			// Indexing half a page is worse than not indexing it: the text runs
-			// off mid-sentence and every term frequency downstream is wrong.
 			name:     "a body past the cap is truncated and dropped",
 			out:      Outcome{StatusCode: 200, ContentType: "text/html", BytesRead: cfg.MaxBodyBytes + 1},
 			maxRetry: 5,
@@ -371,7 +333,6 @@ func TestClassify(t *testing.T) {
 			wantWhy:  ReasonFetchOK,
 		},
 		{
-			// How a crawler ends up with a PDF's raw bytes in the index.
 			name:     "a pdf served with a 200 is refused",
 			out:      Outcome{StatusCode: 200, ContentType: "application/pdf"},
 			maxRetry: 5,
@@ -407,9 +368,6 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-// TestClassifyAttemptCeiling checks that a backoff stops being a backoff once
-// the attempts a host allows have been spent. Without this, a permanently
-// failing URL is re-queued forever.
 func TestClassifyAttemptCeiling(t *testing.T) {
 	cfg := DefaultConfig()
 
@@ -422,15 +380,9 @@ func TestClassifyAttemptCeiling(t *testing.T) {
 	}{
 		{"first of five attempts still backs off", 0, 5, ActBackoff, ReasonServerError},
 		{"fourth of five attempts still backs off", 3, 5, ActBackoff, ReasonServerError},
-		// attempts=4 means this is the 5th and last attempt, so the next
-		// outcome, whatever it is, retires the URL.
 		{"fifth of five attempts is the last one", 4, 5, ActPermanent, ReasonAttemptsExhausted},
 		{"past the ceiling stays permanent", 12, 5, ActPermanent, ReasonAttemptsExhausted},
-		// maxRetry is the total, not the number of retries after the first.
 		{"maxRetry of one permits exactly one attempt", 0, 1, ActPermanent, ReasonAttemptsExhausted},
-		// maxRetry comes from a database column, so 0 and negatives are
-		// reachable from data. attempts+1 is at least 1, so either reads as "at
-		// most one attempt" rather than as an uncrawlable subtree.
 		{"maxRetry of zero permits exactly one attempt", 0, 0, ActPermanent, ReasonAttemptsExhausted},
 		{"negative maxRetry permits exactly one attempt", 0, -7, ActPermanent, ReasonAttemptsExhausted},
 	}
@@ -448,10 +400,6 @@ func TestClassifyAttemptCeiling(t *testing.T) {
 	}
 }
 
-// TestClassifyStatusOutranksError pins the precedence rule. A chain that ends in
-// a 404 is a 404 even though the client reported an error reaching it, and
-// treating that as a transport failure would park a dead URL in the delayed set
-// and keep re-fetching it.
 func TestClassifyStatusOutranksError(t *testing.T) {
 	cfg := DefaultConfig()
 
@@ -468,10 +416,6 @@ func TestClassifyStatusOutranksError(t *testing.T) {
 	}
 }
 
-// TestClassifyTimeoutDoesNotUseTheDeadSchedule is the measurable form of "a
-// slow host is not a dead host". Both outcomes are ActBackoff, so the kind
-// alone cannot tell them apart; the retry schedule can, and Classify uses that
-// to decide whether to write a dead marker.
 func TestClassifyTimeoutDoesNotUseTheDeadSchedule(t *testing.T) {
 	cfg := DefaultConfig()
 
@@ -492,10 +436,6 @@ func TestClassifyTimeoutDoesNotUseTheDeadSchedule(t *testing.T) {
 	}
 }
 
-// TestClassifyDeadRetryOutlivesDeadMarker checks the number that loses a domain
-// if it is wrong. The failing URL is parked for at least as long as the host's
-// own dead marker; if it returned sooner, Admit would see the host still dead,
-// skip the URL as terminal, and the domain would never be probed again.
 func TestClassifyDeadRetryOutlivesDeadMarker(t *testing.T) {
 	cfg := DefaultConfig()
 
@@ -515,8 +455,6 @@ func TestClassifyDeadRetryOutlivesDeadMarker(t *testing.T) {
 	}
 }
 
-// TestClassifyBackoffGrows checks that repeated failures of the same kind space
-// themselves out, so a host failing us is not hit at a constant rate.
 func TestClassifyBackoffGrows(t *testing.T) {
 	cfg := DefaultConfig()
 
@@ -530,9 +468,6 @@ func TestClassifyBackoffGrows(t *testing.T) {
 	}
 }
 
-// TestClassifyBackoffIsAlwaysPositive guards the delayed set. A zero or
-// negative due time would be immediately due forever, which is a hot loop
-// wearing a backoff's clothes.
 func TestClassifyBackoffIsAlwaysPositive(t *testing.T) {
 	cfg := DefaultConfig()
 
@@ -561,9 +496,6 @@ func TestClassifyBackoffIsAlwaysPositive(t *testing.T) {
 	}
 }
 
-// TestClassifyNoEvidenceDoesNotLoop covers the impossible-looking input. With no
-// status and no error there is nothing to learn, and backoff is the safe answer
-// precisely because the attempt ceiling bounds it.
 func TestClassifyNoEvidenceDoesNotLoop(t *testing.T) {
 	cfg := DefaultConfig()
 
@@ -572,7 +504,6 @@ func TestClassifyNoEvidenceDoesNotLoop(t *testing.T) {
 		t.Errorf("kind = %v, want %v -- dropping the url would lose a page we never tried", got.Kind, ActBackoff)
 	}
 
-	// And it must terminate rather than retry forever.
 	got = classify(Outcome{}, 4, 5, &cfg)
 	if got.Kind != ActPermanent {
 		t.Errorf("kind = %v, want %v -- the attempt ceiling must still apply", got.Kind, ActPermanent)
@@ -588,12 +519,6 @@ func TestClassifySuccessCarriesNoRetryDelay(t *testing.T) {
 	}
 }
 
-// TestRetryAfterDefaultIsThePageSchedule covers the defensive arm of the
-// schedule lookup. Every reason that can currently produce a backoff is listed
-// explicitly, so this arm is unreachable from classify today -- but it exists
-// precisely so that a reason added later without a matching arm gets a
-// page-level delay rather than a zero, and a zero due time is immediately due
-// forever. A default nobody exercises is a default nobody can rely on.
 func TestRetryAfterDefaultIsThePageSchedule(t *testing.T) {
 	cfg := DefaultConfig()
 
@@ -606,8 +531,6 @@ func TestRetryAfterDefaultIsThePageSchedule(t *testing.T) {
 	}
 }
 
-// TestRetryAfterNeverZero is the property the default exists to protect,
-// checked across every reason the classifier can emit.
 func TestRetryAfterNeverZero(t *testing.T) {
 	cfg := DefaultConfig()
 
@@ -626,8 +549,6 @@ func TestRetryAfterNeverZero(t *testing.T) {
 }
 
 func TestKindStrings(t *testing.T) {
-	// The strings end up in log fields and Redis counters, so they are part of
-	// the contract rather than debug output.
 	verdicts := map[VerdictKind]string{Allow: "allow", Defer: "defer", Skip: "skip"}
 	for kind, want := range verdicts {
 		if got := kind.String(); got != want {
@@ -649,10 +570,562 @@ func TestKindStrings(t *testing.T) {
 	}
 }
 
-// urlError mimics the *url.Error the http client wraps transport failures in,
-// to prove the classification survives the wrapping the transport actually
-// applies. errors.As and errors.Is both walk it.
 type urlError struct{ err error }
 
 func (e *urlError) Error() string { return fmt.Sprintf("Get %q: %v", "http://example.com", e.err) }
 func (e *urlError) Unwrap() error { return e.err }
+
+func mustClassify(t *testing.T, m *PolicyManager, rawURL string, out Outcome) *Action {
+	t.Helper()
+	act, err := m.Classify(context.Background(), rawURL, out)
+	if err != nil {
+		t.Fatalf("Classify(%q) returned an error: %v", rawURL, err)
+	}
+	if act == nil {
+		t.Fatalf("Classify(%q) returned a nil action", rawURL)
+	}
+	return act
+}
+
+func TestClassifySuccessCountsThePageAndClearsTheFailures(t *testing.T) {
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	m, st, _ := atClock(t, now)
+	ctx := context.Background()
+	const target = "https://example.com/ok"
+
+	if _, err := st.RecordFailure(ctx, "example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	act := mustClassify(t, m, target, Outcome{StatusCode: 200, ContentType: "text/html"})
+	if act.Kind != ActSuccess {
+		t.Fatalf("Kind = %v, want success", act.Kind)
+	}
+	if act.Reason != ReasonFetchOK {
+		t.Errorf("Reason = %q, want %q", act.Reason, ReasonFetchOK)
+	}
+
+	state, err := st.HostState(ctx, "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.PagesCrawled != 1 {
+		t.Errorf("PagesCrawled = %d, want 1", state.PagesCrawled)
+	}
+	if state.ConsecFailures != 0 {
+		t.Errorf("ConsecFailures = %d, want 0; a host that recovered must start its "+
+			"next backoff from the first step", state.ConsecFailures)
+	}
+	if !state.LastSuccess.Equal(now) {
+		t.Errorf("LastSuccess = %v, want %v", state.LastSuccess, now)
+	}
+
+	urlState, err := st.URLState(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if urlState.Attempts != 0 {
+		t.Errorf("attempts = %d after a success, want 0", urlState.Attempts)
+	}
+}
+
+func TestClassifySuccessDoesNotRetireTheURL(t *testing.T) {
+	m, st, _ := atClock(t, time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC))
+	ctx := context.Background()
+	const target = "https://example.com/ok"
+
+	mustClassify(t, m, target, Outcome{StatusCode: 200})
+
+	visited, err := st.IsVisited(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if visited {
+		t.Error("a successful fetch marked the URL visited; a page that then fails to " +
+			"persist would never be fetched again")
+	}
+}
+
+func TestClassifyRetiresA404(t *testing.T) {
+	m, st, _ := atClock(t, time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC))
+	ctx := context.Background()
+	const target = "https://example.com/gone"
+
+	act := mustClassify(t, m, target, Outcome{StatusCode: 404})
+	if act.Kind != ActPermanent {
+		t.Fatalf("Kind = %v, want permanent", act.Kind)
+	}
+	if act.Reason != ReasonNotFound {
+		t.Errorf("Reason = %q, want %q", act.Reason, ReasonNotFound)
+	}
+
+	visited, err := st.IsVisited(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !visited {
+		t.Error("a 404 was not retired; it will be fetched again on every rediscovery")
+	}
+
+	urlState, err := st.URLState(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if urlState.Attempts != 0 {
+		t.Errorf("attempts = %d for a retired URL, want 0: the record is dead weight "+
+			"waiting for its TTL", urlState.Attempts)
+	}
+}
+
+func TestClassifyRetiresBeforeItClears(t *testing.T) {
+	m, st, _ := atClock(t, time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC))
+	ctx := context.Background()
+	const target = "https://example.com/gone"
+
+	if _, err := st.BumpAttempts(ctx, target); err != nil {
+		t.Fatal(err)
+	}
+	st.FailOn = map[string]error{"ClearURLState": errors.New("redis went away mid-write")}
+
+	act, err := m.Classify(ctx, target, Outcome{StatusCode: 404})
+	if err == nil {
+		t.Fatal("expected an error when the decision could not be fully recorded")
+	}
+	if act != nil {
+		t.Fatalf("Action = %+v, want nil: the retiring write landed but the decision "+
+			"was only half recorded, so it is not a decision", act)
+	}
+
+	st.FailOn = nil
+	visited, err := st.IsVisited(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !visited {
+		t.Error("the URL was not retired even though the write that clears its record " +
+			"failed; a failed clear must not undo the retiring write")
+	}
+}
+
+func TestClassifyParksABackoffWithTheComputedDueTime(t *testing.T) {
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	m, st, c := atClock(t, now)
+	ctx := context.Background()
+	const target = "https://example.com/flaky"
+
+	act := mustClassify(t, m, target, Outcome{StatusCode: 503})
+	if act.Kind != ActBackoff {
+		t.Fatalf("Kind = %v, want backoff", act.Kind)
+	}
+	if act.Reason != ReasonServerError {
+		t.Errorf("Reason = %q, want %q", act.Reason, ReasonServerError)
+	}
+	if act.RetryAfter != m.cfg.URLBackoffBase {
+		t.Errorf("RetryAfter = %v, want the base %v for a first failure", act.RetryAfter, m.cfg.URLBackoffBase)
+	}
+
+	urlState, err := st.URLState(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if urlState.Attempts != 1 {
+		t.Errorf("attempts = %d, want 1", urlState.Attempts)
+	}
+
+	if n, err := st.FrontierLen(ctx); err != nil {
+		t.Fatal(err)
+	} else if n != 0 {
+		t.Errorf("frontier length = %d, want 0; a parked URL belongs in the delayed set", n)
+	}
+
+	next, err := m.TakeNext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !next.Idle {
+		t.Errorf("TakeNext handed out %q before the retry was due", next.URL)
+	}
+
+	c.Advance(act.RetryAfter + time.Second)
+	next, err = m.TakeNext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Idle || next.URL != target {
+		t.Errorf("TakeNext = %+v, want %q once the retry was due", next, target)
+	}
+}
+
+func TestClassifyGrowsTheDelayWithEachFailure(t *testing.T) {
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	m, _, c := atClock(t, now)
+	const target = "https://example.com/flaky"
+
+	var last time.Duration
+	for i := range 2 {
+		act := mustClassify(t, m, target, Outcome{StatusCode: 503})
+		if act.RetryAfter <= last {
+			t.Fatalf("failure %d: RetryAfter = %v, want more than the previous %v",
+				i+1, act.RetryAfter, last)
+		}
+		last = act.RetryAfter
+		c.Advance(act.RetryAfter)
+	}
+}
+
+func TestClassifyRetiresAURLThatHasRunOutOfAttempts(t *testing.T) {
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	m, st, c := atClock(t, now)
+	ctx := context.Background()
+	const target = "https://example.com/never-works"
+
+	var last *Action
+	for range m.cfg.URLMaxAttempts {
+		last = mustClassify(t, m, target, Outcome{StatusCode: 503})
+		if last.Kind == ActPermanent {
+			break
+		}
+		c.Advance(last.RetryAfter)
+	}
+	if last.Kind != ActPermanent {
+		t.Fatalf("after %d attempts the kind is %v, want permanent", m.cfg.URLMaxAttempts, last.Kind)
+	}
+	if last.Reason != ReasonAttemptsExhausted {
+		t.Errorf("Reason = %q, want %q: "+
+			"a URL given up on for running out of attempts is a different fact from a "+
+			"URL that answered 404, and the stats hash has to be able to say so",
+			last.Reason, ReasonAttemptsExhausted)
+	}
+
+	visited, err := st.IsVisited(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !visited {
+		t.Error("a URL that ran out of attempts was not retired; it would be retried for ever")
+	}
+}
+
+func TestClassifyMarksADeadHostOnlyForConnectionFailures(t *testing.T) {
+	tests := []struct {
+		name       string
+		out        Outcome
+		wantDead   bool
+		wantReason Reason
+	}{
+		{
+			name:       "a refused dial means the host is gone",
+			out:        Outcome{Err: errConnRefused},
+			wantDead:   true,
+			wantReason: ReasonConnectionRefused,
+		},
+		{
+			name:       "a TLS failure means the host is gone",
+			out:        Outcome{Err: errTLSHandshake},
+			wantDead:   true,
+			wantReason: ReasonTLSError,
+		},
+		{
+			name:       "a timeout must never mark a host dead",
+			out:        Outcome{Err: &timeoutError{}},
+			wantDead:   false,
+			wantReason: ReasonTimeout,
+		},
+		{
+			name:       "a 503 must never mark a host dead",
+			out:        Outcome{StatusCode: 503},
+			wantDead:   false,
+			wantReason: ReasonServerError,
+		},
+		{
+			name:       "rate limiting must never mark a host dead",
+			out:        Outcome{StatusCode: 429},
+			wantDead:   false,
+			wantReason: ReasonRateLimited,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+			m, st, _ := atClock(t, now)
+			ctx := context.Background()
+			host := "probe-" + itoa(len(tc.name)) + ".example"
+			target := "https://" + host + "/page"
+
+			act := mustClassify(t, m, target, tc.out)
+			if act.Reason != tc.wantReason {
+				t.Errorf("Reason = %q, want %q", act.Reason, tc.wantReason)
+			}
+
+			markers, err := st.Markers(ctx, host)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, dead := markers[MarkerDead]
+			_, cooling := markers[MarkerCooldown]
+			if dead != tc.wantDead {
+				t.Errorf("dead marker present = %v, want %v (markers: %s)",
+					dead, tc.wantDead, markerNames(markers))
+			}
+			if !tc.wantDead && !cooling {
+				t.Errorf("no marker at all was raised for a failing host; markers: %s",
+					markerNames(markers))
+			}
+		})
+	}
+}
+
+func TestClassifyNeverMarksAHostDeadForATimeout(t *testing.T) {
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	m, st, _ := atClock(t, now)
+	ctx := context.Background()
+	const host = "slow.example"
+	const target = "https://slow.example/page"
+
+	mustClassify(t, m, target, Outcome{Err: &timeoutError{}})
+
+	markers, err := st.Markers(ctx, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, dead := markers[MarkerDead]; dead {
+		t.Error("a timeout marked the host dead; its URLs would be answered from Redis " +
+			"for an hour because it was slow once")
+	}
+	if _, cooling := markers[MarkerCooldown]; !cooling {
+		t.Errorf("a timeout should cool the host down, got markers: %s", markerNames(markers))
+	}
+}
+
+func TestTheCooldownRespectsTheRobotsCrawlDelay(t *testing.T) {
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	m, st, _ := atClock(t, now)
+	ctx := context.Background()
+	const host = "h.example"
+	const target = "https://h.example/page"
+
+	if err := st.SaveHostState(ctx, host, HostState{
+		Name:            host,
+		CrawlDelay:      30 * time.Second,
+		MaxPages:        100,
+		RobotsFetchedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mustClassify(t, m, target, Outcome{StatusCode: 503})
+
+	markers, err := st.Markers(ctx, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ttl, ok := markers[MarkerCooldown]
+	if !ok {
+		t.Fatalf("no cooldown was raised; markers: %s", markerNames(markers))
+	}
+	floor := m.cfg.HostCooldown(1, 30*time.Second)
+	if ttl != floor {
+		t.Errorf("cooldown ttl = %v, want %v (the site's Crawl-delay as the floor)", ttl, floor)
+	}
+	if ttl < 30*time.Second {
+		t.Errorf("cooldown ttl = %v, want at least the 30s the site asked for", ttl)
+	}
+}
+
+func TestTheDeadMarkerGrowsWithEachConsecutiveFailure(t *testing.T) {
+	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+	m, st, _ := atClock(t, now)
+	ctx := context.Background()
+	const host = "gone.example"
+
+	mustClassify(t, m, "https://gone.example/a", Outcome{Err: &net.DNSError{Err: "no such host"}})
+	first, err := st.Markers(ctx, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstTTL := first[MarkerDead]
+
+	mustClassify(t, m, "https://gone.example/b", Outcome{Err: &net.DNSError{Err: "no such host"}})
+	second, err := st.Markers(ctx, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.ClearMarker(ctx, host, MarkerDead); err != nil {
+		t.Fatal(err)
+	}
+	mustClassify(t, m, "https://gone.example/c", Outcome{Err: &net.DNSError{Err: "no such host"}})
+	third, err := st.Markers(ctx, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third[MarkerDead] <= firstTTL {
+		t.Errorf("the dead ttl is %v after three host failures, want more than the %v "+
+			"it was after one", third[MarkerDead], firstTTL)
+	}
+	if second[MarkerDead] != firstTTL {
+		t.Errorf("the ttl changed under a live marker: %v then %v; a marker that "+
+			"extended itself would keep a host out for ever after enough failures",
+			firstTTL, second[MarkerDead])
+	}
+}
+
+func TestClassifyCountsEveryOutcomeAgainstItsHost(t *testing.T) {
+	tests := []struct {
+		name string
+		out  Outcome
+		want Reason
+	}{
+		{"a success", Outcome{StatusCode: 200}, ReasonFetchOK},
+		{"a 404", Outcome{StatusCode: 404}, ReasonNotFound},
+		{"a 403", Outcome{StatusCode: 403}, ReasonForbidden},
+		{"a 503", Outcome{StatusCode: 503}, ReasonServerError},
+		{"a refused dial", Outcome{Err: &net.DNSError{Err: "no such host"}}, ReasonDNSFailure},
+		{"a timeout", Outcome{Err: &timeoutError{}}, ReasonTimeout},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m, st, _ := atClock(t, time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC))
+			host := "counted.example"
+			target := "https://" + host + "/p?n=" + strconv.Itoa(len(tc.name))
+
+			act := mustClassify(t, m, target, tc.out)
+			if act.Reason != tc.want {
+				t.Fatalf("Reason = %q, want %q", act.Reason, tc.want)
+			}
+			stats := st.Stats(host)
+			if stats[tc.want] != 1 {
+				t.Errorf("stats[%s] = %d, want 1 (all: %v)", tc.want, stats[tc.want], stats)
+			}
+		})
+	}
+}
+
+func TestACountedOutcomeSurvivesAFailedCount(t *testing.T) {
+	m, st, _ := atClock(t, time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC))
+	ctx := context.Background()
+	const target = "https://counted.example/p"
+
+	st.FailOn = map[string]error{"CountReason": errors.New("redis went away")}
+
+	act, err := m.Classify(ctx, target, Outcome{StatusCode: 404})
+	if err != nil {
+		t.Fatalf("a failed count turned into an error: %v", err)
+	}
+	if act.Kind != ActPermanent {
+		t.Errorf("Kind = %v, want permanent; the decision must be applied even when it "+
+			"could not be counted", act.Kind)
+	}
+	st.FailOn = nil
+	visited, err := st.IsVisited(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !visited {
+		t.Error("a failed count stopped the URL being retired")
+	}
+}
+
+func TestClassifyRefusesToDecideWhenItCannotReadTheAttemptCount(t *testing.T) {
+	m, st, _ := atClock(t, time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC))
+	ctx := context.Background()
+	const target = "https://example.com/p"
+
+	st.FailOn = map[string]error{"URLState": errors.New("redis went away")}
+
+	act, err := m.Classify(ctx, target, Outcome{StatusCode: 503})
+	if err == nil {
+		t.Fatal("expected an error; the attempt count is an input to the decision")
+	}
+	if act != nil {
+		t.Errorf("Action = %+v, want nil: nothing was decided, so there is nothing to return", act)
+	}
+	if !errors.Is(err, st.FailOn["URLState"]) {
+		t.Errorf("error = %v, want it to wrap the state failure so the cause survives", err)
+	}
+}
+
+func TestClassifyReportsAFailedRecordWrite(t *testing.T) {
+	tests := []struct {
+		name   string
+		failOn string
+		out    Outcome
+	}{
+		{"a success that cannot be counted", "RecordSuccess", Outcome{StatusCode: 200}},
+		{"a success whose url record cannot be cleared", "ClearURLState", Outcome{StatusCode: 200}},
+		{"a backoff that cannot be parked", "EnqueueDelayed", Outcome{StatusCode: 503}},
+		{"a failure that cannot be counted against the host", "RecordFailure", Outcome{StatusCode: 503}},
+		{"an attempt that cannot be counted", "BumpAttempts", Outcome{StatusCode: 503}},
+		{"a cooldown whose crawl delay cannot be read", "HostState", Outcome{StatusCode: 503}},
+		{"a permanent outcome that cannot be retired", "MarkVisited", Outcome{StatusCode: 404}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m, st, _ := atClock(t, time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC))
+			ctx := context.Background()
+			const target = "https://example.com/p"
+
+			st.FailOn = map[string]error{tc.failOn: errors.New("redis went away")}
+
+			act, err := m.Classify(ctx, target, tc.out)
+			if err == nil {
+				t.Fatalf("expected an error when %s failed", tc.failOn)
+			}
+			if act != nil {
+				t.Errorf("Action = %+v, want nil alongside the error", act)
+			}
+		})
+	}
+}
+
+func TestClassifyRejectsAnEmptyURL(t *testing.T) {
+	m, _, _ := atClock(t, time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC))
+
+	for _, raw := range []string{"", "   "} {
+		if _, err := m.Classify(context.Background(), raw, Outcome{StatusCode: 200}); !errors.Is(err, errEmptyURL) {
+			t.Errorf("Classify(%q) error = %v, want errEmptyURL", raw, err)
+		}
+	}
+}
+
+func TestClassifyNeedsNoHostToStillDecide(t *testing.T) {
+	m, st, _ := atClock(t, time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC))
+	ctx := context.Background()
+	const target = "mailto:someone@example.com"
+
+	act := mustClassify(t, m, target, Outcome{StatusCode: 404})
+	if act.Kind != ActPermanent {
+		t.Errorf("Kind = %v, want permanent", act.Kind)
+	}
+	visited, err := st.IsVisited(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !visited {
+		t.Error("a hostless URL should still be retirable")
+	}
+}
+
+func TestTheHostIsLowercasedForTheRecord(t *testing.T) {
+	for _, raw := range []string{
+		"https://EXAMPLE.com/A",
+		"https://example.com/A",
+	} {
+		if got := hostOfURL(raw); got != "example.com" {
+			t.Errorf("hostOfURL(%q) = %q, want %q", raw, got, "example.com")
+		}
+	}
+}
+
+func TestHostOfURLReportsNothingForSomethingUnparseable(t *testing.T) {
+	for _, raw := range []string{"", "://nope", "https://"} {
+		if got := hostOfURL(raw); got != "" {
+			t.Errorf("hostOfURL(%q) = %q, want an empty string", raw, got)
+		}
+	}
+}
+
+var _ net.Error = timeoutError{}

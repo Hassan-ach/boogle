@@ -12,7 +12,6 @@ templ Pagination(totalPages, currentPage int) {
         }
     }`, currentPage, totalPages) }>
         <div class="flex items-center justify-center gap-3">
-            <!-- Previous -->
             <a @click.prevent="goToPage(currentPage - 1)" href="#"
                 :class="currentPage === 1 ? 'opacity-40 pointer-events-none' : 'hover:bg-blue-50'"
                 class="flex items-center gap-1 px-4 py-2 text-sm font-medium text-blue-600 border border-blue-200 rounded-l transition-colors">
@@ -22,12 +21,10 @@ templ Pagination(totalPages, currentPage int) {
                 Prev
             </a>
 
-            <!-- Page Info -->
             <div class="px-4 py-2 text-sm font-semibold text-gray-700 bg-gray-100 rounded-lg border border-gray-200">
                 { fmt.Sprintf("%d / %d", currentPage, totalPages) }
             </div>
 
-            <!-- Next -->
             <a @click.prevent="goToPage(currentPage + 1)" href="#"
                 :class="currentPage === totalPages ? 'opacity-40 pointer-events-none' : 'hover:bg-blue-50'"
                 class="flex items-center gap-1 px-4 py-2 text-sm font-medium text-blue-600 border border-blue-200 rounded-l transition-colors">

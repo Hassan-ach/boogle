@@ -5,19 +5,16 @@ use slog_term::FullFormat;
 use std::future::Future;
 
 pub fn init_logger(log_file: &str) -> io::Result<Logger> {
-    // Create log directory
     if let Some(parent) = Path::new(log_file).parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Terminal: Pretty, colored output
     let term = slog_term::TermDecorator::new()
         .stderr()
         .force_color()
         .build();
     let term_drain = FullFormat::new(term).use_local_timestamp().build().fuse();
 
-    // File: JSON format
     let file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -31,22 +28,19 @@ pub fn init_logger(log_file: &str) -> io::Result<Logger> {
         .build()
         .fuse();
 
-    // Combine both - logs go to terminal AND file
     let drain = slog::Duplicate::new(term_drain, json_drain).fuse();
 
-    // Wrap in Arc for thread-safe sharing across Tokio tasks
-    // slog_async makes it non-blocking
     let async_drain = slog_async::Async::new(drain).chan_size(1024).build();
 
     Ok(Logger::root(Arc::new(async_drain).fuse(), o!()))
 }
 
-/// Run `f` until it succeeds or `max_attempts` attempts have been made.
+/// Runs `f` until it succeeds or `max_attempts` calls have been made.
 ///
 /// `max_attempts` counts total attempts, not retries after the first one:
-/// `retry_async(3, ..)` calls `f` at most three times. The ranking service's
-/// Python `retry_on_db_error` uses the opposite convention, so this name is
-/// deliberately explicit.
+/// `retry_async(3, ..)` calls `f` at most three times. The delay between
+/// attempts is a flat 500ms, which suits a restarted connection but not a
+/// genuinely overloaded database.
 pub async fn retry_async<F, Fut, T, E>(max_attempts: usize, mut f: F) -> Result<T, E>
 where
     F: FnMut() -> Fut,
@@ -72,7 +66,9 @@ where
     }
 }
 
-/// Synchronous counterpart of [`retry_async`]; `max_attempts` counts attempts.
+/// Blocking twin of [`retry_async`], with the same total-attempt counting.
+///
+/// It sleeps the calling thread, so use it only from startup and test paths.
 pub fn retry_sync<F, T, E>(max_attempts: usize, mut f: F) -> Result<T, E>
 where
     F: FnMut() -> Result<T, E>,
@@ -91,7 +87,6 @@ where
                 if attempts >= max_attempts {
                     return Err(err);
                 }
-                // Uses standard synchronous sleep
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
         }
@@ -132,7 +127,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn retry_async_attempts_exactly_max_attempts_then_propagates() {
-        // The naming contract: max_attempts counts total attempts, not retries.
         for max_attempts in 1..=4usize {
             let calls = Cell::new(0);
             let result: Result<u8, &str> = retry_async(max_attempts, || {
@@ -161,8 +155,6 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(calls.get(), 3);
-        // Two retries means two backoff sleeps; tokio's paused clock makes this
-        // instant, but the loop must still have completed rather than hung.
     }
 
     #[tokio::test(start_paused = true)]
@@ -205,7 +197,6 @@ mod tests {
 
     #[test]
     fn retry_sync_attempts_count_is_stable_across_repeated_calls() {
-        // Guards against state leaking between invocations of the same closure.
         let calls = Cell::new(0);
         for _ in 0..3 {
             let result = retry_sync(3, || {

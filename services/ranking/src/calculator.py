@@ -5,30 +5,13 @@ from psql import DatabaseManager, retry_on_db_error
 
 logger = logging.getLogger(__name__)
 
-# Recompute IDF for every word that appears on at least one page.
+# Recomputes IDF for every word in one statement.
 #
-# Three things matter here, and all three were wrong before:
-#
-#   * The ratio must be computed in numeric, not integer arithmetic. `pages.id`
-#     and the `df` count are both bigint, so `378 / 352` truncated to 1 and
-#     LOG(1) is 0 -- every common word was stored with an IDF of exactly zero.
-#   * The logarithm argument must never be below 1, or the result is negative.
-#     A word appearing on *every* page has n/df == 1, and a word on every page
-#     except one has n/df slightly above 1 while n/(df+1) is slightly below it,
-#     so the smoothed form pushed those words negative. The engine multiplies tf
-#     by idf, so a negative weight does not merely fail to help -- it actively
-#     subtracts from a page's score, and a word present in all N documents is
-#     the definition of one that carries no information. GREATEST(..., 1) floors
-#     the ratio, which makes "appears in nearly every page" score 0 rather than
-#     a penalty.
-#   * The argument must never be exactly 0, or LOG raises "cannot take
-#     logarithm of zero" -- a non-retryable error that takes the whole pipeline
-#     down on an empty corpus. GREATEST(COUNT(*), 1) floors the corpus size so
-#     the statement degrades to "every word is maximally rare" instead.
-#
-# Note on the base: PostgreSQL's LOG() is base 10, not natural. Either is a
-# valid IDF; log10 is what has always been stored here, and switching bases is a
-# reindex, not a fix. The tests pin the base so a change is deliberate.
+# Two GREATEST guards matter. The inner one keeps df >= 1, and the outer one
+# clamps the ratio at 1 so IDF never goes negative: a word appearing on every
+# page has n/df == 1, which gives idf = 0 and makes the term contribute nothing,
+# while rounding could otherwise push it below zero. Corpus size is clamped to at
+# least 1 for the same reason -- an empty corpus would divide by zero.
 IDF_UPDATE_SQL = """
     WITH corpus AS (
         SELECT GREATEST(COUNT(*), 1)::numeric AS n
@@ -48,18 +31,27 @@ IDF_UPDATE_SQL = """
     WHERE words.id = df.word_id
 """
 
+# PageRank lives in a PL/pgSQL function because the iteration is inherently
+# recursive: each pass ranks pages from the previous pass's scores. Doing it in
+# Python would mean holding the whole graph in memory and round-tripping once per
+# iteration.
 PAGERANK_UPDATE_SQL = "SELECT update_page_rank(%s, %s);"
 
 
 class RankingCalculator:
-    """Handles IDF and PageRank computation algorithms against PostgreSQL."""
+    """Runs the two periodic scoring jobs.
+
+    Both jobs rewrite the whole table in one statement and take the full corpus
+    lock while they do, so they are meant to run on a timer and be cheap to skip
+    rather than tuned for throughput.
+    """
 
     def __init__(self, db_manager: DatabaseManager):
         self.db_manager = db_manager
 
     @retry_on_db_error(max_retries=3, delay=1.0, backoff=2.0)
     async def compute_idf(self) -> int:
-        """Compute and update IDF (Inverse Document Frequency) values in the database."""
+        """Recompute IDF for every word. Returns the number of words updated."""
         start_time = time.time()
         logger.info("Starting IDF calculation...")
 
@@ -84,7 +76,12 @@ class RankingCalculator:
     async def update_pagerank(
         self, iterations: int = 20, damping_factor: float = 0.85
     ) -> int:
-        """Execute PL/pgSQL function to calculate and update PageRank values."""
+        """Recompute PageRank. Returns the number of pages updated.
+
+        ``iterations`` is the iteration count and ``damping_factor`` the
+        probability of following a link (0.85 is Google's original value). More
+        iterations converge but cost time linearly.
+        """
         start_time = time.time()
         logger.info("Starting PageRank calculation...")
 
@@ -111,7 +108,12 @@ class RankingCalculator:
     async def run_pipeline(
         self, iterations: int = 20, damping_factor: float = 0.85
     ) -> None:
-        """Run full ranking pipeline: IDF and PageRank concurrently."""
+        """Run both jobs concurrently on separate pooled connections.
+
+        gather runs them at the same time but does not make them atomic: a
+        failure in one leaves the other's work committed. Each job is a full
+        table rewrite, so a partial run is still internally consistent.
+        """
         logger.info("Executing full ranking pipeline (IDF + PageRank)...")
         await asyncio.gather(
             self.compute_idf(),

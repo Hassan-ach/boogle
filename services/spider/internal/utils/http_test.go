@@ -12,18 +12,6 @@ import (
 	"time"
 )
 
-// GetReq is one HTTP exchange. Everything in this file is about the contract that
-// replaced the retry loop, because that loop's tests described a behaviour that
-// has deliberately been deleted: a helper that knew nothing about the host could
-// only answer "yes, always, three times", inside a sleep, holding a worker slot.
-
-// TestGetReqMakesExactlyOneRequest is the property the whole change rests on.
-//
-// The old GetReq took a retry count and a delay and looped. The retry is now the
-// delayed set: a failed fetch is parked with a due time computed from the host's
-// own backoff schedule, and returns from the next crawl. So one call is one
-// request, and the test that pins it is the one that would have failed against the
-// loop for every retry count above one.
 func TestGetReqMakesExactlyOneRequest(t *testing.T) {
 	for _, status := range []int{http.StatusOK, http.StatusServiceUnavailable, http.StatusTooManyRequests} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
@@ -44,12 +32,6 @@ func TestGetReqMakesExactlyOneRequest(t *testing.T) {
 	}
 }
 
-// TestGetReqReportsAFailedStatusWithoutAnError is the other half of the contract.
-//
-// A 503 is not a transport failure and returning an error for it would force
-// every caller to reconstruct the status from the error text. The status is the
-// server's answer and it arrives on the Response; the error is for the cases where
-// there was no answer at all.
 func TestGetReqReportsAFailedStatusWithoutAnError(t *testing.T) {
 	for _, status := range []int{http.StatusNotFound, http.StatusForbidden, http.StatusServiceUnavailable} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
@@ -69,7 +51,6 @@ func TestGetReqReportsAFailedStatusWithoutAnError(t *testing.T) {
 	}
 }
 
-// TestGetReqReturnsTheBodyAndStatus is the plain case.
 func TestGetReqReturnsTheBodyAndStatus(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -96,9 +77,6 @@ func TestGetReqReturnsTheBodyAndStatus(t *testing.T) {
 	}
 }
 
-// TestGetReqSendsCrawlerHeaders is load-bearing rather than cosmetic: a large
-// share of sites serve a degraded interstitial to anything obviously automated,
-// and a crawler that indexes the interstitial indexes the interstitial.
 func TestGetReqSendsCrawlerHeaders(t *testing.T) {
 	var gotUA, gotAccept, gotLang string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -123,11 +101,6 @@ func TestGetReqSendsCrawlerHeaders(t *testing.T) {
 	}
 }
 
-// TestGetReqUsesTheStatedUserAgent covers the reason UserAgent is an option rather
-// than a constant. The crawler has to answer to the same name in robots.txt that
-// it sends on the wire: a site that writes "Disallow: /" for our name and does not
-// match it against what we actually send is a site we crawl against its
-// instructions, and the mismatch is invisible from either side alone.
 func TestGetReqUsesTheStatedUserAgent(t *testing.T) {
 	var gotUA string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -145,8 +118,6 @@ func TestGetReqUsesTheStatedUserAgent(t *testing.T) {
 }
 
 func TestGetReqRejectsAMalformedURL(t *testing.T) {
-	// No request is even attempted; the caller needs to know the URL is bad
-	// rather than that the network is down.
 	res, err := GetReq(context.Background(), http.DefaultClient, "://not a url", GetOptions{})
 	if err == nil {
 		t.Fatal("expected an error for a malformed URL")
@@ -160,8 +131,6 @@ func TestGetReqRejectsAMalformedURL(t *testing.T) {
 }
 
 func TestGetReqRequiresAClient(t *testing.T) {
-	// A nil client would panic inside the transport. A clear error is better, and
-	// a panic here would take down a crawl worker over a wiring mistake.
 	res, err := GetReq(context.Background(), nil, "https://example.com", GetOptions{})
 	if err == nil {
 		t.Fatal("expected an error for a nil client")
@@ -171,9 +140,6 @@ func TestGetReqRequiresAClient(t *testing.T) {
 	}
 }
 
-// TestGetReqHonoursCancellation is why the context is a parameter. A crawl that is
-// shutting down, or a URL whose host has just been marked dead, has to be able to
-// stop the request in flight rather than wait out the client timeout.
 func TestGetReqHonoursCancellation(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -201,9 +167,6 @@ func TestGetReqHonoursCancellation(t *testing.T) {
 }
 
 func TestGetReqReportsConnectionFailures(t *testing.T) {
-	// Port 0 on the loopback interface is closed; the transport fails before any
-	// HTTP status exists. The distinction matters: a caller cannot decide between
-	// "the host is gone" and "the site said 503" without it.
 	res, err := GetReq(context.Background(), http.DefaultClient, "http://127.0.0.1:0/", GetOptions{})
 	if err == nil {
 		t.Fatal("expected an error for an unreachable host")
@@ -216,15 +179,9 @@ func TestGetReqReportsConnectionFailures(t *testing.T) {
 	}
 }
 
-// ── redirects ─────────────────────────────────────────────────────────────────
-
-// redirectChain serves a self-referential chain of 302s, so a test can ask for
-// exactly as many hops as it wants.
 func redirectChain(t *testing.T, hops int) (*httptest.Server, *atomic.Int32) {
 	t.Helper()
 	var hits atomic.Int32
-	// Declared before the handler so the closure can read it: the Location header
-	// has to be absolute, and only the server knows its own address.
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := hits.Add(1)
@@ -239,13 +196,6 @@ func redirectChain(t *testing.T, hops int) (*httptest.Server, *atomic.Int32) {
 	return srv, &hits
 }
 
-// TestGetReqStopsAtTheRedirectLimit pins both halves of the limit: no more requests
-// are made, and the count reports that the chain was cut rather than finished.
-//
-// The count is one past the number actually followed on purpose. If it were the
-// number followed, a caller could not tell "stopped at the limit" from "finished
-// the chain" -- both would read as the limit -- and a redirect loop would be
-// indistinguishable from a long but legitimate chain.
 func TestGetReqStopsAtTheRedirectLimit(t *testing.T) {
 	const limit = 3
 	srv, hits := redirectChain(t, 20)
@@ -289,17 +239,9 @@ func TestGetReqFollowsAChainUnderTheLimit(t *testing.T) {
 	}
 }
 
-// TestGetReqLeavesTheCallersRedirectPolicyAlone guards the client copy.
-//
-// The spider's client is shared with the robots fetcher and every other caller.
-// Installing a redirect policy on it would change their behaviour too, and the
-// failure would be invisible from here -- one component quietly deciding the
-// redirect rules for the whole process.
 func TestGetReqLeavesTheCallersRedirectPolicyAlone(t *testing.T) {
 	sentinel := errors.New("caller policy")
 
-	// A fresh chain per assertion: the counter is what decides where the chain
-	// ends, so reusing one would let the first call decide the second's outcome.
 	t.Run("a stated limit takes precedence", func(t *testing.T) {
 		srv, hits := redirectChain(t, 1)
 		client := srv.Client()
@@ -313,8 +255,6 @@ func TestGetReqLeavesTheCallersRedirectPolicyAlone(t *testing.T) {
 		}
 	})
 
-	// With no limit, the caller's policy is still the one in force, which is only
-	// possible if GetReq did not overwrite the field on the shared client.
 	t.Run("no limit leaves the caller's policy in force", func(t *testing.T) {
 		srv, _ := redirectChain(t, 1)
 		client := srv.Client()
@@ -326,15 +266,6 @@ func TestGetReqLeavesTheCallersRedirectPolicyAlone(t *testing.T) {
 	})
 }
 
-// ── body size limit ───────────────────────────────────────────────────────────
-
-// TestGetReqReportsATruncatedBodyAsTruncated is the reason one byte past the cap
-// is read.
-//
-// Truncation has to be distinguishable from a body that happened to end at the cap.
-// A page cut in half still parses as HTML, and indexing half a page poisons every
-// term frequency on it -- so the caller needs BytesRead to be a fact rather than a
-// guess.
 func TestGetReqReportsATruncatedBodyAsTruncated(t *testing.T) {
 	const cap = 4096
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -373,11 +304,6 @@ func TestGetReqAcceptsAResponseAtExactlyTheLimit(t *testing.T) {
 	}
 }
 
-// TestGetReqFallsBackToThePackageCap covers a zero MaxBytes.
-//
-// There is deliberately no "unlimited" option: an unbounded read is a way to make
-// a crawler hold memory until it dies, and a crawler pointed at the wrong URL will
-// do exactly that.
 func TestGetReqFallsBackToThePackageCap(t *testing.T) {
 	for _, stated := range []int{0, -1} {
 		t.Run(fmt.Sprintf("MaxBytes=%d", stated), func(t *testing.T) {
@@ -397,9 +323,6 @@ func TestGetReqFallsBackToThePackageCap(t *testing.T) {
 	}
 }
 
-// TestGetReqDefaultCapStillBoundsTheRead checks the fallback is a real bound rather
-// than a no-op. A small body is used so the assertion is about the fact that the
-// read completed rather than about a specific size.
 func TestGetReqDefaultCapIsUsed(t *testing.T) {
 	if MaxResponseBytes <= 0 {
 		t.Fatal("MaxResponseBytes must be positive; it is the last bound on a read")
@@ -418,15 +341,11 @@ func TestGetReqDefaultCapIsUsed(t *testing.T) {
 	}
 }
 
-// TestGetReqNilContextDoesNotPanic. The context is a required parameter and Go's
-// nil-context convention says do not pass one, but the function is on a crawl's
-// hot path and a panic here costs a worker.
 func TestGetReqNilContextDoesNotPanic(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer srv.Close()
 
-	//nolint:staticcheck // deliberately violating the convention to pin the handling
-	res, err := GetReq(nil, srv.Client(), srv.URL, GetOptions{}) //nolint:staticcheck
+	res, err := GetReq(nil, srv.Client(), srv.URL, GetOptions{})
 	if err != nil {
 		t.Fatalf("GetReq with a nil context: %v", err)
 	}
@@ -435,9 +354,6 @@ func TestGetReqNilContextDoesNotPanic(t *testing.T) {
 	}
 }
 
-// TestGetReqUsesAControlledDeadline shows the client's own timeout still applies
-// through the copy. A copy that dropped Timeout would turn a client configured with
-// one into a client that waits for ever.
 func TestGetReqUsesAControlledDeadline(t *testing.T) {
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

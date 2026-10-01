@@ -80,7 +80,6 @@ func getIcon(page *model.Page) string {
 }
 
 func getDomain(u string) string {
-    // Simple domain extraction
     ur, err := url.Parse(u)
     if err == nil && ur.Host != "" {
         return strings.TrimPrefix(ur.Host, "www.")

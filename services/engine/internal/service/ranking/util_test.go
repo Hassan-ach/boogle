@@ -11,9 +11,9 @@ import (
 
 func TestDocVector(t *testing.T) {
 	wordMapper := util.NewWordMapper()
-	wordMapper.MapValue("search") // index 0
-	wordMapper.MapValue("engine") // index 1
-	wordMapper.MapValue("go")     // index 2
+	wordMapper.MapValue("search")
+	wordMapper.MapValue("engine")
+	wordMapper.MapValue("go")
 
 	wordIdf := map[string]float64{
 		"search": 1.5,
@@ -30,7 +30,7 @@ func TestDocVector(t *testing.T) {
 
 	vec := docVector(page, wordIdf, wordMapper, 3)
 
-	expected := []float64{3.0, 0.0, 3.0} // search: 2*1.5=3.0, engine: 0, go: 1*3.0=3.0
+	expected := []float64{3.0, 0.0, 3.0}
 
 	if len(vec) != len(expected) {
 		t.Fatalf("expected vector length %d, got %d", len(expected), len(vec))
@@ -45,8 +45,8 @@ func TestDocVector(t *testing.T) {
 
 func TestQueryVector(t *testing.T) {
 	wordMapper := util.NewWordMapper()
-	wordMapper.MapValue("search") // index 0
-	wordMapper.MapValue("engine") // index 1
+	wordMapper.MapValue("search")
+	wordMapper.MapValue("engine")
 
 	wordIdf := map[string]float64{
 		"search": 1.5,
@@ -57,9 +57,6 @@ func TestQueryVector(t *testing.T) {
 
 	vec := queryVector(query, wordIdf, wordMapper)
 
-	// "search" tf=2, idf=1.5 => 3.0
-	// "engine" tf=1, idf=2.0 => 2.0
-	// len(query) is 3, so output vector length is N = len(query) = 3
 	expected := []float64{3.0, 2.0, 0.0}
 
 	if len(vec) != len(expected) {
@@ -78,9 +75,6 @@ func TestSort(t *testing.T) {
 		page1 := &model.Page{ID: uuid.New(), URL: "https://a.com", PRScore: 0.8}
 		page2 := &model.Page{ID: uuid.New(), URL: "https://b.com", PRScore: 0.2}
 
-		// factor = 0.5
-		// page1: 0.5 * 0.2 + 0.5 * 0.8 = 0.5
-		// page2: 0.5 * 0.9 + 0.5 * 0.2 = 0.55
 		pages := map[*model.Page]float64{
 			page1: 0.2,
 			page2: 0.9,
@@ -118,7 +112,6 @@ func TestSort(t *testing.T) {
 			Words:   map[string]int{"a": 1, "b": 2, "c": 3},
 		}
 
-		// Both pages have identical TF-IDF (0.5) and PRScore (0.5) -> identical GlobalScore 0.5
 		pages := map[*model.Page]float64{
 			page1: 0.5,
 			page2: 0.5,
@@ -164,7 +157,6 @@ func TestSort(t *testing.T) {
 			t.Fatalf("expected 2 sorted pages, got %d", len(sorted))
 		}
 
-		// Title "AAA Title" < "ZZZ Title" => comparison returns 1 => ZZZ is sorted before AAA
 		if sorted[0].MetaData.Title != "ZZZ Title" {
 			t.Errorf("expected 'ZZZ Title' first based on sort order logic, got '%s'", sorted[0].MetaData.Title)
 		}

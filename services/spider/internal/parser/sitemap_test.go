@@ -11,8 +11,6 @@ import (
 	"testing"
 )
 
-// ── parseSitemap ─────────────────────────────────────────────────────────────
-
 func TestParseSitemapReadsLocElements(t *testing.T) {
 	doc := `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
@@ -36,9 +34,6 @@ func TestParseSitemapReadsLocElements(t *testing.T) {
 }
 
 func TestParseSitemapAcceptsANamespacedDocument(t *testing.T) {
-	// The namespace is what real sitemaps use, and Go's decoder is lenient
-	// about it either way. A regression here would make every real sitemap
-	// parse to zero URLs.
 	doc := `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
         xmlns:xhtml="http://www.w3.org/1999/xhtml">
@@ -68,8 +63,6 @@ func TestParseSitemapOnAnEmptySitemap(t *testing.T) {
 }
 
 func TestParseSitemapRejectsMalformedXML(t *testing.T) {
-	// A truncated sitemap is the common real-world case, and it must be an
-	// error rather than a silent zero-URL result.
 	for name, doc := range map[string]string{
 		"unclosed tag":    `<urlset><url><loc>https://example.com/a</urlset>`,
 		"not xml at all":  `{"this": "is json"}`,
@@ -85,10 +78,6 @@ func TestParseSitemapRejectsMalformedXML(t *testing.T) {
 	}
 }
 
-// TestParseSitemapOnAnHTMLErrorPage covers a server that answers a sitemap
-// request with a 200 and a soft-404 page. The document is well-formed XML, so
-// it parses without error -- it just has no <url> elements. The requirement is
-// that this yields no URLs rather than a confusing XML error.
 func TestParseSitemapOnAnHTMLErrorPage(t *testing.T) {
 	got, err := parseSitemap([]byte(`<html><body>404 Not Found</body></html>`))
 	if err != nil {
@@ -100,8 +89,6 @@ func TestParseSitemapOnAnHTMLErrorPage(t *testing.T) {
 }
 
 func TestParseSitemapDoesNotFollowExternalEntities(t *testing.T) {
-	// A sitemap is fetched from a host the crawler does not control, so a
-	// billion-laughs or XXE payload must not be expanded.
 	doc := `<?xml version="1.0"?>
 <!DOCTYPE lolz [
  <!ENTITY lol "lol">
@@ -111,7 +98,6 @@ func TestParseSitemapDoesNotFollowExternalEntities(t *testing.T) {
 
 	got, err := parseSitemap([]byte(doc))
 	if err != nil {
-		// Rejecting outright is fine. What must not happen is expansion.
 		return
 	}
 	for _, entry := range got.Urls {
@@ -121,13 +107,6 @@ func TestParseSitemapDoesNotFollowExternalEntities(t *testing.T) {
 	}
 }
 
-// TestURlParseNoLongerPanics is the regression test for the dead method.
-//
-// `func (u u) Parse(raw string) (any, error) { panic("unimplemented") }` was
-// never called, so it compiled cleanly and sat there looking like a working
-// entry point. The moment anything reached for it -- a future refactor, a new
-// caller wiring the type up -- it would take the process down instead of
-// returning an error.
 func TestUrlEntryParseNoLongerPanics(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -147,8 +126,6 @@ func TestUrlEntryParseNoLongerPanics(t *testing.T) {
 		t.Errorf("error = %v, want it to say the method is unimplemented", err)
 	}
 }
-
-// ── fetchSitemap ─────────────────────────────────────────────────────────────
 
 func sitemapServer(t *testing.T, body string, status int) (*httptest.Server, *atomic.Int32) {
 	t.Helper()
@@ -204,7 +181,6 @@ func TestFetchSitemapDefaultsToHTTPSForASchemelessURL(t *testing.T) {
 	srv, _ := sitemapServer(t, `<urlset><url><loc>https://example.com/a</loc></url></urlset>`, http.StatusOK)
 
 	host, _ := url.Parse("https://example.com")
-	// Pass just the host and path, no scheme.
 	got, err := fetchSitemap(context.Background(), srv.Client(), strings.TrimPrefix(srv.URL, "http://"), host)
 	if err == nil {
 		t.Fatalf("expected an error: the rewritten URL points at https on a plain-HTTP test server; got %v", got)
@@ -249,18 +225,6 @@ func TestFetchSitemapReportsAMalformedDocument(t *testing.T) {
 	}
 }
 
-// TestFetchSitemapSkipsUnusableLocsRatherThanFailingTheWholeSitemap is the
-// behavioural requirement: a sitemap with one junk entry is extremely common,
-// and returning an error made the spider discard every good URL in it.
-//
-// What counts as unusable has narrowed, and that is the change worth pinning. It
-// used to mean "did not canonicalise, or matched a skip rule" -- so a /login entry
-// and a .pdf entry were dropped here, silently, with nothing recorded about either.
-// Now it means only "is not a URL at all": a relative loc is resolved against the
-// advertising host, and /login and skipme.pdf are returned for the policy manager
-// to refuse with a reason attached. A sitemap is the one place a site states its
-// own inventory, so discarding its entries without a word is the worst possible
-// place to be deciding they do not exist.
 func TestFetchSitemapSkipsUnusableLocsRatherThanFailingTheWholeSitemap(t *testing.T) {
 	srv, _ := sitemapServer(t, `<urlset>
   <url><loc>https://example.com/good-one</loc></url>
@@ -278,10 +242,6 @@ func TestFetchSitemapSkipsUnusableLocsRatherThanFailingTheWholeSitemap(t *testin
 		t.Fatalf("fetchSitemap() error: %v; one bad loc must not discard the sitemap", err)
 	}
 
-	// The two unusable ones -- a bare fragment and an empty loc -- are gone. The
-	// empty loc is skipped by the explicit check before parsing; the fragment by
-	// canonicalisation, which rejects anything starting with "#" because there is
-	// no document to refer to. The malformed one cannot be parsed at all.
 	want := []string{
 		"https://example.com/good-one",
 		"https://example.com/login",
@@ -298,8 +258,6 @@ func TestFetchSitemapSkipsUnusableLocsRatherThanFailingTheWholeSitemap(t *testin
 	}
 }
 
-// ── FetchSitemaps ────────────────────────────────────────────────────────────
-
 func TestFetchSitemapsCombinesEverySource(t *testing.T) {
 	first, _ := sitemapServer(t, `<urlset><url><loc>https://example.com/a</loc></url></urlset>`, http.StatusOK)
 	second, _ := sitemapServer(t, `<urlset><url><loc>https://example.com/b</loc></url></urlset>`, http.StatusOK)
@@ -313,7 +271,6 @@ func TestFetchSitemapsCombinesEverySource(t *testing.T) {
 }
 
 func TestFetchSitemapsSkipsASourceThatFails(t *testing.T) {
-	// A crawler must not lose every sitemap because one host is down.
 	ok, _ := sitemapServer(t, `<urlset><url><loc>https://example.com/good</loc></url></urlset>`, http.StatusOK)
 	bad, _ := sitemapServer(t, "unavailable", http.StatusInternalServerError)
 
@@ -342,8 +299,6 @@ func TestFetchSitemapsWhenEverySourceFails(t *testing.T) {
 }
 
 func TestFetchSitemapsIsDeterministic(t *testing.T) {
-	// The result seeds the crawl frontier, so an order that varies per call
-	// makes the crawl irreproducible.
 	var idx atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		i := idx.Add(1)

@@ -46,13 +46,11 @@ func (h *SimpleTextHandler) Handle(_ context.Context, r slog.Record) error {
 	level := r.Level.String()
 	msg := r.Message
 
-	// include handler's stored attrs first
 	var attrStr strings.Builder
 	for _, a := range h.attrs {
 		fmt.Fprintf(&attrStr, " %s=%v", a.Key, a.Value)
 	}
 
-	// then record's attrs
 	r.Attrs(func(a slog.Attr) bool {
 		fmt.Fprintf(&attrStr, " %s=%v", a.Key, a.Value)
 		return true
@@ -65,7 +63,6 @@ func (h *SimpleTextHandler) Handle(_ context.Context, r slog.Record) error {
 }
 
 func (h *SimpleTextHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	// create new handler with merged attrs
 	newAttrs := make([]slog.Attr, len(h.attrs)+len(attrs))
 	copy(newAttrs, h.attrs)
 	copy(newAttrs[len(h.attrs):], attrs)
@@ -91,27 +88,17 @@ func NewMultiLogger(fileName string) *Logger {
 	return &Logger{logger, file}
 }
 
-// Close releases the log file, if this Logger has one.
 func (l *Logger) Close() {
 	if l.file != nil {
 		_ = l.file.Close()
 	}
 }
 
-// NewDiscardLogger returns a Logger that throws everything away.
-//
-// For tests, and for any caller that has no log file. It exists because the only
-// other constructor opens a file and log.Fatals if it cannot -- so a test could not
-// build a Logger at all without a writable path, and every component that takes one
-// would be untestable rather than merely noisy.
-//
-// It returns without an open file, which is why Close tolerates one.
 func NewDiscardLogger() *Logger {
 	return &Logger{Logger: slog.New(slog.DiscardHandler)}
 }
 
 func (m MultiHandler) Enabled(ctx context.Context, l slog.Level) bool {
-	//
 	for _, h := range m.handlers {
 		if !h.Enabled(ctx, l) {
 			return false

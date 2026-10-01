@@ -1,41 +1,23 @@
-// Package policy owns every decision the spider makes about what to crawl.
-//
-// It exists because those decisions were previously scattered across the crawl
-// loop, the URL normalizer, the HTTP helper and the store, and because of that
-// several of them were not made at all. The crawl-delay from robots.txt was
-// parsed, stored, and then never read. MaxPages and PagesCrawled were written
-// and never compared. The Allow rules were parsed and discarded. A dead domain
-// re-fetched its robots.txt for every URL it owned, forever, because the failure
-// was never recorded.
-//
-// The split is: utils answers "what URL is this?" and policy answers "should we
-// crawl it?". Nothing outside this package decides whether a URL is fetched.
-//
-// State lives entirely in Redis. That is a deliberate trade -- a flush costs a
-// re-crawl -- and it carries an obligation: every failure path here fails
-// *closed*. A Redis error returns Defer or Skip, never Allow. An unreachable
-// cache must stop the crawl, not blind it.
 package policy
 
 import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Hassan-ach/boogle/services/spider/internal/entity"
 )
 
-// VerdictKind is the answer to "may I crawl this URL right now".
 type VerdictKind int
 
 const (
-	// Allow: crawl it now.
+	// Allow is the zero value, so a Verdict whose Kind was never set permits
+	// the URL. Fail-open on purpose: a missing verdict must not stall a crawl.
 	Allow VerdictKind = iota
-	// Defer: not now, but not never. The URL goes into the delayed set with a
-	// due time and comes back on its own. This is the verdict for a host that is
-	// merely cooling down -- refusing permanently would strand every URL on it.
 	Defer
-	// Skip: permanently uninteresting. The URL is marked visited so the frontier
-	// stops handing it out. Terminal, and only correct for decisions that will
-	// not change: a dead host, an exhausted budget, a robots exclusion.
 	Skip
 )
 
@@ -51,34 +33,23 @@ func (k VerdictKind) String() string {
 	return "unknown"
 }
 
-// Verdict is a crawl decision plus the reason for it.
-//
-// The reason is not decoration. Once a host goes cold or a domain is marked
-// dead, the only useful question is why, and a bare enum leaves that
-// unanswerable. Reasons are counted per host in the stats hash so "what is this
-// crawler refusing, and how much" is a question with an answer.
+// Verdict is the policy manager's answer for one URL: Allow releases it now,
+// Defer parks it until Until, Skip retires it for good. The Reason rides along
+// so the state layer can count refusals without re-deriving them.
 type Verdict struct {
 	Kind   VerdictKind
 	Reason Reason
-	// Host is the resolved host metadata, or nil when the host was never
-	// resolved (a malformed URL, or a host whose robots.txt could not be had).
-	Host *entity.Host
-	// Until is set for Defer only: when the URL becomes eligible again. A Defer
-	// with a zero Until would mean "later, but when?", which is a deadlock.
-	Until time.Time
+	Host   *entity.Host
+	Until  time.Time
 }
 
-// ActionKind is the answer to "what does this fetch outcome mean".
 type ActionKind int
 
 const (
-	// ActSuccess: counters reset, links extracted, URL left the frontier for
-	// good.
+	// ActSuccess is the zero value, so an unpopulated Action reports success
+	// and clears the backoff rather than penalising a URL.
 	ActSuccess ActionKind = iota
-	// ActBackoff: transient. Requeue into the delayed set with a due time and
-	// increment the host's failure counters.
 	ActBackoff
-	// ActPermanent: a dead end. Mark visited and never look at it again.
 	ActPermanent
 )
 
@@ -94,50 +65,30 @@ func (k ActionKind) String() string {
 	return "unknown"
 }
 
-// Action is what to do with a completed fetch.
+// Action records a completed fetch: ActSuccess clears the backoff, ActBackoff
+// schedules a retry, ActPermanent gives up on the URL.
 type Action struct {
-	Kind   ActionKind
-	Reason Reason
-	// RetryAfter is set for ActBackoff only.
+	Kind       ActionKind
+	Reason     Reason
 	RetryAfter time.Duration
 }
 
-// Outcome is everything observed about one fetch. The transport fills it in and
-// Classify reads it.
-//
-// Fields exist for the failure modes a status code cannot express: a redirect
-// loop, a truncated body, a PDF served with a 200. Before this existed every one
-// of those was reported as "no error" and the page went into the index.
+// Outcome is what a fetch actually produced. Classification reads only these
+// fields, so the Fetcher can be swapped without touching the policy tables.
 type Outcome struct {
-	// StatusCode is 0 when no response was ever received -- a dial, TLS or DNS
-	// failure. A non-zero StatusCode is the server's definitive answer and takes
-	// precedence over Err.
-	StatusCode int
-	// Err is the transport error, if any. Nil on a completed response even when
-	// the status was an error: a 404 is not a transport failure.
-	Err error
-	// ContentType is the response media type, used to reject non-HTML bodies
-	// that arrived with a 200.
+	StatusCode  int
+	Err         error
 	ContentType string
-	// BytesRead is how much of the body was actually read. Compared against
-	// MaxResponseBytes to spot a body that was cut off at the cap.
-	BytesRead int
-	// Redirects counts hops followed.
-	Redirects int
-	// FinalURL is where the chain ended, after redirects.
-	FinalURL string
+	BytesRead   int
+	Redirects   int
+	FinalURL    string
 }
 
-// Reason is a bounded machine-readable explanation. Precise error text is not
-// here -- it goes in the URL state hash, which has room for it -- so that this
-// stays a small enumerable set that can be counted per host.
 type Reason string
 
 const (
-	// Allow reasons.
 	ReasonOK Reason = "ok"
 
-	// Admit reasons.
 	ReasonVisited                 Reason = "visited"
 	ReasonMalformedURL            Reason = "malformed_url"
 	ReasonNonHTTPScheme           Reason = "non_http_scheme"
@@ -155,7 +106,6 @@ const (
 	ReasonPolicyUnavailable       Reason = "policy_unavailable"
 	ReasonRobotsUnreachableReason Reason = "robots_unreachable"
 
-	// Classify reasons.
 	ReasonFetchOK             Reason = "fetch_ok"
 	ReasonNotFound            Reason = "not_found"
 	ReasonGone                Reason = "gone"
@@ -172,47 +122,21 @@ const (
 	ReasonBodyTooLarge        Reason = "body_too_large"
 	ReasonContentTypeRejected Reason = "content_type_unsupported"
 	ReasonAttemptsExhausted   Reason = "attempts_exhausted"
-	// ReasonBodyUnparseable is a page that fetched perfectly and could not be
-	// turned into a page. It is its own reason rather than folded into
-	// content_type_unsupported because the two call for opposite responses: a
-	// site serving PDFs with a 200 is a site whose robots.txt or content type is
-	// wrong, while a body that will not parse is usually our own parser meeting
-	// markup it does not handle, and the fix for that one is on this side.
-	//
-	// It used to have no reason at all. Parse failures were reported as fetch
-	// failures, so a page that downloaded and then failed to parse was
-	// indistinguishable in the logs from one whose host was gone.
-	ReasonBodyUnparseable Reason = "body_unparseable"
+	ReasonBodyUnparseable     Reason = "body_unparseable"
 )
 
-// Backoff configuration. The schedules in backoff.go are pure functions of a
-// counter and this struct; nothing here reaches Redis, which is what makes them
-// testable without a database.
 type BackoffConfig struct {
-	// DeadHostBase is the first dead-host TTL. Each consecutive connection-level
-	// failure doubles it.
-	DeadHostBase time.Duration
-	// DeadHostMaxExp caps the doubling exponent. 6 with a 60s base tops out at
-	// 64 minutes; without a cap a long outage would push a host out for weeks.
+	DeadHostBase   time.Duration
 	DeadHostMaxExp int
-	// DeadProbeAfter is how long a URL is parked after its host was marked dead.
-	// It is the earliest the host could be probed again, so it must be at least
-	// DEAD_HOST_BASE or the TTL would expire before the URL returns.
 	DeadProbeAfter time.Duration
 
-	// HostCooldownBase is the first degraded-host cooldown, floored by whatever
-	// Crawl-delay robots.txt asked for.
-	HostCooldownBase time.Duration
-	// HostCooldownMaxExp caps the degraded-host doubling.
+	HostCooldownBase   time.Duration
 	HostCooldownMaxExp int
 
-	// URLBackoffBase is the first per-URL retry delay.
 	URLBackoffBase time.Duration
-	// URLBackoffMax clamps the per-URL doubling.
-	URLBackoffMax time.Duration
+	URLBackoffMax  time.Duration
 }
 
-// DefaultBackoffConfig returns the values in the plan's §9.
 func DefaultBackoffConfig() BackoffConfig {
 	return BackoffConfig{
 		DeadHostBase:       60 * time.Second,
@@ -225,91 +149,36 @@ func DefaultBackoffConfig() BackoffConfig {
 	}
 }
 
-// Config is everything the policy manager is tunable with. It is a plain struct
-// with no behaviour so that a test can construct one literal, and so that
-// loading it from the environment stays a separate, testable concern.
 type Config struct {
 	BackoffConfig
 
-	// RedisPrefix namespaces every key this package writes.
-	//
-	// It is configurable so that two spiders -- a production one and a test
-	// crawl against the same Redis -- do not share a visited set. If they did,
-	// the test crawl would silently do nothing: every URL it discovered would
-	// look already-visited to the other spider's record, and vice versa.
-	//
-	// The trailing colon is added by the keyspace, not stored here, so that
-	// "boogle:spider" and "boogle:spider:" are one namespace rather than two
-	// that differ by an invisible character.
 	RedisPrefix string
 
-	// UserAgent is the name the crawler answers to in robots.txt groups and the
-	// token it matches rules against.
-	//
-	// It matters more than it looks. The standard matches a group's agent token as
-	// a case-insensitive substring of the crawler's user-agent string, so a site
-	// that writes "User-agent: BoogleBot" and disallows everything addresses us
-	// directly -- and a mismatch here means we index the one site that asked us
-	// not to. A bare name is expanded into a full header value; a value that
-	// already looks like one is sent as written.
 	UserAgent string
 
-	// Rules is the set of skip tables the manager consults. A zero value means
-	// DefaultRules, so a caller building a Config literal gets the shipped
-	// rules rather than none.
 	Rules RuleSet
 
-	// MaxPagesPerHost is the page budget for one host *per window*. See
-	// AdmitBudget: a host that exhausts it goes cold, and its counter resets
-	// when the cold period ends. Treating it as a lifetime cap would mean the
-	// host re-cools the instant it wakes and is never crawled again.
 	MaxPagesPerHost int
 
-	// URLMaxAttempts is how many times one URL is fetched before it is given up
-	// on. Distinct from a host's failure count: a URL that 404s is not a host
-	// having a bad day, and a host that times out once has not made every one of
-	// its URLs unfetchable.
 	URLMaxAttempts int
 
-	// HostColdPeriod is how long an exhausted host stays cold.
 	HostColdPeriod time.Duration
 
-	// MinCrawlDelay is a floor applied to whatever Crawl-delay robots.txt
-	// declares. A robots.txt asking for zero, or omitting the directive, must
-	// not mean "no delay" -- that is how a crawler earns a ban.
 	MinCrawlDelay time.Duration
 
-	// RobotsTTL is how long a fetched robots.txt is trusted before being
-	// re-read. Rules change; an hour-old copy is a reasonable compromise
-	// between respecting a change promptly and re-fetching per URL.
 	RobotsTTL time.Duration
 
-	// URLStateTTL is how long per-URL retry bookkeeping survives. Abandoned
-	// state has to expire on its own or a long crawl accumulates one hash per
-	// URL it ever touched.
 	URLStateTTL time.Duration
 
-	// FrontierPopBatch is how many frontier entries one pop may examine while
-	// looking for an unvisited one. This is a *scan budget*, not a retry count,
-	// and the old REDIS_MAX_RETRY conflated the two.
 	FrontierPopBatch int
 
-	// DelayedPromoteBatch caps one promote pass. Kept modest because the script
-	// passes the promoted set to ZREM through Lua's unpack, which is bounded by
-	// the Lua stack; the caller loops until a pass comes back short.
 	DelayedPromoteBatch int
 
-	// MaxRedirects is the longest redirect chain worth following.
 	MaxRedirects int
 
-	// MaxBodyBytes is the largest response body worth reading. A body that
-	// reached this size is treated as truncated and the page is dropped, since
-	// indexing half a page poisons every term frequency on it.
 	MaxBodyBytes int
 }
 
-// DefaultConfig returns the plan's §9 defaults. Every field has a value, so a
-// Config built this way behaves correctly with no environment set at all.
 func DefaultConfig() Config {
 	return Config{
 		BackoffConfig:       DefaultBackoffConfig(),
@@ -327,4 +196,184 @@ func DefaultConfig() Config {
 		MaxRedirects:        10,
 		MaxBodyBytes:        10 << 20,
 	}
+}
+
+func (c BackoffConfig) DeadHostTTL(attempts int) time.Duration {
+	return scale(c.DeadHostBase, attempts, c.DeadHostMaxExp)
+}
+
+func (c BackoffConfig) HostCooldown(attempts int, crawlDelay time.Duration) time.Duration {
+	floor := c.HostCooldownBase
+	if crawlDelay > floor {
+		floor = crawlDelay
+	}
+	return scale(floor, attempts, c.HostCooldownMaxExp)
+}
+
+func (c BackoffConfig) URLBackoff(attempt int) time.Duration {
+	d := scale(c.URLBackoffBase, attempt, -1)
+	if c.URLBackoffMax > 0 && d > c.URLBackoffMax {
+		return c.URLBackoffMax
+	}
+	return d
+}
+
+func scale(base time.Duration, n, maxExp int) time.Duration {
+	if base <= 0 {
+		base = time.Second
+	}
+	if n < 0 {
+		n = 0
+	}
+	if maxExp >= 0 && n > maxExp {
+		n = maxExp
+	}
+	// 62 is the largest shift that keeps base << n inside int64; shifting a
+	// duration by 63 sets the sign bit, which the overflow check below catches.
+	const maxShift = 62
+	if n > maxShift {
+		n = maxShift
+	}
+	d := base << uint(n)
+	if d <= 0 {
+		return time.Duration(1<<62 - 1)
+	}
+	return d
+}
+
+var (
+	errMemoryClosed  = errors.New("state is closed")
+	errEmptyHost     = errors.New("empty host")
+	errUnknownMarker = errors.New("unknown marker kind")
+)
+
+// PolicyManager holds every crawl decision the spider makes: whether a URL may
+// be fetched, how a host is feeling, and what a finished fetch did to the state.
+// It owns policy but not persistence -- the State it is handed does that, so the
+// same logic runs against Redis in production and MemoryState in tests.
+type PolicyManager struct {
+	cfg             Config
+	state           State
+	log             *slog.Logger
+	now             func() time.Time
+	fetchRobots     RobotsFetcher
+	fetch           Fetcher
+	fetchClient     *http.Client
+	resolveSiteMaps SiteMapResolver
+}
+
+// New builds a PolicyManager over the given state. The returned manager is a
+// value that the With* methods copy, so a caller can derive a manager with a
+// different clock or fetcher without disturbing the original.
+func New(cfg Config, state State, logger *slog.Logger) *PolicyManager {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	fetchClient := &http.Client{Timeout: defaultFetchTimeout}
+	return &PolicyManager{
+		cfg:   cfg,
+		state: state,
+		log:   logger,
+		now:   time.Now,
+		fetchRobots: newHTTPRobotsFetcher(
+			nil, defaultUserAgent(cfg)),
+		fetch:       NewHTTPFetcher(fetchClient, cfg),
+		fetchClient: fetchClient,
+	}
+}
+
+// A bare token such as "BoogleBot" is not a usable UA: robots.txt parsers
+// expect "product/version (contact)". Append a contact unless the configured
+// value already carries one.
+func defaultUserAgent(cfg Config) string {
+	ua := strings.TrimSpace(cfg.UserAgent)
+	if ua == "" {
+		return defaultBotUserAgent
+	}
+	if strings.ContainsAny(ua, "/ \t") {
+		return ua
+	}
+	return ua + "/1.0 (+https://boogle.example/bot)"
+}
+
+const defaultBotUserAgent = "BoogleBot"
+
+func (m *PolicyManager) WithClock(now func() time.Time) *PolicyManager {
+	cp := *m
+	if now != nil {
+		cp.now = now
+	}
+	return &cp
+}
+
+func (m *PolicyManager) Config() Config { return m.cfg }
+
+func (m *PolicyManager) Now() time.Time { return m.now() }
+
+func (m *PolicyManager) WithConfig(cfg Config) *PolicyManager {
+	cp := *m
+	cp.cfg = cfg
+	if m.fetchClient != nil {
+		cp.fetch = NewHTTPFetcher(m.fetchClient, cfg)
+	}
+	return &cp
+}
+
+func (m *PolicyManager) State() State { return m.state }
+
+func (m *PolicyManager) refuse(ctx context.Context, host, url string, kind VerdictKind, reason Reason, until time.Time) (*Verdict, error) {
+	if err := m.state.CountReason(ctx, host, reason); err != nil {
+		m.log.Warn("could not record refusal reason",
+			"host", host, "url", url, "reason", reason, "error", err)
+	}
+	return &Verdict{Kind: kind, Reason: reason, Until: until}, nil
+}
+
+func (m *PolicyManager) unavailable(ctx context.Context, host, url string, err error) (*Verdict, error) {
+	m.log.Error("policy state unavailable, refusing to crawl blind",
+		"host", host, "url", url, "error", err)
+	return m.refuse(ctx, host, url, Defer, ReasonPolicyUnavailable,
+		m.now().Add(m.cfg.URLBackoff(1)))
+}
+
+// hostGate applies the host-level gates in severity order: dead, cold, then
+// cooling down. Markers are checked before any further work because they are the
+// cheapest possible refusal -- one read, no policy evaluation.
+func (m *PolicyManager) hostGate(ctx context.Context, host string) (HostState, *Verdict, error) {
+	markers, err := m.state.Markers(ctx, host)
+	if err != nil {
+		v, verr := m.unavailable(ctx, host, "", err)
+		return HostState{}, v, verr
+	}
+
+	if ttl, ok := markers[MarkerDead]; ok {
+		return HostState{}, &Verdict{
+			Kind:   Skip,
+			Reason: ReasonHostDead,
+			Until:  m.now().Add(ttl),
+		}, nil
+	}
+
+	if ttl, ok := markers[MarkerCold]; ok {
+		return HostState{}, &Verdict{
+			Kind:   Skip,
+			Reason: ReasonHostCold,
+			Until:  m.now().Add(ttl),
+		}, nil
+	}
+
+	if ttl, ok := markers[MarkerCooldown]; ok {
+		return HostState{}, &Verdict{
+			Kind:   Defer,
+			Reason: ReasonHostCoolingDown,
+			Until:  m.now().Add(ttl),
+		}, nil
+	}
+
+	st, err := m.state.HostState(ctx, host)
+	if err != nil {
+		v, verr := m.unavailable(ctx, host, "", err)
+		return HostState{}, v, verr
+	}
+	return st, nil, nil
 }

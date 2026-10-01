@@ -29,13 +29,10 @@ async fn main() -> Result<(), AppError> {
 
     let token = tokio_util::sync::CancellationToken::new();
 
-    // Start the indexer loop in the background
     let indexer_handle = tokio::spawn(Arc::clone(&indx).start(token.clone()));
 
-    // Start the sweep loop in the background
     let sweep_handle = tokio::spawn(Arc::clone(&indx).sweep_loop(token.clone()));
 
-    // Spawn a task to listen for Ctrl-C signal and cancel the token when received
     let log_clone = log.clone();
     let token_clone = token.clone();
     let sig_handle = tokio::spawn(async move {
@@ -47,7 +44,6 @@ async fn main() -> Result<(), AppError> {
         }
     });
 
-    // wait for signal handler to complete (which happens after Ctrl-C is received)
     tokio::select! {
         _ = sig_handle => {
             info!(log, "Signal handler task completed");
@@ -57,11 +53,8 @@ async fn main() -> Result<(), AppError> {
         }
     }
 
-    // Ensure the cancellation token is active if the indexer exited first
     token.cancel();
 
-    // Wait for the consumer loop to stop. The Consumer is kept alive here: dropping
-    // it closes its lapin channel, which would break acks from workers still draining.
     let consumer = match indexer_handle.await {
         Ok(Ok(consumer)) => consumer,
         Ok(Err(err)) => {
@@ -78,7 +71,6 @@ async fn main() -> Result<(), AppError> {
         process::exit(1);
     }
 
-    // wait for all indexer tasks to complete, but with a timeout to prevent hanging indefinitely
     match timeout(std::time::Duration::from_secs(30), async {
         let mut tasks = indx.tasks.lock().await;
         while let Some(result) = tasks.join_next().await {
@@ -100,7 +92,6 @@ async fn main() -> Result<(), AppError> {
         }
     }
 
-    // Release the consumer only after every worker has acked or nacked.
     drop(consumer);
 
     info!(log, "Indexer service shutting down");

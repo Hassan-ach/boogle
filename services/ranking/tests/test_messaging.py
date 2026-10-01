@@ -1,12 +1,3 @@
-"""Threshold trigger logic in `MessagingService`.
-
-The service is told "the indexer finished N pages, go rank" once every
-`max_indexer_pages` confirmations. Getting that counter wrong does not crash
-anything -- ranking just silently stops happening -- so the interesting cases
-are all about *when the counter is reset*, which is why they are driven
-through `record_confirmation` rather than a live broker.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -35,7 +26,6 @@ def make_service(max_indexer_pages: int = 3) -> MessagingService:
 
 
 class Gate:
-    """A handler that blocks until the test releases it."""
 
     def __init__(self) -> None:
         self.calls = 0
@@ -49,12 +39,8 @@ class Gate:
 
 
 async def settle() -> None:
-    """Let spawned pipeline tasks run until they are waiting or finished."""
     for _ in range(5):
         await asyncio.sleep(0)
-
-
-# ── configuration ────────────────────────────────────────────────────────────
 
 
 def test_queue_name_defaults_to_the_indexer_confirmation_queue() -> None:
@@ -106,9 +92,6 @@ def test_credentials_default_when_nothing_is_configured() -> None:
     assert service.broker_url == "amqp://admin:admin@localhost:5672"
 
 
-# ── threshold counting ───────────────────────────────────────────────────────
-
-
 async def test_no_pipeline_runs_below_the_threshold() -> None:
     service = make_service(max_indexer_pages=3)
     gate = Gate()
@@ -145,7 +128,6 @@ async def test_counter_resets_after_a_run_completes() -> None:
     await settle()
     assert gate.calls == 1
 
-    # The next two confirmations must be enough again, not four.
     service.record_confirmation()
     service.record_confirmation()
     await settle()
@@ -154,13 +136,6 @@ async def test_counter_resets_after_a_run_completes() -> None:
 
 
 async def test_a_trigger_that_lands_mid_run_is_not_discarded() -> None:
-    """Regression: the counter used to be reset before the lock was checked.
-
-    The trigger was consumed, the pipeline task saw the lock held and returned
-    without doing anything, and the 100 accumulated pages were never ranked.
-    Since a full pipeline takes much longer than 100 pages take to arrive, this
-    meant ranking effectively never ran again after the first success.
-    """
     service = make_service(max_indexer_pages=2)
     gate = Gate()
     service.register_pipeline_handler(gate)
@@ -171,14 +146,12 @@ async def test_a_trigger_that_lands_mid_run_is_not_discarded() -> None:
     await gate.started.wait()
     assert gate.calls == 1
 
-    # A second batch arrives while the first run is still in flight.
     service.record_confirmation()
     service.record_confirmation()
     await settle()
 
     assert gate.calls == 1, "the second run must wait for the lock, not be lost"
 
-    # The first run finishes; the pending threshold must then fire.
     gate.release.set()
     for _ in range(20):
         await asyncio.sleep(0.01)
@@ -189,7 +162,6 @@ async def test_a_trigger_that_lands_mid_run_is_not_discarded() -> None:
 
 
 async def test_extra_confirmations_while_busy_do_not_queue_many_runs() -> None:
-    """Only one follow-up run should be pending, not one per confirmation."""
     service = make_service(max_indexer_pages=2)
     gate = Gate()
     service.register_pipeline_handler(gate)
@@ -234,9 +206,6 @@ async def test_registering_a_handler_after_the_threshold_still_runs() -> None:
     assert gate.calls == 1
 
 
-# ── error containment ────────────────────────────────────────────────────────
-
-
 async def test_a_failing_pipeline_does_not_kill_the_consumer() -> None:
     calls = 0
 
@@ -252,7 +221,6 @@ async def test_a_failing_pipeline_does_not_kill_the_consumer() -> None:
     await settle()
     assert calls == 1
 
-    # The lock must be released, so a later run is still possible.
     assert not service._job_lock.locked()
     assert not service._pipeline_running
 
@@ -262,11 +230,6 @@ async def test_a_failing_pipeline_does_not_kill_the_consumer() -> None:
 
 
 async def test_a_failing_pipeline_still_consumes_its_batch() -> None:
-    """The pages were counted; re-running the same batch immediately would spin.
-
-    A failure is reported through the log, not through a retry loop here, so the
-    counter is still reset and the next threshold starts a fresh batch.
-    """
     calls = 0
 
     async def exploding() -> None:
@@ -294,7 +257,6 @@ async def test_pipeline_is_a_no_op_without_a_handler() -> None:
 
 
 async def test_concurrent_triggers_never_run_two_pipelines_at_once() -> None:
-    """The lock, not the counter, is what guarantees a single concurrent run."""
     service = make_service(max_indexer_pages=1)
     running = 0
     peak = 0
@@ -314,9 +276,6 @@ async def test_concurrent_triggers_never_run_two_pipelines_at_once() -> None:
     await asyncio.sleep(0.05)
 
     assert peak == 1, f"observed {peak} concurrent pipelines"
-
-
-# ── publishing ───────────────────────────────────────────────────────────────
 
 
 async def test_publish_targets_the_confirmation_queue_by_default(monkeypatch) -> None:

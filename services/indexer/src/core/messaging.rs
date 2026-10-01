@@ -33,9 +33,6 @@ pub struct RabbitMQ {
 mod tests {
     use super::*;
 
-    /// The spider service (Go) publishes `{"page_id":"<uuid>"}`. If this shape
-    /// drifts, the indexer rejects every job with a serde error and the crawl
-    /// silently stops indexing, so the wire format is pinned here.
     const SPIDER_PAYLOAD: &str = r#"{"page_id":"6f8c3c3c-1b1a-4b2e-9f3d-2c4e5f6a7b8c"}"#;
 
     #[test]
@@ -65,8 +62,6 @@ mod tests {
 
     #[test]
     fn job_uses_the_same_wire_shape_as_index_confirmation() {
-        // Both messages cross a service boundary, so they must stay compatible
-        // with the Go producer.
         let id = uuid::Uuid::new_v4();
         assert_eq!(
             serde_json::to_string(&Job { page_id: id }).unwrap(),
@@ -99,7 +94,6 @@ mod tests {
 
     #[test]
     fn extra_fields_are_tolerated() {
-        // Forward compatibility: a newer producer must not break this consumer.
         let payload = r#"{"page_id":"6f8c3c3c-1b1a-4b2e-9f3d-2c4e5f6a7b8c","attempt":2}"#;
         let job: Job = serde_json::from_str(payload).unwrap();
         assert!(!job.page_id.is_nil());
@@ -179,7 +173,7 @@ impl RabbitMQ {
             Ok(ch) => ch,
             Err(err) => {
                 error!(self.log.as_ref(), "Failed to create channel"; "err" => %err);
-                return self.ch.clone(); // Return the existing channel if creation fails
+                return self.ch.clone();
             }
         };
 
@@ -266,7 +260,7 @@ impl MessagingQueue for RabbitMQ {
         };
 
         match conf.await? {
-            Confirmation::Ack(None) => {} // routed, persisted
+            Confirmation::Ack(None) => {}
             Confirmation::Ack(Some(m)) | Confirmation::Nack(Some(m)) => {
                 return Err(AppError::Messaging(MessagingError::PublishError(format!(
                     "Message was not routed to a queue: reply code: {}, reply text: {}",
@@ -278,7 +272,7 @@ impl MessagingQueue for RabbitMQ {
                     "Message was not acknowledged by the broker".to_string(),
                 )));
             }
-            Confirmation::NotRequested => { /* confirms not enabled — shouldn't happen here */ }
+            Confirmation::NotRequested => {}
         }
         Ok(())
     }

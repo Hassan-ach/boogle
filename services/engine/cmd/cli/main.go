@@ -31,10 +31,6 @@ func main() {
 	}
 	store := store.NewStore(conf.Store)
 
-	// speller, err := service.NewAspellSpellingService()
-	// if err != nil {
-	// 	panic("failed to initialize speller: " + err.Error())
-	// }
 	speller := mockSpeller{}
 
 	ranker := ranking.NewRankingService(conf.Ranker)

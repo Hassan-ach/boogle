@@ -12,6 +12,11 @@ use html5ever::{
     tendril::{StrTendril, TendrilSink},
 };
 
+/// Extracts word frequencies from an HTML document.
+///
+/// A `TreeSink` is used rather than a string-stripping pass because the tokenizer
+/// alone reveals where text is actually separated: stripping tags would join the
+/// words either side of a `<div>` into one.
 pub fn parse(html: String) -> Result<HashMap<String, u32>, Error> {
     parse_document(TextSink::new(), Default::default())
         .from_utf8()
@@ -25,22 +30,14 @@ enum Node {
 
 type Handle = Rc<Node>;
 
+/// A `TreeSink` that keeps only the word counts and discards the tree it is fed.
+///
+/// `words` is the result. `pending` and `boundary` exist only to rejoin words the
+/// tokenizer split; see `process_text`.
 #[derive(Debug)]
 struct TextSink {
     words: RefCell<HashMap<String, u32>>,
-    /// Trailing token that may continue into the next chunk of text.
-    ///
-    /// The HTML tokenizer emits one long text run as several `append` calls and
-    /// a word can straddle that seam. Without carrying the fragment over,
-    /// "word" is indexed as "w" + "ord" and the index fills with non-words.
     pending: RefCell<String>,
-    /// True when an element was created since the last text `append`.
-    ///
-    /// That is the only reliable boundary signal: `pop` never fires for
-    /// implicitly-closed elements such as `<p>`, and sibling elements can be
-    /// allocated at the same address, so neither can be used here. Carrying a
-    /// token across an element boundary would fuse "alpha" and "beta" from two
-    /// paragraphs into the single unusable token "alphabeta".
     boundary: Cell<bool>,
     doc: Handle,
 }
@@ -55,6 +52,11 @@ impl TextSink {
         }
     }
 
+    /// Counts one whitespace-delimited token.
+    ///
+    /// Punctuation is trimmed first, then the token is dropped unless it is
+    /// entirely alphabetic: the index stores words, so numbers and identifiers
+    /// such as `utf8` would otherwise become their own low-value entries.
     fn ingest(words: &mut HashMap<String, u32>, raw_word: &str) {
         let word = raw_word.trim_matches(is_word_punctuation);
 
@@ -71,11 +73,19 @@ impl TextSink {
         *words.entry(word).or_insert(0) += 1;
     }
 
+    /// Feeds one chunk of character data, keeping any partial trailing word in
+    /// `pending`.
+    ///
+    /// html5ever delivers text in chunks that can fall anywhere, including in the
+    /// middle of a word: `<b>ex</b>ample` arrives as two chunks. Without `pending`
+    /// that would be indexed as "ex" and "ample", so the trailing partial word is
+    /// held back until more text or a boundary confirms it.
+    ///
+    /// `boundary` records that a non-text node intervened. Without it, text on
+    /// either side of a `<div>` would be concatenated into one bogus word.
     fn process_text(&self, text: &str) {
         let mut pending = self.pending.borrow_mut();
 
-        // An element was opened since the last run, so the pending token can
-        // never be continued and must be emitted on its own.
         if self.boundary.get() {
             self.boundary.set(false);
             if !pending.is_empty() {
@@ -87,8 +97,6 @@ impl TextSink {
 
         let combined = std::mem::take(&mut *pending) + text;
 
-        // Only tokens followed by whitespace (or the end of the document) are
-        // complete; the trailing run is held back for the next chunk.
         let (processable, carry) = if combined.is_empty() || combined.ends_with(char::is_whitespace)
         {
             (combined.as_str(), String::new())
@@ -143,8 +151,6 @@ impl TreeSink for TextSink {
     }
 
     fn create_element(&self, name: QualName, _: Vec<Attribute>, _: ElementFlags) -> Self::Handle {
-        // An element boundary means the next text run is a different text node,
-        // so any pending token must be completed now.
         self.boundary.set(true);
         Handle::new(Node::Element(name))
     }
@@ -319,7 +325,6 @@ mod tests {
 
     #[test]
     fn drops_tokens_containing_non_alphabetic_characters() {
-        // Interior punctuation is not trimmed, so these are rejected wholesale.
         let words = words_of("<body>keep drop1 drop-me keep</body>");
         assert_eq!(words.get("keep"), Some(&2));
         assert!(!words.contains_key("drop1"), "digits must be rejected");
@@ -362,7 +367,6 @@ mod tests {
 
     #[test]
     fn survives_malformed_html() {
-        // Unclosed tags must not panic or lose the surrounding text.
         let words = words_of("<body><p>alpha<div><span>beta");
         assert_eq!(words.get("alpha"), Some(&1));
         assert_eq!(words.get("beta"), Some(&1));
@@ -383,8 +387,6 @@ mod tests {
 
     #[test]
     fn words_spanning_tokenizer_chunks_are_not_fragmented() {
-        // The tokenizer splits long text runs. A word straddling a boundary must
-        // survive intact rather than becoming fragments like "w" + "ord".
         for n in [1usize, 500, 2_000, 10_000, 20_000] {
             let body = "word ".repeat(n);
             let words = words_of(&format!("<body>{body}</body>"));
@@ -401,8 +403,6 @@ mod tests {
 
     #[test]
     fn text_runs_in_different_elements_stay_separate() {
-        // Adjacent elements must never fuse into one token: "alphabeta" would be
-        // unsearchable for both "alpha" and "beta".
         let words = words_of("<body><p>alpha</p><p>beta</p></body>");
         assert_eq!(words.get("alpha"), Some(&1), "got {:?}", words);
         assert_eq!(words.get("beta"), Some(&1), "got {:?}", words);
@@ -411,11 +411,6 @@ mod tests {
 
     #[test]
     fn inline_markup_produces_no_garbage_tokens() {
-        // Runs inside the same inline context may be carried together, but no
-        // token may be fabricated and nothing may be lost: every emitted token
-        // has to be a substring of the source text. Whether an inline-split word
-        // is rejoined is unknowable from the TreeSink API, and choosing to fuse
-        // instead would corrupt ordinary multi-paragraph pages.
         let source = "abcdef";
         let words = words_of("<body><p>ab<b>cd</b>ef</p></body>");
         assert!(!words.is_empty(), "text must not be dropped entirely");
@@ -443,8 +438,6 @@ mod tests {
 
     #[test]
     fn words_split_across_chunks_within_one_element_are_rejoined() {
-        // Long text runs are emitted as several appends by the tokenizer, and
-        // those chunks sit inside a single element, so they must be stitched.
         let long_run = "alpha beta gamma delta ".repeat(2_000);
         let words = words_of(&format!("<body><p>{long_run}</p></body>"));
         assert_eq!(words.get("alpha"), Some(&2_000));

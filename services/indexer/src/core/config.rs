@@ -146,8 +146,6 @@ mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    // Environment variables are process-global, so the tests that mutate them
-    // must not run concurrently.
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn env_lock() -> MutexGuard<'static, ()> {
@@ -157,9 +155,6 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Rust 2024 marks `set_var`/`remove_var` unsafe because they mutate
-    /// process-global state. Every caller holds `env_lock`, so no other thread
-    /// can be reading the environment concurrently.
     fn set_var(key: &str, value: &str) {
         unsafe { env::set_var(key, value) }
     }
@@ -168,8 +163,6 @@ mod tests {
         unsafe { env::remove_var(key) }
     }
 
-    /// Clear every variable these loaders read so each test starts from a known
-    /// state regardless of what the developer has exported.
     fn clear_env() {
         for key in [
             "LOG_PATH",
@@ -188,7 +181,6 @@ mod tests {
         ] {
             remove_var(key);
         }
-        // RABBITMQ_URL and DATABASE_URL are required; provide them by default.
         set_var("DATABASE_URL", "postgres://user:pass@localhost:5432/db");
         set_var("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/%2f");
     }
@@ -235,8 +227,6 @@ mod tests {
         let _guard = env_lock();
         clear_env();
 
-        // These use `.unwrap_or(...)` rather than `.expect(...)`, so bad input
-        // must degrade to the default instead of aborting startup.
         set_var("SWEEP_INTERVAL_SECONDS", "not-a-number");
         set_var("SWEEP_GRACE_SECONDS", "");
 
@@ -329,8 +319,6 @@ mod tests {
 
     #[test]
     fn queue_names_agree_between_app_and_rabbit_config() {
-        // The indexer consumes `app.queue_name` and the ranking service listens on
-        // `confirmation_queue_name`; a mismatch silently stops all ranking.
         let _guard = env_lock();
         clear_env();
         set_var("RABBITMQ_QUEUE", "a.jobs");

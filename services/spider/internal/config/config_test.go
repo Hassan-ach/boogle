@@ -8,24 +8,6 @@ import (
 	"github.com/Hassan-ach/boogle/services/spider/internal/policy"
 )
 
-// Every policy setting has to survive two cases: unset (which must give the
-// package default, not a zero) and set to something nonsensical (which must give
-// the default rather than being taken literally).
-//
-// The second case is the one that matters. A zero here is not an error, it is a
-// crawl that does nothing: a zero scan batch means the frontier is never examined,
-// a zero promote batch means retries are never released, and a zero page budget
-// means no host is ever crawled. All three look identical from the outside -- a
-// crawl that finished, having done nothing.
-
-// policyEnvVars is every environment variable loadPolicyConfig reads, with a value
-// that is unmistakably its own so a test can tell "read from the environment" from
-// "left at the default".
-//
-// Keeping it as one table rather than a test per variable is the point. The failure
-// this guards against is a Config field being added and never wired, which looks
-// exactly like a field added and wired: both compile, and only one of them is
-// reachable from a deployment.
 var policyEnvVars = []struct {
 	key  string
 	set  string
@@ -52,14 +34,8 @@ var policyEnvVars = []struct {
 	{"MAX_BODY_BYTES", "1048576", 1048576},
 }
 
-// deprecatedEnvVars are variables still read, but no longer as the name of a
-// setting. They are cleared alongside the real ones because a developer's shell is
-// as likely to have REDIS_MAX_RETRY set as FRONTIER_POP_BATCH, and a test that
-// inherited either would be testing the shell.
 var deprecatedEnvVars = []string{"REDIS_MAX_RETRY"}
 
-// clearPolicyEnv unsets everything loadPolicyConfig reads, so a test starts from a
-// known-empty environment rather than inheriting whatever the developer's shell has.
 func clearPolicyEnv(t *testing.T) {
 	t.Helper()
 	for _, v := range policyEnvVars {
@@ -97,14 +73,6 @@ func TestLoadPolicyConfigReadsTheEnvironment(t *testing.T) {
 	}
 }
 
-// policyEnvFields maps an environment variable onto the Config field it sets.
-//
-// Written as an explicit table rather than a naming convention because the mapping
-// is not derivable -- "HOST_COLD_PERIOD_SEC" is HostColdPeriod and
-// "SPIDER_REDIS_PREFIX" is RedisPrefix -- and a convention-based lookup would agree
-// with the wiring exactly when the wiring was wrong, which is the one case the test
-// exists for. A variable missing from this table makes TestLoadPolicyConfigReads-
-// TheEnvironment fail rather than being silently skipped.
 var policyEnvFields = map[string]string{
 	"SPIDER_REDIS_PREFIX":       "RedisPrefix",
 	"SPIDER_USER_AGENT":         "UserAgent",
@@ -127,9 +95,6 @@ var policyEnvFields = map[string]string{
 	"MAX_BODY_BYTES":            "MaxBodyBytes",
 }
 
-// configField returns one field of a policy.Config by name, failing the test if it
-// does not exist -- which is what happens when a field is renamed and the env table
-// is not, and it should be an error rather than a zero comparison.
 func configField(c policy.Config, name string) reflect.Value {
 	f := reflect.ValueOf(c).FieldByName(name)
 	if !f.IsValid() {
@@ -138,14 +103,6 @@ func configField(c policy.Config, name string) reflect.Value {
 	return f
 }
 
-// TestLoadPolicyConfigHasNoUnreachableField is the check that makes the table above
-// exhaustive by construction rather than by review.
-//
-// It walks every field of the loaded config and requires it to be non-zero. A
-// Config field that nothing reads is invisible in every other way: the struct
-// literal compiles, the field looks configured, and the only symptom is a setting
-// that quietly cannot be changed. RedisConfig.Delay was in exactly that state for
-// as long as the frontier pop loop existed.
 func TestLoadPolicyConfigHasNoUnreachableField(t *testing.T) {
 	clearPolicyEnv(t)
 
@@ -155,7 +112,7 @@ func TestLoadPolicyConfigHasNoUnreachableField(t *testing.T) {
 	for i := range tp.NumField() {
 		f := tp.Field(i)
 		if f.PkgPath != "" {
-			continue // unexported
+			continue
 		}
 		got := v.Field(i)
 		if got.IsZero() {
@@ -164,8 +121,6 @@ func TestLoadPolicyConfigHasNoUnreachableField(t *testing.T) {
 		}
 	}
 
-	// And the same for the embedded backoff config, which is reached through its
-	// own fields rather than through policy.Config.
 	bf := reflect.ValueOf(loadPolicyConfig().BackoffConfig)
 	for i := range bf.NumField() {
 		f := bf.Type().Field(i)
@@ -176,15 +131,6 @@ func TestLoadPolicyConfigHasNoUnreachableField(t *testing.T) {
 	}
 }
 
-// TestTheOldPopBudgetIsStillHonouredWhenTheNewNameIsNot is the deprecation, tested.
-//
-// REDIS_MAX_RETRY was renamed to FRONTIER_POP_BATCH, and a rename with no fallback
-// changes behaviour on the day it ships: every deployment that only ever set the
-// old name would silently drop to the default batch, which is a different crawl.
-// The fallback exists so the rename is invisible, and it is only invisible while
-// both are read -- which is the thing that can regress, since nothing else in the
-// tree mentions REDIS_MAX_RETRY any more and a later refactor would not know to
-// keep it.
 func TestTheOldPopBudgetIsStillHonouredWhenTheNewNameIsNot(t *testing.T) {
 	clearPolicyEnv(t)
 	t.Setenv("REDIS_MAX_RETRY", "7")
@@ -194,21 +140,12 @@ func TestTheOldPopBudgetIsStillHonouredWhenTheNewNameIsNot(t *testing.T) {
 			"rename that changes behaviour the day it ships is not a rename", got)
 	}
 
-	// And the new name wins when both are present, so an operator who migrates
-	// gets what they typed rather than a value the fallback insists on.
 	t.Setenv("FRONTIER_POP_BATCH", "3")
 	if got := loadPolicyConfig().FrontierPopBatch; got != 3 {
 		t.Errorf("with both set, FrontierPopBatch = %d, want 3 from FRONTIER_POP_BATCH", got)
 	}
 }
 
-// TestRedisConfigHasNoDeadFields is the check that a field cannot come back.
-//
-// RedisConfig carried Delay and MaxRetry, and neither was read by anything after
-// the pop loop moved into the policy manager. A field like that is worse than an
-// absent one: it is a lever that looks connected to nothing, and RedisConfig.Delay
-// is how the spider spent its life ignoring the Crawl-delay it parsed out of every
-// robots.txt it fetched.
 func TestRedisConfigHasNoDeadFields(t *testing.T) {
 	clearPolicyEnv(t)
 
@@ -219,7 +156,7 @@ func TestRedisConfigHasNoDeadFields(t *testing.T) {
 	for i := range tp.NumField() {
 		f := tp.Field(i)
 		if f.PkgPath != "" {
-			continue // unexported
+			continue
 		}
 		if !want[f.Name] {
 			t.Errorf("RedisConfig.%s is a field nothing reads; it will look like a "+
@@ -231,13 +168,6 @@ func TestRedisConfigHasNoDeadFields(t *testing.T) {
 	}
 }
 
-// TestLoadPolicyConfigRejectsUnusableDurations covers every duration variable,
-// since they are the ones where a bad value is silent rather than merely wrong.
-//
-// A zero TTL expires every URL's retry bookkeeping on the next read, which turns
-// the backoff off without any log line and without any error. A zero crawl delay
-// means no rate limiting at all, which is the polite way of saying the crawler
-// hammers a site that asked it to slow down.
 func TestLoadPolicyConfigRejectsUnusableDurations(t *testing.T) {
 	durationVars := []string{
 		"URL_STATE_TTL_SEC", "ROBOTS_TTL_SEC", "HOST_COLD_PERIOD_SEC",
@@ -261,14 +191,6 @@ func TestLoadPolicyConfigRejectsUnusableDurations(t *testing.T) {
 	}
 }
 
-// TestPolicyConfigDefaultsAreSelfConsistent checks the relationships between the
-// defaults rather than the values themselves.
-//
-// Two of these are not arbitrary. A dead-host base longer than the probe delay
-// would expire the marker before the URLs parked behind it came back, so a
-// recovered domain would be re-probed and its retries released against a host
-// still marked dead. And a URL backoff base longer than the maximum is a schedule
-// that never grows, which looks like exponential backoff and is not.
 func TestPolicyConfigDefaultsAreSelfConsistent(t *testing.T) {
 	c := policy.DefaultConfig()
 
@@ -285,8 +207,6 @@ func TestPolicyConfigDefaultsAreSelfConsistent(t *testing.T) {
 		t.Errorf("DeadHostMaxExp = %d, want at least 1", c.DeadHostMaxExp)
 	}
 	if c.DeadHostMaxExp > 20 {
-		// 2^20 seconds is over twelve days, which for a crawl that is supposed to
-		// re-probe a domain is indistinguishable from abandoning it.
 		t.Errorf("DeadHostMaxExp = %d; a dead host would be parked for over a week",
 			c.DeadHostMaxExp)
 	}

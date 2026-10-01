@@ -19,10 +19,6 @@ func newTestManager(t *testing.T) (*PolicyManager, *MemoryState) {
 	return New(DefaultConfig(), st, testLogger()), st
 }
 
-// newTestManagerAt is newTestManager with the manager and the state reading the
-// same fixed clock. They have to agree: the manager decides when a retry is due,
-// and the state stamps the entries it writes, so a manager running ahead of the
-// state promotes entries the state believes were written in the future.
 func newTestManagerAt(t *testing.T, now time.Time) (*PolicyManager, *MemoryState) {
 	t.Helper()
 	clock := func() time.Time { return now }
@@ -30,14 +26,6 @@ func newTestManagerAt(t *testing.T, now time.Time) (*PolicyManager, *MemoryState
 	return New(DefaultConfig(), st, testLogger()).WithClock(clock), st
 }
 
-// TestHostGateFailsClosed is the central safety property of the whole package.
-//
-// Redis holds the only record of what has been crawled. If an unreachable state
-// were read as "no state, carry on", the crawl would re-fetch every URL in the
-// frontier, ignore every cooldown and every dead marker, and do it at full
-// speed against hosts already known to be failing. So an error must never
-// produce Allow, and must never produce the terminal Skip either -- Defer is the
-// only safe answer, because the URL might be perfectly good once Redis is back.
 func TestHostGateFailsClosed(t *testing.T) {
 	boom := errors.New("redis is on fire")
 
@@ -52,8 +40,6 @@ func TestHostGateFailsClosed(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			m, st := newTestManager(t)
-			// Fail only the read the gate makes after markers, so the host-state
-			// path is exercised too.
 			st.FailWith = boom
 
 			_, verdict, err := m.hostGate(context.Background(), "example.com")
@@ -81,8 +67,6 @@ func TestHostGateFailsClosed(t *testing.T) {
 	}
 }
 
-// TestHostGateOrdering checks that markers are consulted before the state hash,
-// because the whole point of a dead marker is to answer without a second lookup.
 func TestHostGateOrdering(t *testing.T) {
 	t.Run("dead is decided without reading host state", func(t *testing.T) {
 		m, st := newTestManager(t)
@@ -91,9 +75,6 @@ func TestHostGateOrdering(t *testing.T) {
 		if err := st.SetMarker(ctx, "example.com", MarkerDead, time.Hour); err != nil {
 			t.Fatal(err)
 		}
-		// The marker read keeps working; only the host-state read behind it is
-		// broken. If the gate consulted the state hash first, this would come
-		// back as a refusal for the wrong reason -- or, worse, as an allow.
 		st.FailOn = map[string]error{"HostState": errors.New("should never be reached")}
 
 		state, verdict, err := m.hostGate(ctx, "example.com")
@@ -140,11 +121,6 @@ func TestHostGateOrdering(t *testing.T) {
 	})
 }
 
-// TestHostGateCooldownDefersRatherThanSkips is a distinction that costs a domain
-// if it is wrong. A cooldown means the host is answering, just not happily. The
-// natural-looking Skip would strand every URL on a host that recovers in ten
-// seconds, and a crawl that drops a tenth of a site because it hit one 503 is
-// not a crawl.
 func TestHostGateCooldownDefersRatherThanSkips(t *testing.T) {
 	m, st := newTestManager(t)
 	ctx := context.Background()
@@ -168,17 +144,11 @@ func TestHostGateCooldownDefersRatherThanSkips(t *testing.T) {
 	}
 }
 
-// TestHostGateDeadReportsWhenItExpires checks that a dead host says when it will
-// be probeable again. The parked URL has to come back after the marker, and the
-// marker has to be visible to whoever schedules that.
 func TestHostGateDeadReportsWhenItExpires(t *testing.T) {
 	m, st := newTestManager(t)
 	ctx := context.Background()
 
 	base := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
-	// Both clocks are pinned. The marker deadline is stored by the state and
-	// read back by the manager, so leaving either on real time makes the
-	// comparison a race against the wall clock rather than a check of anything.
 	m = m.WithClock(func() time.Time { return base })
 	st.SetClock(func() time.Time { return base })
 
@@ -195,10 +165,6 @@ func TestHostGateDeadReportsWhenItExpires(t *testing.T) {
 	}
 }
 
-// TestHostGateExaminesAMarkerIsExhausted is the property that makes a TTL key
-// work at all: once the deadline passes, the host is no longer gated and its
-// URLs flow again. This is the implicit probe, and without it a dead domain is
-// skipped for the rest of the crawl.
 func TestHostGateExaminesAMarkerIsExhausted(t *testing.T) {
 	m, st := newTestManager(t)
 	ctx := context.Background()
@@ -207,14 +173,12 @@ func TestHostGateExaminesAMarkerIsExhausted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Freshly marked: gated, and nothing is read past the marker.
 	if _, verdict, _ := m.hostGate(ctx, "example.com"); verdict == nil {
 		t.Fatal("a host with a live dead marker was not gated")
 	}
 
 	st.Advance(time.Minute)
 
-	// Expired: not gated, and the host flows again. This is the implicit probe.
 	st2, verdict, err := m.hostGate(ctx, "example.com")
 	if err != nil {
 		t.Fatal(err)
@@ -228,11 +192,6 @@ func TestHostGateExaminesAMarkerIsExhausted(t *testing.T) {
 	}
 }
 
-// TestSetMarkerDoesNotExtendAnExistingDeadline covers twenty workers deciding a
-// host is dead in the same second. With a plain SET each would push the expiry
-// out to its own "now plus ttl", so the marker would outlive the backoff
-// schedule the policy computed and a recovered host would stay dark for longer
-// than the policy says.
 func TestSetMarkerDoesNotExtendAnExistingDeadline(t *testing.T) {
 	_, st := newTestManager(t)
 	ctx := context.Background()
@@ -243,8 +202,6 @@ func TestSetMarkerDoesNotExtendAnExistingDeadline(t *testing.T) {
 	if err := st.SetMarker(ctx, "example.com", MarkerDead, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	// A second worker, ten seconds later, asking for a much longer marker
-	// because its failure count was higher.
 	st.Advance(10 * time.Second)
 	if err := st.SetMarker(ctx, "example.com", MarkerDead, time.Hour); err != nil {
 		t.Fatal(err)
@@ -261,8 +218,6 @@ func TestSetMarkerDoesNotExtendAnExistingDeadline(t *testing.T) {
 	}
 }
 
-// TestSetMarkerReplacesAnExpiredOne confirms NX does not make a marker
-// unraisable: once the old deadline passes, a new failure sets a fresh one.
 func TestSetMarkerReplacesAnExpiredOne(t *testing.T) {
 	_, st := newTestManager(t)
 	ctx := context.Background()
@@ -288,8 +243,6 @@ func TestSetMarkerWithNonPositiveTTLClears(t *testing.T) {
 	if err := st.SetMarker(ctx, "example.com", MarkerCooldown, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	// A zero TTL would create a key that vanishes immediately, which reads as
-	// "not set" and turns the decision into a silent no-op.
 	if err := st.SetMarker(ctx, "example.com", MarkerCooldown, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -299,9 +252,6 @@ func TestSetMarkerWithNonPositiveTTLClears(t *testing.T) {
 	}
 }
 
-// TestRefusalIsCounted is the observability payoff. Before this existed, a /login
-// or .pdf link vanished at extraction time with no record at all, so "how much
-// of this site are we declining and why" had no answer.
 func TestRefusalIsCounted(t *testing.T) {
 	m, st := newTestManager(t)
 	ctx := context.Background()
@@ -334,10 +284,6 @@ func TestRefusalIsCounted(t *testing.T) {
 	}
 }
 
-// TestCountingAFailureNeverBreaksARefusal checks the ordering. The counter is
-// observability; losing a count during a partial outage must not turn a correct
-// refusal into an error the caller retries, and retrying a refusal is exactly the
-// loop this package exists to stop.
 func TestCountingAFailureNeverBreaksARefusal(t *testing.T) {
 	m, st := newTestManager(t)
 	ctx := context.Background()
@@ -353,10 +299,6 @@ func TestCountingAFailureNeverBreaksARefusal(t *testing.T) {
 	}
 }
 
-// TestHostStateBudgetIsPerWindow is the semantic that a lifetime cap would get
-// wrong. If the counter never reset, a host that woke from its cold period would
-// find itself instantly over budget again and re-cool without ever being
-// crawled -- an infinite cold period that looks like a working limit.
 func TestHostStateBudgetIsPerWindow(t *testing.T) {
 	_, st := newTestManager(t)
 	ctx := context.Background()
@@ -380,7 +322,6 @@ func TestHostStateBudgetIsPerWindow(t *testing.T) {
 		t.Fatalf("budget not exhausted after %d pages: %+v", maxPages, state)
 	}
 
-	// The window closes and the next one starts.
 	if err := st.ResetWindow(ctx, "example.com", time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -394,10 +335,6 @@ func TestHostStateBudgetIsPerWindow(t *testing.T) {
 	}
 }
 
-// TestBudgetExhaustedPrefersTheLowerLimit covers the "robots may only lower the
-// global cap" rule. A host's own limit wins when it is lower, and never when it
-// is higher -- a hostile robots.txt must not be able to opt itself into an
-// unbounded crawl.
 func TestBudgetExhaustedPrefersTheLowerLimit(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -409,8 +346,6 @@ func TestBudgetExhaustedPrefersTheLowerLimit(t *testing.T) {
 		{"at the global cap", HostState{PagesCrawled: 10}, 10, true},
 		{"a lower host limit wins", HostState{PagesCrawled: 3, MaxPages: 3}, 10, true},
 		{"a higher host limit does not raise the cap", HostState{PagesCrawled: 10, MaxPages: 1000}, 10, true},
-		// A zero means "not configured", and reading it as an exhausted budget
-		// would make every host instantly cold.
 		{"no limits at all means no limit", HostState{PagesCrawled: 9999}, 0, false},
 		{"a zero host limit falls back to the global", HostState{PagesCrawled: 4, MaxPages: 0}, 3, true},
 	}
@@ -424,11 +359,6 @@ func TestBudgetExhaustedPrefersTheLowerLimit(t *testing.T) {
 	}
 }
 
-// TestFailuresCountAndReset drives the counter the backoff schedules read.
-//
-// A success is what clears it, which is the whole point: the count is a count of
-// *consecutive* failures, and a host that recovers has to stop paying for the
-// failures that made it recover.
 func TestFailuresCountAndReset(t *testing.T) {
 	_, st := newTestManager(t)
 	ctx := context.Background()
@@ -449,8 +379,6 @@ func TestFailuresCountAndReset(t *testing.T) {
 	if state.ConsecFailures != 0 {
 		t.Errorf("ConsecFailures = %d after a success, want 0", state.ConsecFailures)
 	}
-	// And a failure after the success starts from the first step again, rather
-	// than resuming at five.
 	got, err := st.RecordFailure(ctx, "example.com")
 	if err != nil {
 		t.Fatal(err)
@@ -460,8 +388,6 @@ func TestFailuresCountAndReset(t *testing.T) {
 	}
 }
 
-// TestURLAttemptsDriveThePerURLSchedule is the plumbing behind the per-page
-// backoff: the count classify reads has to be the count that was written.
 func TestURLAttemptsDriveThePerURLSchedule(t *testing.T) {
 	_, st := newTestManager(t)
 	ctx := context.Background()
@@ -494,9 +420,6 @@ func TestURLAttemptsDriveThePerURLSchedule(t *testing.T) {
 	}
 }
 
-// TestVisitedIsTerminal is what makes a Skip stick. A visited URL must never be
-// handed out again, and the whole point of skipping a dead host's URLs is that
-// the frontier stops producing them.
 func TestVisitedIsTerminal(t *testing.T) {
 	_, st := newTestManager(t)
 	ctx := context.Background()
@@ -514,9 +437,6 @@ func TestVisitedIsTerminal(t *testing.T) {
 	}
 }
 
-// TestMarkVisitedDropsEmptyURLs guards the set's integrity. An empty member
-// would match a URL that failed to parse, which is exactly the case the visited
-// set is supposed to exclude.
 func TestMarkVisitedDropsEmptyURLs(t *testing.T) {
 	_, st := newTestManager(t)
 	ctx := context.Background()
@@ -529,9 +449,6 @@ func TestMarkVisitedDropsEmptyURLs(t *testing.T) {
 	}
 }
 
-// TestEnqueuePriorityIsAnInlinkCount documents the frontier's scoring, because
-// ZPOPMAX takes the *highest* score and the sign of the increment is easy to get
-// backwards: a URL linked from many places should come out first.
 func TestEnqueuePriorityIsAnInlinkCount(t *testing.T) {
 	_, st := newTestManager(t)
 	ctx := context.Background()
@@ -542,7 +459,6 @@ func TestEnqueuePriorityIsAnInlinkCount(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// "common" is linked from three pages, the others from one each.
 	if err := st.Enqueue(ctx, "https://example.com/common", "https://example.com/common"); err != nil {
 		t.Fatal(err)
 	}
@@ -556,9 +472,6 @@ func TestEnqueuePriorityIsAnInlinkCount(t *testing.T) {
 	}
 }
 
-// TestWithClockDoesNotMutateTheOriginal keeps the test seam from leaking into
-// production behaviour: a copy is returned, so a manager that has been given a
-// fixed clock in one test cannot surprise another.
 func TestWithClockDoesNotMutateTheOriginal(t *testing.T) {
 	m, _ := newTestManager(t)
 	fixed := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -575,8 +488,6 @@ func TestWithClockDoesNotMutateTheOriginal(t *testing.T) {
 	}
 }
 
-// TestLogIsOptional keeps New usable without a configured logger, since a nil
-// slog.Logger would otherwise panic on the first refusal.
 func TestLogIsOptional(t *testing.T) {
 	st := NewMemoryState()
 	m := New(DefaultConfig(), st, nil)

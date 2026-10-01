@@ -13,6 +13,18 @@ logger = logging.getLogger(__name__)
 
 
 def retry_on_db_error(max_retries: int = 3, delay: float = 1.0, backoff: float = 2.0):
+    """Retry a coroutine when the database connection fails.
+
+    ``max_retries`` counts retries *after* the first attempt, so the default of 3
+    means four calls in total. This is the opposite of the indexer's Rust
+    ``retry_async``, whose ``max_attempts`` includes the first try; the two
+    services do not share a retry budget.
+
+    Only OperationalError and InterfaceError are retried. Those signal a broken
+    connection. Any other exception is raised immediately, because a bad query
+    will fail identically on every attempt.
+    """
+
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
@@ -45,7 +57,12 @@ def retry_on_db_error(max_retries: int = 3, delay: float = 1.0, backoff: float =
 
 
 class DatabaseManager:
-    """Manages PostgreSQL async connection pool lifecycle and connections using psycopg v3."""
+    """Owns the shared connection pool.
+
+    A single pool per process, shared by the IDF and PageRank jobs. Call
+    ``initialize`` once at startup before use; the pool is created unopened so
+    the constructor cannot block on the database.
+    """
 
     def __init__(
         self,
@@ -59,7 +76,6 @@ class DatabaseManager:
         self._pool: Optional[AsyncConnectionPool] = None
 
     async def initialize(self) -> None:
-        """Initialize and open the async connection pool."""
         if self._pool is not None:
             logger.warning("Connection pool is already initialized")
             return
@@ -93,7 +109,6 @@ class DatabaseManager:
             raise
 
     async def close(self) -> None:
-        """Close the async connection pool."""
         if self._pool is not None:
             await self._pool.close()
             self._pool = None
@@ -101,7 +116,12 @@ class DatabaseManager:
 
     @asynccontextmanager
     async def get_connection(self):
-        """Async context manager to get and return a connection from the pool."""
+        """Yield a connection and return it to the pool on exit.
+
+        Falls back to a direct connection when ``initialize`` was never called.
+        That fallback warns rather than raising: it keeps a caller that skipped
+        startup working, at the cost of a connection per call.
+        """
         if self._pool is None:
             logger.warning(
                 "Connection pool not initialized, creating direct connection"

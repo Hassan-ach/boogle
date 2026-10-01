@@ -1,22 +1,5 @@
 package store
 
-// Deterministic coverage for the row-reading loop, with no database involved.
-//
-// The only way to see a truncated result set through `database/sql` is a failure
-// that arrives *after* some rows have already been read, and provoking that
-// against a real Postgres means killing a connection mid-query and hoping. So the
-// driver is faked here instead: `faultyRows` hands back one good row and then
-// fails, which is exactly the shape of a connection dropped partway through a
-// large result set.
-//
-// This matters because of what it looked like. `Next` reports "no more rows" and
-// "the connection died" the same way -- false -- and the difference is only in
-// `Err`. The loop in `GetData` did not consult it, so a query cut short returned
-// a short page and no error at all: the user saw a normal-looking result list
-// with results missing from the end of it, and nothing anywhere recorded that the
-// query had been cut off. For a search engine that is the worst available failure
-// mode, because there is nothing to notice.
-
 import (
 	"context"
 	"database/sql"
@@ -32,15 +15,10 @@ import (
 	"github.com/google/uuid"
 )
 
-// A failure a real driver can produce mid-stream.
 var errStreamTruncated = errors.New("connection reset by peer")
 
-// ── a minimal database/sql driver that fails partway through a result set ────
-
 type faultyDriver struct {
-	rows int
-	// failAfter is how many rows are delivered before the stream breaks. A
-	// negative value means the stream never breaks.
+	rows      int
 	failAfter int
 }
 
@@ -59,7 +37,6 @@ func (c *faultyConn) Prepare(string) (driver.Stmt, error) {
 func (c *faultyConn) Close() error              { return nil }
 func (c *faultyConn) Begin() (driver.Tx, error) { return nil, errors.New("not implemented") }
 
-// QueryerContext lets `sql.DB` call straight through without preparing.
 func (c *faultyConn) QueryContext(
 	_ context.Context, _ string, _ []driver.NamedValue,
 ) (driver.Rows, error) {
@@ -73,7 +50,6 @@ type faultyRows struct {
 }
 
 func (r *faultyRows) Columns() []string {
-	// Must match the column list `GetData` scans.
 	return []string{"id", "url", "pr", "metadata", "word_count", "word_set"}
 }
 
@@ -81,7 +57,6 @@ func (r *faultyRows) Close() error { return nil }
 
 func (r *faultyRows) Next(dest []driver.Value) error {
 	if r.failAfter >= 0 && r.delivered >= r.failAfter {
-		// A non-EOF error is what makes `rows.Err()` report something.
 		return errStreamTruncated
 	}
 	if r.remaining == 0 {
@@ -109,8 +84,6 @@ func (r *faultyRows) Next(dest []driver.Value) error {
 	return nil
 }
 
-// openFaultyStore builds a PsqlStore backed by the fake driver, and skips if the
-// driver name has somehow been taken (which would mean two tests racing).
 var driverCounter atomic.Int64
 
 func openFaultyStore(t *testing.T, rowCount, failAfter int) PsqlStore {
@@ -138,11 +111,6 @@ func itoa(n int64) string {
 	return string(out)
 }
 
-// ── the tests ───────────────────────────────────────────────────────────────
-
-// TestGetDataReportsATruncatedResultSet is the regression test. Five rows exist
-// and the stream dies after two: the answer has to be an error, because the
-// alternative is a result list that is quietly missing three results.
 func TestGetDataReportsATruncatedResultSet(t *testing.T) {
 	s := openFaultyStore(t, 5, 2)
 
@@ -156,8 +124,6 @@ func TestGetDataReportsATruncatedResultSet(t *testing.T) {
 	}
 }
 
-// The failure has to arrive as an AppError, like every other store failure, so
-// the handler renders "internal server error" rather than the driver's text.
 func TestGetDataRendersATruncatedResultSetAsAnAppError(t *testing.T) {
 	s := openFaultyStore(t, 5, 2)
 
@@ -174,8 +140,6 @@ func TestGetDataRendersATruncatedResultSetAsAnAppError(t *testing.T) {
 	}
 }
 
-// A stream that ends cleanly is not a failure, and treating it as one would break
-// every search.
 func TestGetDataAcceptsAStreamThatEndsCleanly(t *testing.T) {
 	s := openFaultyStore(t, 3, -1)
 
@@ -199,10 +163,6 @@ func TestGetDataAcceptsAStreamThatEndsCleanly(t *testing.T) {
 	}
 }
 
-// A stream that breaks before yielding anything is a failure too, and used to be
-// indistinguishable from a query that matched nothing -- the worst version of the
-// bug, because an empty result page is exactly what a failed query looks like to
-// a user.
 func TestGetDataReportsAStreamThatBreaksBeforeAnyRow(t *testing.T) {
 	s := openFaultyStore(t, 5, 0)
 
@@ -215,7 +175,6 @@ func TestGetDataReportsAStreamThatBreaksBeforeAnyRow(t *testing.T) {
 	}
 }
 
-// An empty result set is a legitimate answer, not a failure.
 func TestGetDataAcceptsAnEmptyResultSet(t *testing.T) {
 	s := openFaultyStore(t, 0, -1)
 
@@ -228,9 +187,6 @@ func TestGetDataAcceptsAnEmptyResultSet(t *testing.T) {
 	}
 }
 
-// A row whose metadata is not valid JSON is a scan-level failure and has to be
-// reported rather than silently producing a page with empty metadata, which the
-// results template would render as a bare URL with no title.
 func TestGetDataReportsARowWithUnreadableMetadata(t *testing.T) {
 	sql.Register("boogle-faulty-badmeta", &badMetaDriver{})
 	conn, err := sql.Open("boogle-faulty-badmeta", "")

@@ -10,11 +10,6 @@ import (
 	"time"
 )
 
-// Fetch is the boundary between "a decision" and "an observation". Everything the
-// policy layer knows about a URL arrives through an Outcome, so the mapping from a
-// real HTTP exchange onto an Outcome is load-bearing: a status dropped here is a
-// 404 the crawler will happily fetch again.
-
 func TestFetchReportsWhatTheServerSaid(t *testing.T) {
 	var ua string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -44,18 +39,11 @@ func TestFetchReportsWhatTheServerSaid(t *testing.T) {
 		t.Errorf("FinalURL = %q, want %q", out.FinalURL, srv.URL)
 	}
 
-	// The user agent is the configuration's, not a constant, so the name this
-	// crawler is matched by in a robots.txt is the name it answers to on the wire.
-	// Two different strings means being held to rules addressed to somebody else.
 	if ua != defaultUserAgent(m.cfg) {
 		t.Errorf("User-Agent on the wire = %q, want %q", ua, defaultUserAgent(m.cfg))
 	}
 }
 
-// TestFetchReportsAFailedStatusWithoutInventingAnError is the split Classify
-// depends on. A 503 is an answer, and an answer has a status; folding it into the
-// error channel would lose the one piece of information that says "this host is
-// there and unhappy" as opposed to "this host is gone".
 func TestFetchReportsAFailedStatusWithoutInventingAnError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -77,7 +65,6 @@ func TestFetchReportsAFailedStatusWithoutInventingAnError(t *testing.T) {
 func TestFetchReportsATransportFailureWithNoStatus(t *testing.T) {
 	m, _, _ := atClock(t, time.Date(2026, 6, 5, 8, 0, 0, 0, time.UTC))
 
-	// Nothing is listening on port 0, so this fails before any status exists.
 	body, out := m.Fetch(context.Background(), "http://127.0.0.1:0/")
 	if out.Err == nil {
 		t.Fatal("Err = nil for an unreachable host")
@@ -90,14 +77,7 @@ func TestFetchReportsATransportFailureWithNoStatus(t *testing.T) {
 	}
 }
 
-// TestFetchKeepsTheStatusWhenTheBodyFailsHalfwayThrough is the case the comment on
-// NewHTTPFetcher is about. A server that answers 200 and then drops the connection
-// has told us something a bare transport error would not: it exists, it is
-// reachable, and it is worth trying again. Losing the status turns that into "no
-// idea", and a host that is genuinely flaky gets treated like one that is gone.
 func TestFetchKeepsTheStatusWhenTheBodyFailsHalfwayThrough(t *testing.T) {
-	// Announce more content than is sent, then close: the client reads a 200 and
-	// then an unexpected EOF.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "4096")
 		w.WriteHeader(http.StatusOK)
@@ -105,8 +85,6 @@ func TestFetchKeepsTheStatusWhenTheBodyFailsHalfwayThrough(t *testing.T) {
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
-		// Closing without the rest panics the handler's connection in a way httptest
-		// turns into a short read on the client, which is what this needs.
 		panic(http.ErrAbortHandler)
 	}))
 	defer srv.Close()
@@ -124,9 +102,6 @@ func TestFetchKeepsTheStatusWhenTheBodyFailsHalfwayThrough(t *testing.T) {
 	}
 }
 
-// TestFetchHonoursTheConfiguredBodyCap is why NewHTTPFetcher takes its caps from
-// the configuration. A crawler pointed at the wrong URL will otherwise read until
-// the process dies, and the cap is the last thing between that and a crash.
 func TestFetchHonoursTheConfiguredBodyCap(t *testing.T) {
 	const cap = 8192
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -140,11 +115,6 @@ func TestFetchHonoursTheConfiguredBodyCap(t *testing.T) {
 	m = m.WithConfig(cfg).WithFetchClient(srv.Client())
 
 	_, out := m.Fetch(context.Background(), srv.URL)
-	// Exactly one byte past the cap, and not merely "more than the cap". The extra
-	// byte is what makes truncation detectable at all -- a body read to exactly the
-	// limit is indistinguishable from one that ended there -- so an assertion of
-	// "greater than" would pass just as happily against a fetcher that read the
-	// whole response and ignored the cap entirely.
 	if out.BytesRead != cap+1 {
 		t.Errorf("BytesRead = %d, want exactly %d -- one byte past the %d cap, so "+
 			"truncation is visible without the rest of the body being read",
@@ -152,14 +122,6 @@ func TestFetchHonoursTheConfiguredBodyCap(t *testing.T) {
 	}
 }
 
-// TestWithConfigDoesNotReplaceACallerSuppliedFetcher is a wiring hazard with a real
-// failure mode.
-//
-// WithFetcher hands the transport to the caller, so a test can script outcomes
-// nobody can produce over a real network. If WithConfig then rebuilt the built-in
-// fetcher, the caller's fetcher would be silently discarded the moment anything
-// reconfigured the manager -- and the test would stop testing anything, which is
-// the version of this bug that survives review.
 func TestWithConfigDoesNotReplaceACallerSuppliedFetcher(t *testing.T) {
 	m, _, _ := atClock(t, time.Date(2026, 6, 5, 8, 0, 0, 0, time.UTC))
 
@@ -182,18 +144,10 @@ func TestWithConfigDoesNotReplaceACallerSuppliedFetcher(t *testing.T) {
 	}
 }
 
-// TestWithConfigRebuildsTheBuiltInFetcher is the mirror: a caller who never
-// installed one must still get a fetcher built from the new configuration, or
-// raising MAX_REDIRECTS in the environment would do nothing at all.
-//
-// Written against a redirect chain rather than a body size so that the assertion is
-// about the *rebuilt* fetcher: a body-size change is invisible on a small response,
-// and a test that passes for the wrong reason is worse than no test.
 func TestWithConfigRebuildsTheBuiltInFetcher(t *testing.T) {
 	var hits atomic.Int64
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Two hops: enough to be refused by a limit of 1 and followed by a limit of 5.
 		if hits.Add(1) <= 2 {
 			http.Redirect(w, r, srv.URL+"/hop", http.StatusFound)
 			return
@@ -205,15 +159,10 @@ func TestWithConfigRebuildsTheBuiltInFetcher(t *testing.T) {
 	m, _, _ := atClock(t, time.Date(2026, 6, 5, 8, 0, 0, 0, time.UTC))
 	m = m.WithFetchClient(srv.Client())
 
-	// The default limit follows the chain to the end.
 	_, out := m.Fetch(context.Background(), srv.URL)
 	if out.StatusCode != 200 {
 		t.Fatalf("with the default limit: StatusCode = %d, want 200", out.StatusCode)
 	}
-	// The hop count is what turns "redirect limit reached" into a decision.
-	// Classify reads it and refuses the page permanently, so a fetch that reported
-	// zero redirects would report a perfectly good 200 from the far end of a chain
-	// the caller had told us to stop following.
 	if out.Redirects != 2 {
 		t.Errorf("with the default limit: Redirects = %d, want 2", out.Redirects)
 	}
@@ -239,9 +188,6 @@ func TestWithConfigRebuildsTheBuiltInFetcher(t *testing.T) {
 }
 
 func TestFetchWithoutATransportIsAClassifiableFailure(t *testing.T) {
-	// A manager assembled as a struct literal rather than through New. A nil
-	// dereference here would take the process down over one worker's copy, so the
-	// failure has to arrive as an Outcome Classify can read.
 	st := NewMemoryState()
 	m := &PolicyManager{state: st, log: testLogger(), cfg: DefaultConfig(), now: time.Now}
 
@@ -257,13 +203,6 @@ func TestFetchWithoutATransportIsAClassifiableFailure(t *testing.T) {
 	}
 }
 
-// TestDiscardRetiresAndCounts covers the post-fetch refusal: a page that was
-// fetched perfectly and is not worth indexing.
-//
-// Before Discard existed this was a bare `return` in the crawl loop, which means
-// the URL stayed in the frontier's history unrecorded and came back on every
-// rediscovery, and "how much are we indexing and how much are we dropping" had no
-// answer at all.
 func TestDiscardRetiresAndCounts(t *testing.T) {
 	m, st, _ := atClock(t, time.Date(2026, 6, 5, 8, 0, 0, 0, time.UTC))
 	ctx := context.Background()

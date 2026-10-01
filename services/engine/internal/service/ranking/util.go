@@ -8,17 +8,9 @@ import (
 	"github.com/Hassan-ach/boogle/services/engine/internal/util"
 )
 
-// less reports whether a must be ordered before b, best match first.
-//
-// It has to be a total order, and above all asymmetric. The old comparator's
-// `return -1` fall-through made less(a, b) and less(b, a) both true for pages
-// that tied on every key, so the sorted order depended on the input order --
-// and the input came out of a Go map, so the same query could come back ranked
-// differently run to run.
-//
-// Score, word count and title are the meaningful keys. URL and ID are the
-// deterministic backstop for the case where two distinct pages agree on all
-// three, so no pair is ever left to the randomised map iteration order.
+// less breaks score ties deterministically, ending at the page ID. Without that
+// final key, two pages with identical scores could swap between requests and
+// make pagination repeat or skip results.
 func less(a, b *model.Page) bool {
 	switch {
 	case a.GlobalScore != b.GlobalScore:
@@ -34,6 +26,8 @@ func less(a, b *model.Page) bool {
 	}
 }
 
+// sort blends each page's TF-IDF score with its PageRank into GlobalScore:
+// factor weights TF-IDF and 1-factor weights PageRank. Callers pass 0.5.
 func sort(pages map[*model.Page]float64,
 	factor float64,
 ) ([]*model.Page, error) {
@@ -43,9 +37,6 @@ func sort(pages map[*model.Page]float64,
 		pgs = append(pgs, p)
 	}
 
-	// Deterministic even though the input is a map: every pair of distinct
-	// pages is separated by `less`, so Go's randomised map iteration order
-	// cannot leak into the result.
 	slices.SortStableFunc(pgs, func(a, b *model.Page) int {
 		switch {
 		case less(a, b):
@@ -60,6 +51,9 @@ func sort(pages map[*model.Page]float64,
 	return pgs, nil
 }
 
+// docVector builds a length-N TF-IDF vector indexed by the word mapper. Words the
+// mapper does not know panic: the mapper is built from the same corpus, so a miss
+// means the store returned data the indexer never wrote.
 func docVector(
 	page *model.Page,
 	wordIdf map[string]float64,
@@ -72,7 +66,6 @@ func docVector(
 		idf := wordIdf[w]
 		wIdx, ok := wordMapper.GetIndex(w)
 		if !ok {
-			// this should never happen
 			panic(fmt.Sprintf("word %s not found in word mapper", w))
 		}
 		vec[wIdx] = float64(tf) * idf

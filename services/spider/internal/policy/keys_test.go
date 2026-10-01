@@ -30,11 +30,6 @@ func TestKeyspaceKeys(t *testing.T) {
 	}
 }
 
-// TestKeyspaceHostKeysShareASlot is the reason every key carries a hash tag.
-// A host's state hash and its three markers are read together in one pipeline
-// and, in a later phase, touched together in one script. If they hashed to
-// different slots that would be a CROSSSLOT error the day this cache is
-// clustered, and it would be discovered in production rather than here.
 func TestKeyspaceHostKeysShareASlot(t *testing.T) {
 	ks := NewKeyspace("boogle:spider")
 	host := "example.com"
@@ -58,9 +53,6 @@ func TestKeyspaceHostKeysShareASlot(t *testing.T) {
 	}
 }
 
-// TestKeyspaceDifferentHostsDoNotShareASlot is the other half: co-locating one
-// host's keys must not put every host in the same slot, which would make a
-// cluster no better than a single node.
 func TestKeyspaceDifferentHostsDoNotShareASlot(t *testing.T) {
 	ks := NewKeyspace("boogle:spider")
 
@@ -85,7 +77,6 @@ func TestKeyspaceURLStateIsHashed(t *testing.T) {
 		t.Errorf("key = %q, want the url namespace", key)
 	}
 
-	// Distinct URLs must not collide, and the same URL must be stable.
 	if ks.URLState(long) != key {
 		t.Error("url state key is not stable for the same url")
 	}
@@ -94,10 +85,6 @@ func TestKeyspaceURLStateIsHashed(t *testing.T) {
 	}
 }
 
-// TestKeyspaceVisitedHoldsFullURLs documents the deliberate asymmetry. Visited
-// is keyed on the URL itself because exact-string dedup is the correctness
-// property, while the per-URL state hash is hashed because it is written often
-// and URLs are long. Hashing visited would make dedup a collision question.
 func TestKeyspaceVisitedHoldsFullURLs(t *testing.T) {
 	ks := NewKeyspace("boogle:spider")
 
@@ -112,8 +99,6 @@ func TestKeyspacePrefixNormalisation(t *testing.T) {
 		in   string
 		want string
 	}{
-		// A trailing colon is an easy thing to type by hand, and it would
-		// produce "boogle:spider::frontier" -- a different key, silently empty.
 		{"boogle:spider:", "boogle:spider"},
 		{"boogle:spider::", "boogle:spider"},
 		{"  boogle:spider  ", "boogle:spider"},
@@ -128,9 +113,6 @@ func TestKeyspacePrefixNormalisation(t *testing.T) {
 	}
 }
 
-// TestKeyspaceRejectsBracesInHost guards the hash tag itself. A host containing
-// a brace would redefine where its keys live, and a host is parsed out of a URL
-// by a crawler pointed at whatever it found.
 func TestKeyspaceBracesInHostCannotEscapeTheTag(t *testing.T) {
 	ks := NewKeyspace("boogle:spider")
 	host := "evil}.example.com{other"
@@ -149,8 +131,6 @@ func TestKeyspaceBracesInHostCannotEscapeTheTag(t *testing.T) {
 		}
 	}
 
-	// And it must be deterministic, so the same odd host always maps to the same
-	// key rather than to a fresh one each run.
 	if ks.HostState(host) != ks.HostState(host) {
 		t.Error("host state key is not deterministic")
 	}
@@ -165,8 +145,6 @@ func TestKeyspaceUnknownMarkerCannotCollide(t *testing.T) {
 			t.Errorf("an unknown marker kind produced %q, which collides with a real one", bad)
 		}
 	}
-	// It must also not be the host's state key, or a caller that passed a bad
-	// kind would SET over the host's real policy state.
 	if bad == ks.HostState("example.com") {
 		t.Error("an unknown marker kind produced the host state key")
 	}
@@ -185,8 +163,6 @@ func TestMarkerKindString(t *testing.T) {
 	}
 }
 
-// hashTagOf returns the {braced} portion Redis Cluster would use for slot
-// selection, or "" if the key has none.
 func hashTagOf(key string) string {
 	open := strings.IndexByte(key, '{')
 	if open < 0 {

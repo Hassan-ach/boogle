@@ -1,10 +1,3 @@
-"""Shared fakes for the ranking service unit tests.
-
-Everything here is hand-written rather than generated: the surface the ranking
-service touches is tiny (one context manager, one cursor, one commit), and a
-real object is easier to reason about than a mock's expectations.
-"""
-
 from __future__ import annotations
 
 import os
@@ -20,7 +13,6 @@ if SRC not in sys.path:
 
 
 class FakeCursor:
-    """Records every statement it is handed and replays canned results."""
 
     def __init__(self, connection: "FakeConnection") -> None:
         self._connection = connection
@@ -57,11 +49,6 @@ class FakeCursor:
 
 
 class FakeConnection:
-    """A psycopg connection stand-in with an explicit, ordered event log.
-
-    `errors` maps a substring of the statement to the exception it should raise,
-    so a test can fail one stage of the pipeline and leave the other alone.
-    """
 
     def __init__(
         self,
@@ -98,7 +85,6 @@ class FakeConnection:
 
 
 class FakeDBManager:
-    """Replaces `DatabaseManager` so no pool or network is involved."""
 
     def __init__(
         self,

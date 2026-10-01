@@ -10,12 +10,6 @@ import (
 	"time"
 )
 
-// These run against a real Redis because the caching this phase adds is Redis
-// caching. The unit tests prove that a manager asks its state once per host; only
-// a real Redis proves the second manager -- a different process, or the same one
-// after a restart -- sees the same answer and does not fetch again. A fake shares
-// one map, so the two cases are indistinguishable to it and to nothing else.
-
 func TestRedisRobotsAreCachedAcrossManagers(t *testing.T) {
 	st, conn, _ := newTestState(t)
 	ctx := context.Background()
@@ -26,7 +20,6 @@ func TestRedisRobotsAreCachedAcrossManagers(t *testing.T) {
 	var firstCalls, secondCalls int
 	body := "User-agent: *\nDisallow: /private/\nSitemap: https://example.com/s.xml\n"
 
-	// Two managers over one Redis, as a restart would produce.
 	m1 := New(cfg, st, testLogger()).WithRobotsFetcher(countingRobots(
 		func(context.Context, string) ([]byte, int, error) {
 			firstCalls++
@@ -46,9 +39,6 @@ func TestRedisRobotsAreCachedAcrossManagers(t *testing.T) {
 		t.Fatalf("the first manager made %d fetches, want 1", firstCalls)
 	}
 
-	// The rules must be honoured by the second manager, which never read them
-	// itself. If it does not, the cache is storing something nothing reads -- and
-	// the first manager's robots.txt was fetched for nothing.
 	v, err := m2.Admit(ctx, "https://example.com/private/secret")
 	if err != nil {
 		t.Fatalf("second Admit: %v", err)
@@ -58,8 +48,6 @@ func TestRedisRobotsAreCachedAcrossManagers(t *testing.T) {
 			FormatVerdict(v))
 	}
 
-	// And a different manager over a *different* connection, which is the case a
-	// fake structurally cannot cover: no shared map, only shared keys.
 	m3 := New(cfg, st, testLogger()).WithRobotsFetcher(countingRobots(
 		func(context.Context, string) ([]byte, int, error) {
 			t.Error("a fresh connection re-fetched robots.txt already in Redis")
@@ -69,7 +57,6 @@ func TestRedisRobotsAreCachedAcrossManagers(t *testing.T) {
 		t.Errorf("third Admit = %s / %v, want Allow from the cached rules", FormatVerdict(v), err)
 	}
 
-	// The sitemaps came out of the same file and belong with the rules.
 	state, err := st.HostState(ctx, "example.com")
 	if err != nil {
 		t.Fatal(err)
@@ -80,14 +67,6 @@ func TestRedisRobotsAreCachedAcrossManagers(t *testing.T) {
 	_ = conn
 }
 
-// TestRedisNegativeCacheSurvivesARestart is the bug, restated against real Redis.
-//
-// The whole failure this package exists to fix was that nothing recorded a host
-// having failed, so every URL on a dead domain opened another connection. A
-// hand-written fake shares one map with the manager under test and so cannot show
-// whether the record is where it can be found again. Here the second manager has
-// a state of its own over a connection of its own, and the only thing they share
-// is the key.
 func TestRedisNegativeCacheSurvivesARestart(t *testing.T) {
 	st, conn, keys := newTestState(t)
 	ctx := context.Background()
@@ -97,14 +76,11 @@ func TestRedisNegativeCacheSurvivesARestart(t *testing.T) {
 	calls := 0
 	fetcher := countingRobots(func(_ context.Context, url string) ([]byte, int, error) {
 		calls++
-		// A DNS failure, which is what a dead domain looks like and what must be
-		// recorded rather than retried.
 		return nil, 0, &net.DNSError{Err: "no such host", Name: url}
 	})
 
 	m := New(cfg, st, testLogger()).WithRobotsFetcher(fetcher)
 
-	// The first URL pays for the discovery.
 	if v, err := m.Admit(ctx, "https://dead.example/first"); err != nil {
 		t.Fatalf("Admit: %v", err)
 	} else if v.Kind != Defer {
@@ -114,8 +90,6 @@ func TestRedisNegativeCacheSurvivesARestart(t *testing.T) {
 		t.Fatalf("first Admit made %d fetches, want 1", calls)
 	}
 
-	// The marker is in Redis under the host's hash slot, with a TTL that will let
-	// the host be probed again.
 	ttl, err := conn.PTTL(ctx, keys.HostMarker("dead.example", MarkerDead)).Result()
 	if err != nil {
 		t.Fatalf("the dead marker is not in Redis: %v", err)
@@ -124,17 +98,11 @@ func TestRedisNegativeCacheSurvivesARestart(t *testing.T) {
 		t.Errorf("dead marker TTL = %v, want a positive deadline; without one the "+
 			"host could never be probed again", ttl)
 	}
-	// The first dead TTL is base * 2^1, not base: DeadHostTTL's argument is the
-	// consecutive failure count and a first failure is count one. Asserting the
-	// computed value rather than the base is what keeps this test honest about
-	// the schedule it is checking.
 	want := cfg.DeadHostTTL(1)
 	if ttl > want+2*time.Second || ttl < want-2*time.Second {
 		t.Errorf("dead marker TTL = %v, want about DeadHostTTL(1) = %v", ttl, want)
 	}
 
-	// Now the restart: a fresh state, a fresh client, a fresh manager. Only the
-	// key survives, which is the only thing that ever did.
 	fresh := NewRedisState(conn, prefixOf(t, st), time.Hour)
 	m2 := New(cfg, fresh, testLogger()).WithRobotsFetcher(countingRobots(
 		func(context.Context, string) ([]byte, int, error) {
@@ -147,8 +115,6 @@ func TestRedisNegativeCacheSurvivesARestart(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Admit: %v", err)
 		}
-		// Skip, not Allow, and not Defer either: the marker is authoritative, and
-		// a restarted process must reach the same conclusion the first one did.
 		if v.Kind != Skip || v.Reason != ReasonHostDead {
 			t.Fatalf("a URL on a host marked dead in Redis was %s, want skip/host_dead",
 				FormatVerdict(v))
@@ -159,14 +125,6 @@ func TestRedisNegativeCacheSurvivesARestart(t *testing.T) {
 	}
 }
 
-// TestRedisRobotsCacheIsNotWrittenOnFailure guards the trap that makes a negative
-// cache permanent instead of temporary.
-//
-// RobotsFetchedAt is what "this host is resolved" means. Writing it on a failed
-// fetch would record a host as resolved with no rules -- which permits everything
-// -- and would outlive the dead marker by a factor of a thousand, since the marker
-// expires in a minute and RobotsTTL is a day. The host would then never be probed
-// again.
 func TestRedisRobotsCacheIsNotWrittenOnFailure(t *testing.T) {
 	st, conn, keys := newTestState(t)
 	ctx := context.Background()
@@ -183,7 +141,6 @@ func TestRedisRobotsCacheIsNotWrittenOnFailure(t *testing.T) {
 		t.Fatal("EnsureHost succeeded on an unreachable host")
 	}
 
-	// The marker is there -- that is the negative cache. The state is not.
 	state, err := st.HostState(ctx, "gone.example")
 	if err != nil {
 		t.Fatal(err)
@@ -196,21 +153,11 @@ func TestRedisRobotsCacheIsNotWrittenOnFailure(t *testing.T) {
 			state.Allow, state.Disallow)
 	}
 
-	// And the proof that this matters: with the marker gone but the timestamp
-	// wrongly set, the host would look resolved and permit everything. Checking
-	// the field in Redis directly catches the write even if some future caller
-	// stops reading it back.
 	if raw := conn.HGet(ctx, keys.HostState("gone.example"), fieldRobotsAt).Val(); raw != "" {
 		t.Errorf("robots_at is in Redis as %q on a host that was never reached", raw)
 	}
 }
 
-// TestRedisCountersPersistAcrossManagers checks that a refusal counted by one
-// process is visible to the next.
-//
-// The stats hash is the only account of why a site is not being indexed. If it
-// were per-process it would be empty for a crawler that was restarted after the
-// interesting refusals happened -- which is exactly when somebody goes looking.
 func TestRedisCountersPersistAcrossManagers(t *testing.T) {
 	st, conn, _ := newTestState(t)
 	ctx := context.Background()
@@ -227,8 +174,6 @@ func TestRedisCountersPersistAcrossManagers(t *testing.T) {
 		}
 	}
 
-	// A fresh state over the same keys -- as a restarted process would build. It
-	// shares nothing with m but the prefix.
 	fresh := NewRedisState(conn, prefixOf(t, st), time.Hour)
 	defer fresh.Close()
 
@@ -249,13 +194,6 @@ func TestRedisCountersPersistAcrossManagers(t *testing.T) {
 	}
 }
 
-// TestRedisWindowRolloverResetsOnlyTheBudget checks the shape of the reset, which
-// is the one that is easy to over-apply.
-//
-// A reset that also cleared the failure count would drop a host that had failed
-// five times in a row back to its first, shortest backoff, once an hour. A reset
-// that cleared nothing would make the budget a lifetime cap and the host would
-// disappear from the index permanently.
 func TestRedisWindowRolloverResetsOnlyTheBudget(t *testing.T) {
 	st, client, keys := newTestState(t)
 	ctx := context.Background()
@@ -268,12 +206,6 @@ func TestRedisWindowRolloverResetsOnlyTheBudget(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// Seeded directly, and that is the point of doing it this way. pages_crawled
-	// and last_success are not SaveHostState's to write -- they move through
-	// RecordSuccess, which is the only writer and which no caller should be
-	// rewriting behind. Five thousand RecordSuccess calls would be a slow way to
-	// say the same thing, and would leave the test asserting nothing about the
-	// field's ownership.
 	if err := client.HSet(ctx, keys.HostState("h.example"),
 		fieldPagesCrawled, 5000,
 		fieldLastSuccess, start.Add(-time.Hour).Unix(),
@@ -310,15 +242,10 @@ func TestRedisWindowRolloverResetsOnlyTheBudget(t *testing.T) {
 	}
 }
 
-// countingRobots wraps a fetcher and reports how many times it ran, so a test can
-// say "exactly once" as a fact rather than inferring it from a fetch count it did
-// not take.
 func countingRobots(f RobotsFetcher) RobotsFetcher {
 	return f
 }
 
-// prefixOf recovers the key prefix a state is using, so a second state can be
-// built over the same keys without the test threading the string through.
 func prefixOf(t *testing.T, st *RedisState) string {
 	t.Helper()
 	return st.Keys().Prefix()

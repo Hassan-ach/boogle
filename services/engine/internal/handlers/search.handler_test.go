@@ -16,21 +16,6 @@ import (
 	"github.com/labstack/echo/v5"
 )
 
-// The search handler is where an internal failure turns into a response body, so
-// it is the boundary these tests are about. The previous version of every error
-// path here was:
-//
-//     return c.String(http.StatusInternalServerError, fmt.Sprint("err: %w", err))
-//
-// Two things were wrong with that. `%w` is a verb for fmt.Errorf, not for
-// fmt.Sprint, so Sprint emitted it literally and the response body began with
-// "err: %w". And the driver error was spliced in whole, host and port included:
-// a database that was down produced a 500 whose body told the user exactly which
-// host and port it could not reach. The AppError type exists specifically to keep
-// that text internal, and writing err.Error() into the response threw it away.
-
-// ── fakes ───────────────────────────────────────────────────────────────────
-
 type fakeStore struct {
 	totalPages int
 	data       *store.Data
@@ -38,7 +23,6 @@ type fakeStore struct {
 	totalErr error
 	dataErr  error
 
-	// recorded arguments
 	gotWords  []string
 	gotPage   int
 	totalCall int
@@ -80,14 +64,10 @@ type fakeSpeller struct{ suggestions []string }
 
 func (f *fakeSpeller) GetSuggestions(string) []string { return f.suggestions }
 
-// ── helpers ─────────────────────────────────────────────────────────────────
-
 func newTestHandler(s store.Store, r *fakeRanker, sp *fakeSpeller) *SearchingHandler {
 	return NewSearchHandler(s, r, sp)
 }
 
-// call runs the handler the way echo would: on an error it is handed to
-// HandleError, which is the whole point of returning it rather than writing it.
 func call(t *testing.T, h *SearchingHandler, target string) *httptest.ResponseRecorder {
 	t.Helper()
 	e := echo.New()
@@ -101,15 +81,10 @@ func call(t *testing.T, h *SearchingHandler, target string) *httptest.ResponseRe
 	return rec
 }
 
-// a query failure carrying the sort of detail that must never reach a browser.
 var dbIsDown = apperror.Internal(errors.New(
 	"dial tcp 127.0.0.1:5432: connect: connection refused (password=hunter2)",
 ))
 
-// ── error paths ─────────────────────────────────────────────────────────────
-
-// TestASearchFailureDoesNotLeakTheDatabaseError is the regression test for the
-// whole handler.
 func TestASearchFailureDoesNotLeakTheDatabaseError(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -131,7 +106,6 @@ func TestASearchFailureDoesNotLeakTheDatabaseError(t *testing.T) {
 			}
 
 			body := rec.Body.String()
-			// The two things that actually leaked before.
 			if strings.Contains(body, "%w") {
 				t.Errorf("response body contains a literal %%w: %q", body)
 			}
@@ -150,8 +124,6 @@ func TestASearchFailureDoesNotLeakTheDatabaseError(t *testing.T) {
 	}
 }
 
-// The rendered page still has to say something. A 500 with an empty body is just
-// as broken as one full of internals, from the user's point of view.
 func TestASearchFailureRendersTheErrorPage(t *testing.T) {
 	h := newTestHandler(&fakeStore{totalErr: dbIsDown}, &fakeRanker{}, &fakeSpeller{})
 	rec := call(t, h, "/?query=hello")
@@ -166,9 +138,6 @@ func TestASearchFailureRendersTheErrorPage(t *testing.T) {
 	}
 }
 
-// An error must reach HandleError, not be swallowed into a 200. A handler that
-// returned nil after a failure would render an empty result page, which is
-// indistinguishable from a search that genuinely matched nothing.
 func TestASearchFailureIsNotReportedAsAnEmptyResultPage(t *testing.T) {
 	h := newTestHandler(&fakeStore{dataErr: dbIsDown}, &fakeRanker{}, &fakeSpeller{})
 	rec := call(t, h, "/?query=hello")
@@ -178,8 +147,6 @@ func TestASearchFailureIsNotReportedAsAnEmptyResultPage(t *testing.T) {
 	}
 }
 
-// An error that is not an AppError at all -- a programming mistake, say -- must
-// still be a 500 and still be quiet.
 func TestAPlainErrorIsAlsoKeptOffTheWire(t *testing.T) {
 	plain := errors.New("something went wrong: dial tcp 10.0.0.5:5432 refused")
 
@@ -193,8 +160,6 @@ func TestAPlainErrorIsAlsoKeptOffTheWire(t *testing.T) {
 		t.Errorf("response body leaks the host: %q", rec.Body.String())
 	}
 }
-
-// ── the happy path ──────────────────────────────────────────────────────────
 
 func samplePage(title string) *model.Page {
 	return &model.Page{
@@ -229,8 +194,6 @@ func TestASuccessfulSearchRendersTheResults(t *testing.T) {
 	}
 }
 
-// The query the speller produced is what gets searched for, and it is the whole
-// point of running the words through aspell first.
 func TestTheSearchedQueryIsWhateverTheSpellerProduced(t *testing.T) {
 	s := &fakeStore{totalPages: 1, data: &store.Data{}}
 	h := newTestHandler(s, &fakeRanker{}, &fakeSpeller{
@@ -252,21 +215,17 @@ func TestTheSearchedQueryIsWhateverTheSpellerProduced(t *testing.T) {
 	}
 }
 
-// `?page` is 1-based in the URL and 0-based in `OFFSET pageNum * PageSize`, so the
-// handler has to subtract one. Getting this wrong hands every first-page request
-// the second page of results, which looks fine until you notice the first page is
-// never shown.
 func TestThePageParameterIsTranslatedToAZeroBasedOffset(t *testing.T) {
 	for _, tc := range []struct {
 		query string
 		want  int
 	}{
-		{"/?query=hello", 0},          // no parameter: the first page
-		{"/?query=hello&page=1", 0},   // explicitly the first page
-		{"/?query=hello&page=3", 2},   // the third page, as offset 2
-		{"/?query=hello&page=0", 0},   // 0 is not a page; fall back to the first
-		{"/?query=hello&page=-4", 0},  // neither is a negative number
-		{"/?query=hello&page=abc", 0}, // nor is a word
+		{"/?query=hello", 0},
+		{"/?query=hello&page=1", 0},
+		{"/?query=hello&page=3", 2},
+		{"/?query=hello&page=0", 0},
+		{"/?query=hello&page=-4", 0},
+		{"/?query=hello&page=abc", 0},
 	} {
 		s := &fakeStore{totalPages: 9, data: &store.Data{}}
 		h := newTestHandler(s, &fakeRanker{}, &fakeSpeller{})
@@ -279,8 +238,6 @@ func TestThePageParameterIsTranslatedToAZeroBasedOffset(t *testing.T) {
 	}
 }
 
-// A missing `?page` must not be read as page zero *and* then treated as "no
-// limit", which is how a full-index scan gets into a search.
 func TestTheResultSetIsAlwaysPaged(t *testing.T) {
 	s := &fakeStore{totalPages: 3, data: &store.Data{}}
 	h := newTestHandler(s, &fakeRanker{}, &fakeSpeller{})
@@ -292,8 +249,6 @@ func TestTheResultSetIsAlwaysPaged(t *testing.T) {
 	}
 }
 
-// The `images` and `graph` tabs short-circuit before any store call, so a
-// failure in the database cannot take them down with it.
 func TestTheOtherTabsDoNotTouchTheStore(t *testing.T) {
 	for _, tab := range []string{"images", "graph"} {
 		s := &fakeStore{dataErr: dbIsDown}
@@ -310,8 +265,6 @@ func TestTheOtherTabsDoNotTouchTheStore(t *testing.T) {
 	}
 }
 
-// An unrecognised tab falls through to the all-tab rather than rendering
-// nothing, so a bad or hand-edited link still returns results.
 func TestAnUnknownTabFallsBackToAllResults(t *testing.T) {
 	s := &fakeStore{totalPages: 1, data: &store.Data{}}
 	h := newTestHandler(s, &fakeRanker{pages: []*model.Page{samplePage("fallback")}}, &fakeSpeller{})

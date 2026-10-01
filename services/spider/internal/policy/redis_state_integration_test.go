@@ -17,22 +17,10 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// These run against a real Redis because the things most worth testing here are
-// exactly the things a fake would have to lie about: TTLs actually expiring,
-// SET NX actually not extending, PTTL's two distinct negative answers, and
-// pipelines genuinely batching. A hand-written fake proves the fake.
-//
-// Each test gets its own key prefix and its own logical database, so a run never
-// touches another test's keys and never touches the spider's working set.
-
-// redisTestDB is the logical database reserved for integration tests. The
-// spider's own configuration defaults to DB 1, so 15 is out of its way.
 const redisTestDB = 15
 
 var prefixCounter atomic.Int64
 
-// newTestState returns a state over a unique prefix, and registers cleanup that
-// removes only that prefix's keys.
 func newTestState(t *testing.T) (*RedisState, *redis.Client, Keyspace) {
 	t.Helper()
 
@@ -51,9 +39,6 @@ func newTestState(t *testing.T) (*RedisState, *redis.Client, Keyspace) {
 		DB:       redisTestDB,
 	})
 	if err := conn.Ping(context.Background()).Err(); err != nil {
-		// Skipping rather than failing: `just test-integration` runs in
-		// environments where the compose stack may not be up, and a hard failure
-		// here would look like a code defect.
 		t.Skipf("redis unavailable at %s:%s (start it with `just infra-up`): %v", addr, port, err)
 	}
 
@@ -62,8 +47,6 @@ func newTestState(t *testing.T) (*RedisState, *redis.Client, Keyspace) {
 	keys := state.Keys()
 
 	t.Cleanup(func() {
-		// Scan rather than KEYS: KEYS blocks the server, and a test suite that
-		// blocks the Redis it is testing against is its own outage.
 		ctx := context.Background()
 		var cursor uint64
 		for {
@@ -100,7 +83,6 @@ func TestRedisStateFrontier(t *testing.T) {
 		t.Errorf("FrontierLen = %d, want 2 (the empty string must be dropped)", n)
 	}
 
-	// A second enqueue increments, so priority is an inlink count.
 	if err := st.Enqueue(ctx, "https://example.com/a"); err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +94,6 @@ func TestRedisStateFrontier(t *testing.T) {
 		t.Errorf("priority = %v, want 2 after two enqueues", score)
 	}
 
-	// EnqueueAt sets an exact priority instead.
 	if err := st.EnqueueAt(ctx, "https://example.com/b", 42); err != nil {
 		t.Fatal(err)
 	}
@@ -139,9 +120,6 @@ func TestRedisStateDelayedIsScoredByDueTime(t *testing.T) {
 		t.Errorf("score = %v, want the due unix time %d", score, due.Unix())
 	}
 
-	// And it is findable by score, which is the whole mechanism: one
-	// ZRANGEBYSCORE finds everything that has come due, with no timer and no
-	// per-URL bookkeeping.
 	now := strconv.FormatInt(time.Now().Unix(), 10)
 	dueEntries, err := conn.ZRangeByScore(ctx, keys.Delayed(), &redis.ZRangeBy{
 		Min: "-inf", Max: now,
@@ -176,10 +154,6 @@ func TestRedisStateVisited(t *testing.T) {
 		t.Error("an unvisited url reported visited")
 	}
 
-	// Checked against the set directly rather than through IsVisited, which
-	// short-circuits on an empty URL and would hide the very thing being tested.
-	// An empty member would match a URL that failed to parse, which is exactly
-	// the case the visited set is meant to exclude.
 	n, err := conn.SCard(ctx, keys.Visited()).Result()
 	if err != nil {
 		t.Fatal(err)
@@ -197,7 +171,6 @@ func TestRedisStateVisited(t *testing.T) {
 	}
 }
 
-// countingHook records how many commands of each kind a client issued.
 type countingHook struct {
 	mu     sync.Mutex
 	counts map[string]int
@@ -218,9 +191,6 @@ func (h *countingHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 
 func (h *countingHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return func(ctx context.Context, cmds []redis.Cmder) error {
-		// One batch = one round trip. The individual commands are counted here
-		// rather than in ProcessHook, because a pipelined command never reaches
-		// ProcessHook at all.
 		h.record("multi")
 		for _, cmd := range cmds {
 			h.record(cmd.Name())
@@ -241,12 +211,6 @@ func (h *countingHook) count(name string) int {
 	return h.counts[name]
 }
 
-// TestRedisStateMarkersCostOneRoundTrip is a performance property stated as a
-// test because it is the property the design is built around. Markers runs
-// before every single fetch, so reading the three of them one at a time would
-// triple the round trips on the hottest path in the crawler. No assertion on
-// values can catch it, because the values are identical either way -- what
-// differs is how many batches they arrive in.
 func TestRedisStateMarkersCostOneRoundTrip(t *testing.T) {
 	_, conn, _ := newTestState(t)
 	ctx := context.Background()
@@ -259,9 +223,6 @@ func TestRedisStateMarkersCostOneRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// All three reads have to happen, and they have to happen as one batch. A
-	// pipelined call is a single MULTI/EXEC, so the pipeline count is the
-	// round-trip count.
 	if got := hook.count("pttl"); got != len(AllMarkers) {
 		t.Errorf("issued %d PTTL commands, want %d -- a marker would be missed", got, len(AllMarkers))
 	}
@@ -292,10 +253,6 @@ func TestRedisStateHostStateRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The counters are not part of what a save carries: they move one page at a
-	// time, and a save is a write of a record read earlier. They are driven here
-	// the way the crawl drives them, which is also what proves a save does not
-	// clobber them -- the save above and the counters below interleave.
 	for range 42 {
 		if err := st.RecordSuccess(ctx, "example.com", first.Add(2*time.Hour)); err != nil {
 			t.Fatal(err)
@@ -306,7 +263,6 @@ func TestRedisStateHostStateRoundTrips(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// And a save afterwards, carrying a record that knows none of it.
 	if err := st.SaveHostState(ctx, "example.com", saved); err != nil {
 		t.Fatal(err)
 	}
@@ -331,26 +287,17 @@ func TestRedisStateHostStateRoundTrips(t *testing.T) {
 	if !got.WindowStartedAt.Equal(first) || !got.LastSuccess.Equal(first.Add(2*time.Hour)) {
 		t.Errorf("timestamps did not round-trip: window=%v lastSuccess=%v", got.WindowStartedAt, got.LastSuccess)
 	}
-	// The robots rules are the ones the old code parsed and threw away, so they
-	// have to survive a round trip intact.
 	if strings.Join(got.Allow, ",") != "/wiki/,/docs" {
 		t.Errorf("Allow = %v, want [/wiki/ /docs]", got.Allow)
 	}
 	if strings.Join(got.Disallow, ",") != "/private/,/admin/" {
 		t.Errorf("Disallow = %v, want [/private/ /admin/]", got.Disallow)
 	}
-	// Sitemaps are collected rather than obeyed, because nothing consumes them
-	// yet -- but collecting them at all was the point of reading the file, and a
-	// round trip that drops them throws away the only copy.
 	if strings.Join(got.SiteMaps, ",") != "https://example.com/sitemap.xml,https://example.com/news.xml" {
 		t.Errorf("SiteMaps = %v, want both sitemaps in order", got.SiteMaps)
 	}
 }
 
-// TestRedisStateHostStateOmitsUnsetTimestamps guards against writing the epoch
-// over a real timestamp. A HostState built for one purpose can easily leave the
-// window unset -- a save that only knows about robots rules, say -- and writing
-// that zero would end the host's budget window and hand it a fresh one.
 func TestRedisStateHostStateOmitsUnsetTimestamps(t *testing.T) {
 	st, _, _ := newTestState(t)
 	ctx := context.Background()
@@ -361,7 +308,6 @@ func TestRedisStateHostStateOmitsUnsetTimestamps(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// Save again without the timestamps set.
 	if err := st.SaveHostState(ctx, "example.com", HostState{Name: "example.com", MaxPages: 10}); err != nil {
 		t.Fatal(err)
 	}
@@ -385,8 +331,6 @@ func TestRedisStateUnknownHostIsNotAnError(t *testing.T) {
 	st, _, _ := newTestState(t)
 	ctx := context.Background()
 
-	// Admit resolves an unknown host by fetching robots.txt. An error here would
-	// make every first visit look like a Redis outage.
 	got, err := st.HostState(ctx, "never-seen.example")
 	if err != nil {
 		t.Fatalf("an unknown host returned an error: %v", err)
@@ -420,9 +364,6 @@ func TestRedisStateCounters(t *testing.T) {
 		t.Errorf("Status = %q after three failures, want %q", state.Status, statusDegraded)
 	}
 
-	// A success clears the failure count and adds a page in the same call, which
-	// is the property that lets the counters be maintained without a
-	// read-modify-write that twenty workers would lose.
 	at := time.Date(2026, 7, 4, 10, 0, 0, 0, time.UTC)
 	if err := st.RecordSuccess(ctx, "example.com", at); err != nil {
 		t.Fatal(err)
@@ -450,15 +391,6 @@ func TestRedisStateCounters(t *testing.T) {
 	}
 }
 
-// TestRedisStateSaveDoesNotTouchCounters is the guard on the split of ownership.
-//
-// SaveHostState's argument is a record read at some earlier moment, and every
-// worker holds one of those. If it wrote the counters, a robots.txt re-read --
-// which happens on a daily schedule and takes a millisecond -- would put back
-// whatever the counters said when it read them, and a page crawled in between
-// would stop having happened. The count is how a host's budget is spent, so this
-// is not a rounding error: a host whose pages are quietly forgotten spends its
-// whole budget twice and is crawled for twice as long as MAX_PAGES_PER_HOST.
 func TestRedisStateSaveDoesNotTouchCounters(t *testing.T) {
 	st, client, keys := newTestState(t)
 	ctx := context.Background()
@@ -472,8 +404,6 @@ func TestRedisStateSaveDoesNotTouchCounters(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A stale record, exactly as a caller reading before a fetch and writing
-	// after would hold: everything it knows is stale.
 	stale, err := st.HostState(ctx, "example.com")
 	if err != nil {
 		t.Fatal(err)
@@ -499,7 +429,6 @@ func TestRedisStateSaveDoesNotTouchCounters(t *testing.T) {
 		t.Error("LastSuccess was cleared by a save of a stale record")
 	}
 
-	// The fields the save does own, to show the same call did something.
 	if err := st.SaveHostState(ctx, "example.com", HostState{
 		Name: "example.com", MaxPages: 42, CrawlDelay: 3 * time.Second,
 	}); err != nil {
@@ -517,17 +446,10 @@ func TestRedisStateSaveDoesNotTouchCounters(t *testing.T) {
 	}
 }
 
-// TestRedisClaimSiteMapsHandsOutOneClaim is why sitemap entries are not queued
-// twice. Sitemap entries go into the frontier by inlink priority, so a second
-// pass over the same file does not re-add the same URLs at the same score; it
-// raises the score of URLs that have not been crawled yet, once per robots.txt
-// re-read, until they are never crawled at all.
 func TestRedisClaimSiteMapsHandsOutOneClaim(t *testing.T) {
 	st, _, _ := newTestState(t)
 	ctx := context.Background()
 
-	// One reading, contended. All eight workers fetched the same robots.txt, so
-	// all eight claim the same reading.
 	readAt := time.Now().UTC().Truncate(time.Second)
 
 	const workers = 8
@@ -557,13 +479,6 @@ func TestRedisClaimSiteMapsHandsOutOneClaim(t *testing.T) {
 	}
 }
 
-// TestRedisClaimSiteMapsDecidesByReading is the comparison a flag could not
-// express, and the reason the claim is a timestamp rather than a boolean.
-//
-// The order is the one that breaks a flag: the newer reading claims first, and
-// the older reading then arrives. A flag-based implementation would clear the
-// flag for its own reading and let a stale robots.txt queue the same sitemaps a
-// second time.
 func TestRedisClaimSiteMapsDecidesByReading(t *testing.T) {
 	st, _, _ := newTestState(t)
 	ctx := context.Background()
@@ -595,10 +510,6 @@ func TestRedisClaimSiteMapsDecidesByReading(t *testing.T) {
 			"page and updates its sitemap would never be found again")
 	}
 
-	// And a claim with no reading behind it is refused rather than compared. The
-	// zero time is not "older than everything": as a Unix number it is about
-	// -6.2e10, which the comparison would happily accept and then store, leaving
-	// the field claiming a robots.txt that was never read.
 	won, err = st.ClaimSiteMaps(ctx, "example.com", time.Time{})
 	if err != nil {
 		t.Fatal(err)
@@ -616,22 +527,12 @@ func TestRedisClaimSiteMapsDecidesByReading(t *testing.T) {
 	}
 }
 
-// TestRedisSaveHostStateDoesNotEraseTheSitemapClaim is the reason
-// SiteMapsClaimedAt is absent from SaveHostState, and it is only testable here.
-//
-// The interleaving is not exotic: a host is resolved, its rules are saved, and
-// then the winner claims and starts reading a sitemap that may take seconds. Any
-// worker that resolved the same host a moment later saves the host record again
-// in between. If that write carried the claim -- with the value it read, before
-// the claim was taken -- it would erase the claim the winner holds, and the
-// discovery would run again for the same robots.txt.
 func TestRedisSaveHostStateDoesNotEraseTheSitemapClaim(t *testing.T) {
 	st, _, _ := newTestState(t)
 	ctx := context.Background()
 
 	readAt := time.Now().UTC().Truncate(time.Second)
 
-	// The winner, holding a record read before the claim.
 	stale, err := st.HostState(ctx, "example.com")
 	if err != nil {
 		t.Fatal(err)
@@ -645,7 +546,6 @@ func TestRedisSaveHostStateDoesNotEraseTheSitemapClaim(t *testing.T) {
 		t.Fatal("the first claim was refused")
 	}
 
-	// A second worker, holding the same stale record, saves it after the claim.
 	stale = stale.WithRobots("example.com", []string{"/"}, nil,
 		[]string{"https://example.com/s.xml"}, 0, readAt)
 	if err := st.SaveHostState(ctx, "example.com", stale); err != nil {
@@ -662,7 +562,6 @@ func TestRedisSaveHostStateDoesNotEraseTheSitemapClaim(t *testing.T) {
 			got.SiteMapsClaimedAt, readAt)
 	}
 
-	// And the claim is still closed to that same reading.
 	won, err = st.ClaimSiteMaps(ctx, "example.com", readAt)
 	if err != nil {
 		t.Fatal(err)
@@ -672,9 +571,6 @@ func TestRedisSaveHostStateDoesNotEraseTheSitemapClaim(t *testing.T) {
 	}
 }
 
-// TestRedisStateMarkersExpire is the property the whole skip-a-dead-domain
-// design rests on. If a marker did not actually expire, a host marked dead once
-// would be skipped for the rest of the crawl and never probed again.
 func TestRedisStateMarkersExpire(t *testing.T) {
 	st, _, _ := newTestState(t)
 	ctx := context.Background()
@@ -692,8 +588,6 @@ func TestRedisStateMarkersExpire(t *testing.T) {
 		}
 	}
 
-	// All three are read in one call, which is what keeps a dead host costing
-	// one round trip rather than three.
 	markers, err := st.Markers(ctx, "example.com")
 	if err != nil {
 		t.Fatal(err)
@@ -718,9 +612,6 @@ func TestRedisStateMarkersExpire(t *testing.T) {
 	}
 }
 
-// TestRedisStateSetMarkerDoesNotExtend is the concurrency guard. Twenty workers
-// can decide a host is dead in the same second, and with a plain SET each would
-// push the expiry out to its own "now plus ttl".
 func TestRedisStateSetMarkerDoesNotExtend(t *testing.T) {
 	st, _, _ := newTestState(t)
 	ctx := context.Background()
@@ -729,7 +620,6 @@ func TestRedisStateSetMarkerDoesNotExtend(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(300 * time.Millisecond)
-	// A later worker with a higher failure count asking for a much longer TTL.
 	if err := st.SetMarker(ctx, "example.com", MarkerDead, time.Hour); err != nil {
 		t.Fatal(err)
 	}
@@ -769,7 +659,6 @@ func TestRedisStateURLAttempts(t *testing.T) {
 	ctx := context.Background()
 	const url = "https://example.com/flaky"
 
-	// No record is normal, not an error.
 	zero, err := st.URLState(ctx, url)
 	if err != nil {
 		t.Fatal(err)
@@ -795,14 +684,10 @@ func TestRedisStateURLAttempts(t *testing.T) {
 	if state.Attempts != 3 {
 		t.Errorf("Attempts = %d, want 3", state.Attempts)
 	}
-	// The URL is stored alongside the hash so a key found in a keyspace scan can
-	// be traced back to its member.
 	if state.URL != url {
 		t.Errorf("URL = %q, want %q", state.URL, url)
 	}
 
-	// The bookkeeping expires on its own, or a long crawl accumulates one hash
-	// per URL it ever touched.
 	ttl, err := conn.TTL(ctx, keys.URLState(url)).Result()
 	if err != nil {
 		t.Fatal(err)
@@ -849,10 +734,6 @@ func TestRedisStateCountReason(t *testing.T) {
 	}
 }
 
-// TestRedisStatePrefixesAreIsolated is why the prefix is configurable at all.
-// Two spiders sharing one Redis -- or a spider and its test run -- must not see
-// each other's keys. Getting this wrong would let one crawl's visited set hide
-// another's frontier, and the second spider would sit idle forever.
 func TestRedisStatePrefixesAreIsolated(t *testing.T) {
 	_, conn, _ := newTestState(t)
 	ctx := context.Background()
@@ -874,7 +755,6 @@ func TestRedisStatePrefixesAreIsolated(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// b shares the same host and the same URL, and must see none of it.
 	visited, err := b.IsVisited(ctx, url)
 	if err != nil {
 		t.Fatal(err)
@@ -894,7 +774,6 @@ func TestRedisStatePrefixesAreIsolated(t *testing.T) {
 		t.Errorf("one prefix's markers are visible to another: %v", markers)
 	}
 
-	// And the key names genuinely differ, not just the data.
 	if a.Keys().Frontier() == b.Keys().Frontier() {
 		t.Errorf("both prefixes produced the key %q", a.Keys().Frontier())
 	}

@@ -37,7 +37,6 @@ func extrantMeta(n *html.Node) entity.MetaData {
 	return m
 }
 
-// findHtmlNode traverses top-level nodes to find the <html> ElementNode
 func findHtmlNode(n *html.Node) *html.Node {
 	if n.Type == html.ElementNode && strings.EqualFold(n.Data, "html") {
 		return n
@@ -50,17 +49,6 @@ func findHtmlNode(n *html.Node) *html.Node {
 	return nil
 }
 
-// documentLanguage reports the language a document declares for itself, by
-// reading the lang or xml:lang attribute off the <html> element.
-//
-// It reports rather than decides. It used to return a skip boolean, and
-// ParseHTML turned that into an error, so every non-English page logged "failed
-// to fetch and parse page" and was indistinguishable from a network failure --
-// and neither was countable. The policy manager makes the call now; this only
-// supplies the evidence.
-//
-// An absent attribute is reported as the empty string, which policy.IsEnglish
-// reads as "no claim made" rather than "not English". Most real pages omit it.
 func documentLanguage(root *html.Node) string {
 	htmlNode := findHtmlNode(root)
 	if htmlNode == nil {

@@ -22,7 +22,8 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-/// Total attempts for retryable operations (see `core::utils::retry_async`).
+/// Total attempts, including the first, for every retry in this crate. See
+/// `retry_async`.
 pub const MAX_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, FromRow)]
@@ -49,11 +50,13 @@ pub trait Indexe {
     async fn sweep_loop(self: Arc<Self>, tk: CancellationToken);
 }
 
-/// Decide whether a failed job should go back on the queue.
+/// Decides whether a failed message goes back on the queue.
 ///
-/// Retrying a permanently broken message would spin the worker forever, so
-/// poison payloads (undecodable JSON, unparsable HTML, a page that is already
-/// gone) are discarded. Everything else is transient and gets requeued.
+/// This is the poison-message line: requeueing a permanent failure loops forever,
+/// and dropping a transient one loses work that would have succeeded. A parse or
+/// serde error will fail identically on every retry, so it is dropped; a database
+/// or messaging error may succeed later. `NotFoundError` is excluded from requeue
+/// because the referenced row is gone for good.
 pub fn should_requeue(err: &AppError) -> bool {
     match err {
         AppError::Database(db_err) => !matches!(db_err, DatabaseError::NotFoundError(_)),
@@ -87,9 +90,6 @@ where
         Ok(())
     }
 
-    /// Returns the still-open [`Consumer`] so the caller can keep it alive while
-    /// in-flight workers drain. Dropping a lapin `Consumer` closes its channel,
-    /// which makes every outstanding ack fail with `InvalidChannel`.
     pub async fn index_loop(self: Arc<Self>, tk: CancellationToken) -> Result<Consumer, AppError> {
         if tk.is_cancelled() {
             info!(
@@ -108,6 +108,9 @@ where
         .await
         {
             Ok(mut consumer) => loop {
+                // select! on cancellation and the consumer stream: whichever
+                // fires first wins, so a shutdown does not wait for the next
+                // message to arrive.
                 tokio::select! {
                     _ = tk.cancelled() => {
                         info!(self.log, "Received shutdown signal, stopping consumer for queue"; "queue" => self.conf.queue_name.to_string());
@@ -126,7 +129,9 @@ where
 
                         info!(log, "Received message from queue"; "queue" => &queue_name, "payload_size" => delivery.data.len());
 
-                        // Acquire semaphore slot, respecting cancellation
+                                                // The semaphore caps concurrent indexing. Cancellation
+                        // is raced against acquiring it, otherwise shutdown would
+                        // block until an in-flight task released its permit.
                         let permit = tokio::select! {
                             Ok(p) = Arc::clone(&indx.limit).acquire_owned() => p,
                             _ = tk.cancelled() => {
@@ -137,8 +142,13 @@ where
 
                         let mut tasks = self.tasks.lock().await;
                         tasks.spawn(async move {
-                            let _permit = permit; // Keeps slot active until task completes
+                            // Held for the task's lifetime, which is what keeps
+                            // in-flight work within max_concurrent_tasks.
+                            let _permit = permit;
 
+                            // Ack only after indexing succeeded, so a crash
+                            // mid-index leaves the message unacked and it returns
+                            // to the queue.
                             match indx.handler(delivery.data.clone()).await {
                                 Ok(()) => {
                                     if let Err(err) = delivery.ack(BasicAckOptions::default()).await {
@@ -233,9 +243,6 @@ where
                        "error" => err.to_string()
                 );
                 self.db.undo_indexing(page.id).await?;
-                // The claim is released, so the sweep can pick the page up again.
-                // Returning Ok here would make the caller ack the message and the
-                // job would be dropped from the queue until the next sweep.
                 return Err(err);
             }
         }
@@ -244,7 +251,6 @@ where
             serde_json::to_vec(&IndexConfirmation { page_id: page.id })
         }) {
             Ok(payload) => {
-                // It ok to ignore the result of the publish_with_confirm call, since we don't want to block the indexing process.
                 if let Err(err) = retry_async(MAX_ATTEMPTS, || async {
                     self.mq
                         .publish_with_confirm(&self.conf.confirmation_queue_name, payload.clone())
@@ -483,8 +489,6 @@ mod tests {
         }
 
         async fn consume(&self, _queue: &str, _prefetch: usize) -> Result<Consumer, AppError> {
-            // Consuming needs a live broker; these tests drive `index_page`
-            // directly instead.
             Err(AppError::Other("not supported in tests".into()))
         }
 
@@ -492,8 +496,6 @@ mod tests {
             self.closed.fetch_add(1, Ordering::SeqCst);
         }
     }
-
-    // ── index_page ────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn index_page_indexes_words_and_publishes_a_confirmation() {
@@ -552,7 +554,6 @@ mod tests {
 
     #[tokio::test]
     async fn index_page_does_not_panic_on_pathological_html() {
-        // Very large and deeply malformed input must still produce a result.
         let huge = format!(
             "<body>{}<div><span>{}{}",
             "<p>filler text </p>".repeat(5_000),
@@ -583,8 +584,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn index_page_releases_the_claim_when_batching_exhausts_retries() {
-        // Regression: this used to return Ok(()), which made the caller ack the
-        // message and silently dropped the job.
         let db = MockDB::failing_batch(99);
         let mq = MockMQ::default();
         let indexer = Indexer::new(db, mq, app_config(), discard_logger());
@@ -610,8 +609,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn index_page_keeps_the_page_indexed_when_confirmation_publish_fails() {
-        // The words are already committed; losing the confirmation must not undo
-        // that work or fail the job.
         let db = MockDB::with_page("<body>alpha</body>");
         let mq = MockMQ {
             publish_failures_remaining: AtomicUsize::new(99),
@@ -626,8 +623,6 @@ mod tests {
         assert_eq!(indexer.db.undo_calls.load(Ordering::SeqCst), 0);
         assert_eq!(indexer.db.batched_words.lock().unwrap().len(), 1);
     }
-
-    // ── handler ──────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn handler_indexes_a_well_formed_job() {
@@ -673,8 +668,6 @@ mod tests {
         assert!(matches!(err, AppError::SerdeError(_)));
     }
 
-    // ── requeue policy ───────────────────────────────────────────────────────
-
     #[test]
     fn requeue_policy_discards_poison_messages() {
         assert!(!should_requeue(&AppError::SerdeError(
@@ -702,7 +695,6 @@ mod tests {
 
     #[test]
     fn requeue_policy_covers_every_error_variant() {
-        // Guards against a new variant silently defaulting to the wrong branch.
         let every: Vec<AppError> = vec![
             AppError::Database(DatabaseError::SqlxError(sqlx::Error::PoolClosed)),
             AppError::Database(DatabaseError::ConnectionError("x".into())),
@@ -731,12 +723,9 @@ mod tests {
 
         assert_eq!(every.len(), 13);
         for err in every {
-            // Must not panic, and must return a definite answer.
             let _ = should_requeue(&err);
         }
     }
-
-    // ── lifecycle ────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn close_releases_both_the_queue_and_the_database() {
@@ -769,7 +758,6 @@ mod tests {
             tokio::spawn(async move { indexer.sweep_loop(tk).await })
         };
 
-        // Let one tick fire and the publish complete.
         tokio::time::sleep(Duration::from_millis(1_100)).await;
         tk.cancel();
         tokio::time::timeout(Duration::from_secs(2), handle)

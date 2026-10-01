@@ -5,8 +5,6 @@ import (
 	"testing"
 )
 
-// setEnv uses t.Setenv, which fails the test if it is called from a parallel
-// one and restores the previous value afterwards.
 func TestGetWithDefaultReturnsTheValueWhenSet(t *testing.T) {
 	t.Setenv("BOOGLE_TEST_STR", "configured")
 
@@ -22,7 +20,6 @@ func TestGetWithDefaultReturnsTheDefaultWhenUnset(t *testing.T) {
 }
 
 func TestGetWithDefaultTreatsAnEmptyValueAsUnset(t *testing.T) {
-	// `PG_HOST=` in a compose file means "I forgot", not "the empty host".
 	t.Setenv("BOOGLE_TEST_STR", "")
 
 	if got := GetWithDefault("BOOGLE_TEST_STR", "fallback"); got != "fallback" {
@@ -31,14 +28,12 @@ func TestGetWithDefaultTreatsAnEmptyValueAsUnset(t *testing.T) {
 }
 
 func TestGetWithDefaultDoesNotDistinguishAbsentFromEmpty(t *testing.T) {
-	// Both mean the same thing to the caller, and the two must not drift apart.
 	t.Setenv("BOOGLE_TEST_EMPTY", "")
 	t.Setenv("BOOGLE_TEST_WS", " ")
 
 	if GetWithDefault("BOOGLE_TEST_EMPTY", "d") != GetWithDefault("BOOGLE_TEST_ABSENT", "d") {
 		t.Error("an empty value and an absent value must resolve the same way")
 	}
-	// Whitespace is not empty, so it is a legitimate value.
 	if got := GetWithDefault("BOOGLE_TEST_WS", "d"); got != " " {
 		t.Errorf("GetWithDefault() = %q, want the whitespace value to be kept", got)
 	}
@@ -55,8 +50,6 @@ func TestGetIntWithDefault(t *testing.T) {
 		{"parses zero", true, "0", 0},
 		{"parses a negative", true, "-7", -7},
 		{"parses a leading plus", true, "+7", 7},
-		// Atoi is base 10 on purpose. These are ports, counts and weights, and
-		// accepting "0x10" or "0b11" for them would only hide a typo.
 		{"falls back on a hex literal", true, "0x10", 99},
 		{"falls back on an octal literal", true, "0o10", 99},
 		{"falls back when unset", false, "", 99},
@@ -64,9 +57,6 @@ func TestGetIntWithDefault(t *testing.T) {
 		{"falls back on a non-number", true, "abc", 99},
 		{"falls back on a float", true, "4.2", 99},
 		{"falls back on trailing junk", true, "42abc", 99},
-		// strconv is strict, so a stray space is a misconfiguration rather than
-		// something to paper over. Falling back to a known-good default beats
-		// starting with a value nobody chose.
 		{"falls back on surrounding space", true, "  42  ", 99},
 	}
 
@@ -93,8 +83,6 @@ func TestGetFloatWithDefault(t *testing.T) {
 		{"parses a whole number", true, "4", 4},
 		{"parses a negative", true, "-0.5", -0.5},
 		{"parses exponent notation", true, "1e3", 1000},
-		// Go's float grammar accepts a trailing or leading dot, so these are
-		// legitimate values rather than typos.
 		{"parses a trailing dot", true, "4.", 4},
 		{"parses a leading dot", true, ".5", 0.5},
 		{"parses infinity", true, "Inf", math.Inf(1)},
@@ -103,8 +91,6 @@ func TestGetFloatWithDefault(t *testing.T) {
 		{"falls back on a non-number", true, "abc", 1.5},
 		{"falls back on a bare dot", true, ".", 1.5},
 		{"falls back on surrounding space", true, "  4.2  ", 1.5},
-		// NaN is parseable but poisons every comparison it takes part in, so a
-		// ranking weight that becomes NaN silently disables ranking.
 		{"falls back on NaN", true, "NaN", 1.5},
 	}
 
@@ -121,8 +107,6 @@ func TestGetFloatWithDefault(t *testing.T) {
 }
 
 func TestGetIntAndGetFloatAgreeOnWholeNumbers(t *testing.T) {
-	// The ranker reads the same variable through both helpers depending on the
-	// field, so "0.85" must not mean 85 in one place and 0 in the other.
 	t.Setenv("BOOGLE_TEST_BOTH", "2")
 
 	if got := GetIntWithDefault("BOOGLE_TEST_BOTH", -1); got != 2 {
@@ -134,7 +118,6 @@ func TestGetIntAndGetFloatAgreeOnWholeNumbers(t *testing.T) {
 }
 
 func TestDefaultsAreUsedIndependently(t *testing.T) {
-	// One bad variable must not drag the others down with it.
 	t.Setenv("BOOGLE_TEST_GOOD", "10")
 	t.Setenv("BOOGLE_TEST_BAD", "not-a-number")
 

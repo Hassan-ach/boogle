@@ -13,13 +13,6 @@ import (
 	"uuid"
 )
 
-// The store's use of policy state is where the frontier used to be reached
-// through the cache, and the old code there was quietly lossy. So these tests are
-// about what the store writes and in what order, not about the store in general.
-
-// fakeDB records the calls persistPage makes. It is hand-written rather than
-// generated: five methods, and a mock generator would be a new dependency to fake
-// something this small.
 type fakeDB struct {
 	pageID uuid.UUID
 	err    error
@@ -62,7 +55,6 @@ func (f *fakeDB) WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 
 func (f *fakeDB) Close() {}
 
-// fakeCache records host-metadata writes.
 type fakeCache struct {
 	written map[string]*entity.Host
 	err     error
@@ -110,11 +102,6 @@ func TestStoreInitSeedsAnEmptyFrontier(t *testing.T) {
 	}
 }
 
-// TestStoreInitDoesNotSeedOverExistingWork is the startup case that matters. A
-// second Init -- a restart, a redeploy -- must not re-enqueue the start URLs on
-// top of a frontier that already has work, because every URL in it would have its
-// priority counted up again and the start URLs would be crawled twice for no
-// reason.
 func TestStoreInitDoesNotSeedOverExistingWork(t *testing.T) {
 	s, st := newTestStore(t)
 	ctx := context.Background()
@@ -124,7 +111,6 @@ func TestStoreInitDoesNotSeedOverExistingWork(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// And a URL already crawled is not work.
 	if err := st.Enqueue(ctx, "https://example.net/discovered"); err != nil {
 		t.Fatal(err)
 	}
@@ -148,17 +134,6 @@ func TestStoreInitDoesNotSeedOverExistingWork(t *testing.T) {
 	}
 }
 
-// TestStoreInitFailsClosedOnAnUnreadableFrontier is the bug the old CountUrls had.
-//
-// It returned 0 on any error, which Init read as "the frontier is empty" and so
-// answered "seed it". So a Redis blip at startup -- the one moment Redis is most
-// likely to be briefly unavailable -- re-enqueued every start URL on top of a
-// frontier that was already full. Nothing failed loudly; the crawl just started
-// from the front of the queue with inflated priorities.
-//
-// Only the length read fails here. If the whole state were broken the seed would
-// fail too and the test would pass for the wrong reason: it would be the write
-// failing, not the decision to write.
 func TestStoreInitFailsClosedOnAnUnreadableFrontier(t *testing.T) {
 	s, st := newTestStore(t)
 	st.FailOn = map[string]error{"FrontierLen": errors.New("redis is unreachable")}
@@ -166,33 +141,12 @@ func TestStoreInitFailsClosedOnAnUnreadableFrontier(t *testing.T) {
 	if err := s.Init([]string{"https://example.com/"}); err == nil {
 		t.Fatal("Init reported success with an unreadable frontier")
 	}
-	// The seed must not have been attempted, so nothing was written.
 	if got := len(st.Frontier()); got != 0 {
 		t.Errorf("frontier holds %d urls after a failed read; the start urls were "+
 			"seeded onto a frontier that could not be confirmed empty", got)
 	}
 }
 
-// TestStorePersistPageDecidesNothingAboutTheCrawl is the test that pins where the
-// crawl decisions are not.
-//
-// This function used to end by marking the page visited and enqueueing its links,
-// and both were crawl decisions made by a database layer. A store that writes rows
-// is not entitled to decide when a URL has been seen or what the crawl should look
-// at next, and doing it here had costs that only showed in aggregate: nothing
-// counted a refusal, because nothing here could refuse; the decision could not be
-// retried, observed or reasoned about from anywhere except the function that
-// happened to insert the row; and a URL the gate would have refused still cost a
-// Redis write on its way to being discarded at the pop.
-//
-// So the loop does both now, through the policy manager, after this returns and only
-// if the insert committed. What is left here is a row.
-//
-// The properties those two writes carried are not lost with them. A self-linking
-// page is still crawled once and not twice --
-// TestTheLoopDoesNotFetchAPageTwiceWhenItIsAlreadyVisited, at the layer that now
-// owns it -- and a visited link is still queued and then dropped at the pop --
-// TestDiscoverQueuesAURLItHasAlreadyCrawled, likewise.
 func TestStorePersistPageDecidesNothingAboutTheCrawl(t *testing.T) {
 	s, st := newTestStore(t)
 	ctx := context.Background()
@@ -221,9 +175,6 @@ func TestStorePersistPageDecidesNothingAboutTheCrawl(t *testing.T) {
 	}
 }
 
-// TestStorePersistPageStopsAtAFailedInsert checks that a database failure does not
-// mark the page visited. The reverse order would lose the page: marked visited,
-// not persisted, and never crawled again.
 func TestStorePersistPageStopsAtAFailedInsert(t *testing.T) {
 	s, st := newTestStore(t)
 	s.db = &fakeDB{err: errors.New("disk is full")}
@@ -244,14 +195,6 @@ func TestStorePersistPageStopsAtAFailedInsert(t *testing.T) {
 	}
 }
 
-// TestStorePersistHostNoLongerWritesAWaitedMarker pins the removal of a write that
-// nothing read.
-//
-// AddToWaitedHost set a TTL key that no code path consulted -- the spider had no
-// rate limiting at all, and the Crawl-delay it parsed from robots.txt went into the
-// same dead field. A write that nothing reads is worse than no write: it looks
-// like rate limiting in a code review, and it is why the crawl-delay bug survived
-// so long.
 func TestStorePersistHostNoLongerWritesAWaitedMarker(t *testing.T) {
 	s, _ := newTestStore(t)
 

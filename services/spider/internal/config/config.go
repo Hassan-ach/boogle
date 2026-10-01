@@ -24,18 +24,6 @@ type RedisConfig struct {
 	Port     int
 }
 
-// Delay and MaxRetry used to live here, and both are gone.
-//
-// They configured the old frontier pop loop, and neither meant what its name said.
-// MaxRetry was read as a count of frontier entries one pop was allowed to burn
-// through, so a "retry budget" of ten silently became a scan of ten URLs every time
-// the loop woke up; it is now FRONTIER_POP_BATCH, which is only ever that. Delay was
-// the sleep between pops, and it was set to zero by every crawler that cared about
-// throughput -- so the crawl-delay it appeared to honour was not honoured at all,
-// which is how the spider ended up hammering hosts that asked for five seconds.
-// Both fields survive one release as env vars (REDIS_MAX_RETRY is still read as a
-// fallback for FRONTIER_POP_BATCH) and nothing reads them here any more.
-
 type PSQLConfig struct {
 	Host     string
 	Port     int
@@ -87,14 +75,9 @@ func LoadConfig() (*Config, error) {
 	return c, nil
 }
 
-// loadPolicyConfig builds the policy manager's configuration from the
-// environment, starting from the package's own defaults.
-//
-// Starting from DefaultConfig rather than from a zero struct is the important
-// part: every field has a defensible value with no environment set at all, so a
-// missing variable is a default rather than a zero. A zero here is a silent
-// failure -- a zero batch size means "scan nothing", and a zero page budget means
-// "crawl no pages" -- and both look exactly like a crawl that has finished.
+// loadPolicyConfig starts from policy.DefaultConfig and overrides only the fields
+// an operator can reasonably be expected to change, so a new policy knob is
+// usable without an environment variable and the two defaults cannot drift.
 func loadPolicyConfig() policy.Config {
 	c := policy.DefaultConfig()
 
@@ -117,11 +100,6 @@ func loadPolicyConfig() policy.Config {
 	c.URLBackoffMax = secondsWithDefault("URL_BACKOFF_MAX_SEC", c.URLBackoffMax)
 
 	c.DelayedPromoteBatch = getIntWithDefault("DELAYED_PROMOTE_BATCH", c.DelayedPromoteBatch)
-	// FRONTIER_POP_BATCH supersedes REDIS_MAX_RETRY, which conflated a scan budget
-	// with a retry count and so burned up to ten frontier entries per pop. The old
-	// name stays as a fallback for one release so a deployment that only sets
-	// REDIS_MAX_RETRY does not change behaviour the day this ships; it is ignored as
-	// soon as the new name is set, so there is never a question of which wins.
 	c.FrontierPopBatch = getIntWithDefault("FRONTIER_POP_BATCH",
 		getIntWithDefault("REDIS_MAX_RETRY", c.FrontierPopBatch))
 	c.MaxPagesPerHost = getIntWithDefault("MAX_PAGES_PER_HOST", c.MaxPagesPerHost)
@@ -131,13 +109,9 @@ func loadPolicyConfig() policy.Config {
 	return c
 }
 
-// secondsWithDefault reads a duration expressed as whole seconds, falling back on
-// anything that is not a positive number.
-//
-// A malformed or non-positive value falls back rather than being taken literally,
-// because both zero and negative are silent failure modes here: a zero TTL expires
-// every URL's retry bookkeeping on the next read, which turns the backoff off
-// without saying so.
+// secondsWithDefault reads a duration expressed in whole seconds. A missing,
+// unparseable, zero or negative value silently falls back and says so on stdout:
+// a bad tuning value should not stop the spider from starting.
 func secondsWithDefault(key string, fallback time.Duration) time.Duration {
 	raw := getWithDefault(key, "")
 	if raw == "" {

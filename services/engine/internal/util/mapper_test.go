@@ -29,8 +29,6 @@ func TestPageMapperAssignsDenseIndicesInInsertionOrder(t *testing.T) {
 }
 
 func TestPageMapperIgnoresDuplicateIds(t *testing.T) {
-	// Duplicates are the normal case: the indexer upserts the same word on many
-	// pages, and re-mapping it would give one word two vector slots.
 	m := NewPageMapper()
 	a := uuid.New()
 
@@ -55,7 +53,6 @@ func TestPageMapperGetIndexReportsMissingIds(t *testing.T) {
 	if ok {
 		t.Error("GetIndex must report an unmapped id as absent")
 	}
-	// The zero value is returned, and callers must not treat it as a valid slot.
 	if idx != 0 {
 		t.Errorf("GetIndex returned index %d for a missing id, want the zero value", idx)
 	}
@@ -110,8 +107,6 @@ func TestPageMapperGetValueByIndexOnEmptyMapper(t *testing.T) {
 }
 
 func TestPageMapperGetValuesReturnsACopy(t *testing.T) {
-	// A caller that mutates the returned slice must not corrupt the mapping;
-	// `reverse` is the only thing backing GetValueByIndex.
 	m := NewPageMapper()
 	a, b := uuid.New(), uuid.New()
 	m.MapValue(a)
@@ -150,13 +145,9 @@ func TestPageMapperGetValuesIsInIndexOrder(t *testing.T) {
 }
 
 func TestPageMapperSatisfiesTheMapperInterface(t *testing.T) {
-	// Both mappers are passed around as `util.Mapper[T]`, so the interface has
-	// to keep matching these concrete types.
 	var _ Mapper[uuid.UUID] = NewPageMapper()
 	var _ Mapper[string] = NewWordMapper()
 }
-
-// ── WordMapper ───────────────────────────────────────────────────────────────
 
 func TestWordMapperAssignsDenseIndicesInInsertionOrder(t *testing.T) {
 	m := NewWordMapper()
@@ -179,8 +170,6 @@ func TestWordMapperAssignsDenseIndicesInInsertionOrder(t *testing.T) {
 }
 
 func TestWordMapperIgnoresDuplicateWords(t *testing.T) {
-	// This is the case that matters: batch_words re-sends the same word for every
-	// page it appears on, and a second slot would leave a zero in the vector.
 	m := NewWordMapper()
 	m.MapValue("cat")
 	m.MapValue("cat")
@@ -257,8 +246,6 @@ func TestWordMapperGetValuesReturnsACopy(t *testing.T) {
 }
 
 func TestWordMapperHandlesTheEmptyString(t *testing.T) {
-	// An empty word is not something the tokenizer produces, but the mapper
-	// must stay self-consistent if one ever arrives.
 	m := NewWordMapper()
 	m.MapValue("")
 
@@ -272,14 +259,11 @@ func TestWordMapperHandlesTheEmptyString(t *testing.T) {
 }
 
 func TestWordMapperIndicesAreContiguousFromZero(t *testing.T) {
-	// The vector built in docVector is sized by GetSize, so a gap in the
-	// indices would leave an unreachable slot.
 	m := NewWordMapper()
 	words := make([]string, 500)
 	for i := range words {
 		words[i] = uuid.New().String()
 	}
-	// Insert in a shuffled order to prove the index is by insertion, not value.
 	for _, i := range []int{499, 0, 250, 1, 498, 2} {
 		m.MapValue(words[i])
 	}

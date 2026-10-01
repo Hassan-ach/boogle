@@ -74,20 +74,6 @@ func TestParseHTML(t *testing.T) {
 	}
 }
 
-// TestAPageThatListsTheSameURLTwiceCrawlsItOnce covers the dedup, which is easy to
-// lose and expensive to lose.
-//
-// Almost every page links to its own header and footer. The three spellings below
-// are one document -- an absolute URL, a root-relative one and the same root-
-// relative one with a fragment -- and they reach the collector as three separate
-// hrefs. Canonicalisation collapses all three to the same key, which is the point
-// of canonicalising first: two URLs that differ only in spelling are one page, and
-// keying them separately splits its word counts and its PageRank between them.
-//
-// The frontier is a set, so a duplicate is harmless there. It is not harmless
-// before it: every duplicate costs an admission, a state read and a counter
-// increment, on every page that has a nav bar, and the refusals among them are
-// counted twice -- so a site's stats overstate how much of it was declined.
 func TestAPageThatListsTheSameURLTwiceCrawlsItOnce(t *testing.T) {
 	html := `<!doctype html><html lang="en"><head><title>t</title></head><body>` +
 		`<a href="/about">about</a>` +

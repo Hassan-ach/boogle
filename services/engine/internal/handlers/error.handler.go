@@ -11,6 +11,9 @@ import (
 	"github.com/labstack/echo/v5"
 )
 
+// HandleError is the single place an error becomes a response: it logs the cause,
+// writes the status, then renders the error page. The status is written before
+// rendering because a render failure cannot change it any more.
 func HandleError(c *echo.Context, err error) {
 	code, message, internalErr := classifyError(err)
 
@@ -27,6 +30,9 @@ func HandleError(c *echo.Context, err error) {
 	}
 }
 
+// classifyError maps an error to (status, client-safe message, internal cause).
+// Only the cause is logged. Order matters: our AppError and Echo's HTTPError both
+// satisfy errors.As on their own types, so the specific checks come first.
 func classifyError(err error) (int, string, error) {
 	if errors.Is(err, echo.ErrNotFound) {
 		return http.StatusNotFound, "page not found", nil
@@ -38,10 +44,6 @@ func classifyError(err error) (int, string, error) {
 
 	var appErr *apperror.AppError
 	if errors.As(err, &appErr) {
-		// A hand-built AppError with no Code would otherwise reach
-		// WriteHeader(0), and net/http panics on a status code outside 100..599.
-		// Taking that as "unset" keeps the error path from turning a store
-		// failure into a crashed request handler.
 		code := appErr.Code
 		if code < 100 || code > 599 {
 			code = http.StatusInternalServerError

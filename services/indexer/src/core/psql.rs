@@ -55,14 +55,6 @@ impl DB for Psql {
         older_than: Duration,
         limit: i64,
     ) -> Result<Vec<Uuid>, AppError> {
-        // A page is marked indexed before any indexing work starts, so a worker that
-        // died or hung leaves it claimed forever. Release stale claims first,
-        // otherwise those pages are invisible to the sweep.
-        //
-        // Releasing also discards the words the dead worker managed to write.
-        // They are a partial index of a page whose re-crawl may differ, and
-        // leaving them in place means the retry's `DO UPDATE` refreshes the words
-        // it sees while the ones it no longer has stay behind.
         sqlx::query!(
             r#"WITH released AS (
                     UPDATE pages
@@ -98,9 +90,18 @@ impl DB for Psql {
 
         Ok(ids)
     }
+    /// Claims a page for indexing.
+    ///
+    /// `FOR UPDATE SKIP LOCKED` is what makes several indexer replicas safe: each
+    /// takes a different unindexed row instead of blocking on the same one. The
+    /// claim and the `indexed = TRUE` update share one statement so no row can be
+    /// handed out without being marked.
+    ///
+    /// `indexed = TRUE` is set before indexing actually runs. A crash mid-index
+    /// leaves the page marked, and `find_stale_pages` picks it back up via
+    /// `updated_at`/`index_attempts` rather than leaving it unindexed forever.
     async fn get_page_by_id(&self, page_id: Uuid) -> Result<Page, AppError> {
         let mut tx = self.pool.begin().await?;
-        // Create a query type mapping
         let query = sqlx::query_as::<_, Page>(
             "WITH cte AS (
                  SELECT id, url_id, html
@@ -118,7 +119,6 @@ impl DB for Psql {
             RETURNING pages.id, pages.url_id, pages.html",
         )
         .bind(page_id);
-        // Fetch Optional row
         let Some(page) = query.fetch_optional(&mut *tx).await? else {
             tx.commit().await?;
             return Err(AppError::Database(DatabaseError::NotFoundError(format!(
@@ -131,6 +131,12 @@ impl DB for Psql {
         Ok(page)
     }
 
+    /// Writes one page's word counts in a single multi-row upsert.
+    ///
+    /// One statement rather than a loop: a page with thousands of distinct words
+    /// would otherwise cost thousands of round trips. Word ids come from an
+    /// upsert of the words themselves, so a word never seen before is created in
+    /// the same transaction.
     async fn batch_words(
         &self,
         words: &HashMap<String, u32>,
@@ -143,9 +149,6 @@ impl DB for Psql {
             return Ok(());
         }
 
-        // Drop what cannot be stored. `words.word` is VARCHAR(25) and Postgres
-        // raises rather than truncating, so one long token would fail the entire
-        // batch -- and the batch is every word on the page.
         let overlong: Vec<&str> = words
             .keys()
             .filter(|w| w.chars().count() > MAX_WORD_LEN)
@@ -171,16 +174,9 @@ impl DB for Psql {
             return Ok(());
         }
 
-        // Sort so every concurrent worker inserts the same keys in the same order.
-        // HashMap iteration order is randomized per task, which makes concurrent
-        // INSERT ... ON CONFLICT speculative-insertion locks deadlock.
         let mut keys: Vec<String> = storable.keys().map(|w| (*w).clone()).collect();
         keys.sort_unstable();
 
-        // Both halves of the write are now reported. A failure here used to be
-        // logged and returned as `Ok(())`, and the caller's response to `Ok` is
-        // to ack the job -- so the page stayed marked indexed with no words, it
-        // never returned to the queue, and nothing above ERROR recorded why.
         let map = batch_upsert_words(&self.pool, keys, self.conf.word_batch_size, &self.log)
             .await
             .map_err(|err| {
@@ -199,9 +195,6 @@ impl DB for Psql {
             .filter_map(|(word, id)| storable.get(&word).map(|count| (id, *count)))
             .collect();
 
-        // An id set smaller than the word set means a word was in the batch but
-        // came back without an id, which would index the page with a subset of
-        // its words and call it a success.
         if word_id_count.len() != storable.len() {
             let err = format!(
                 "resolved {} of {} word ids for page {}; the page would be indexed \
@@ -217,12 +210,6 @@ impl DB for Psql {
             return Err(AppError::Database(DatabaseError::BatchWordsError(err)));
         }
 
-        // A page is only ever claimed while `indexed = FALSE`, and the only ways
-        // out of that state are `undo_indexing` and the stale sweep -- both of
-        // which drop the page's existing words. So by the time a word is written
-        // the page has none, and the insert below is a replace rather than an
-        // accumulate. `DO UPDATE` is still needed for the case where the page was
-        // indexed, swept, and re-claimed within the same set.
         link_words_to_page(
             &self.pool,
             page_id,
@@ -235,16 +222,6 @@ impl DB for Psql {
     }
 
     async fn undo_indexing(&self, page_id: Uuid) -> Result<(), AppError> {
-        // Drop whatever the attempt wrote. Un-marking the page is not enough on
-        // its own: the next attempt upserts the words it finds now, and a word
-        // that was removed from the page in the meantime is never deleted from
-        // anywhere. It would go on contributing to the page's score for as long
-        // as the row lived, which is forever.
-        //
-        // This and the `DO UPDATE` in `batch_link_words_to_page` are what make
-        // indexing a page a replace rather than a merge. A page can only be
-        // claimed while `indexed = FALSE`, and the only ways into that state are
-        // here and the stale sweep, so every re-index passes through one of them.
         let removed = sqlx::query!("DELETE FROM page_word WHERE page_id = $1", page_id)
             .execute(&self.pool)
             .await?;
@@ -283,11 +260,7 @@ impl DB for Psql {
     }
 }
 
-// Function connect to postgres and test it
-// return a pool connect
 async fn db_connectioon(conf: &PsqlConfig) -> Result<Pool<Postgres>, AppError> {
-    // Startup parameters, so they apply to every connection handed out by the pool.
-    // Without these a lock wait is unbounded and a worker task can hang forever.
     let lock_timeout = format!("{}", conf.lock_timeout_ms);
     let statement_timeout = format!("{}", conf.statement_timeout_ms);
     let opts: PgConnectOptions = conf.url.parse()?;
@@ -328,44 +301,11 @@ async fn db_connectioon(conf: &PsqlConfig) -> Result<Pool<Postgres>, AppError> {
     Ok(pool)
 }
 
-// Function to insert words in batch and return their ids
 async fn upsert_words(pool: &Pool<Postgres>, words: Vec<String>) -> Result<HashMap<String, Uuid>> {
     if words.is_empty() {
         return Ok(HashMap::new());
     }
 
-    // Using UNNEST to pass the entire vector as one parameter ($1)
-    //
-    // Two statements, because the obvious one-statement form was the single worst
-    // bug in this service. It used to be:
-    //
-    //     WITH inserted AS (
-    //         INSERT INTO words (word) SELECT * FROM UNNEST($1::text[])
-    //         ON CONFLICT (word) DO NOTHING
-    //     )
-    //     SELECT words.id, words.word FROM words
-    //     INNER JOIN UNNEST($1::text[]) u(word) ON words.word = u.word
-    //
-    // which reads as "insert the words, then look them up". But every
-    // sub-statement in a WITH sees the *same* snapshot as the main query, so the
-    // trailing SELECT could not see anything `inserted` had just written. It only
-    // ever found words that were already in the table -- and a word that is
-    // already in the table is, by definition, a word some earlier page put there.
-    //
-    // The consequences compounded. `upsert_words` returned nothing for new words,
-    // so `word_id_count` was empty, so `link_words_to_page` returned early, so
-    // `batch_words` reported success having written no rows. The job was acked and
-    // the page marked indexed. A brand new word was therefore dropped on the floor
-    // unless the same page happened to be crawled again later -- so on a fresh
-    // index every page had to be visited twice before it contributed anything, and
-    // a page visited once was invisible to search for good. Nothing was logged
-    // above ERROR anywhere along that chain.
-    //
-    // The single-statement alternative is `ON CONFLICT DO UPDATE ... RETURNING`,
-    // which does return every input word. It is not used here because it takes a
-    // row lock on every word that already exists, and the common words in a crawl
-    // are exactly the ones every worker wants at the same time. `DO NOTHING` plus
-    // a separate read keeps concurrent workers from serialising on each other.
     sqlx::query!(
         r#"INSERT INTO words (word)
            SELECT * FROM UNNEST($1::text[])
@@ -375,9 +315,6 @@ async fn upsert_words(pool: &Pool<Postgres>, words: Vec<String>) -> Result<HashM
     .execute(pool)
     .await?;
 
-    // Every requested word exists by now: it was either already there or the
-    // statement above put it there. `words.word` is UNIQUE, so this returns
-    // exactly one row per input and the join is redundant.
     let rows = sqlx::query!(
         r#"SELECT id, word FROM words WHERE word = ANY($1)"#,
         &words[..]
@@ -393,20 +330,15 @@ async fn upsert_words(pool: &Pool<Postgres>, words: Vec<String>) -> Result<HashM
     Ok(ids)
 }
 
-/// `words.word` is `VARCHAR(25)`. A longer value is an error, not a truncation,
-/// so it has to be filtered before it reaches the statement.
-///
-/// This is not a theoretical bound: real pages are full of long unbroken
-/// alphabetic runs -- minified JavaScript identifiers, CSS class names, base64
-/// blobs, long URL path segments. Since the upsert takes the whole batch as one
-/// statement, a single 26-character token on an otherwise ordinary page fails
-/// every word on that page, and the error used to be swallowed, so the page was
-/// acked with nothing indexed.
-///
-/// The limit is named rather than inlined so it reads as a schema fact and not a
-/// tuning knob; it mirrors `migration/01_schema.sql`.
+/// Longest word indexed, in characters. Longer tokens are dropped rather than
+/// truncated, since a truncated word would be wrong and an untruncated one would
+/// overflow the column. 25 covers English prose with room to spare.
 const MAX_WORD_LEN: usize = 25;
 
+/// Upserts word rows in chunks and returns each word's id.
+///
+/// Chunked because Postgres caps a statement at 65535 bind parameters, and a
+/// page can easily have more distinct words than that.
 async fn batch_upsert_words(
     pool: &Pool<Postgres>,
     words: Vec<String>,
@@ -419,17 +351,12 @@ async fn batch_upsert_words(
 
     let mut all_ids = HashMap::with_capacity(words.len());
 
-    // Process words in chunks
     for chunk in words.chunks(batch_size) {
         match upsert_words(pool, chunk.to_vec()).await {
             Ok(chunk_ids) => {
                 all_ids.extend(chunk_ids);
             }
             Err(err) => {
-                // Returning the first failure rather than continuing is the point.
-                // Carrying on produced an id map missing the whole chunk, which
-                // `batch_words` then linked as a partial page, and the missing-id
-                // check above could not tell that apart from a filter decision.
                 error!(log, "failed to upsert batch of words";
                       "batch_size" => chunk.len(),
                       "error" => %err
@@ -454,8 +381,6 @@ async fn link_words_to_page(
         return Ok(());
     }
 
-    // Same ordering guarantee as the word upsert, so concurrent workers never
-    // grab page_word locks in conflicting orders.
     let mut entries: Vec<_> = word_id_count.iter().collect();
     entries.sort_unstable_by_key(|(id, _)| **id);
 
@@ -527,38 +452,16 @@ async fn batch_link_words_to_page(
     return Ok(());
 }
 
-/// Integration tests against a live PostgreSQL.
-///
-/// Every test here is `#[ignore]`d and runs only under `cargo test -- --ignored`,
-/// which `just test-integration` does for you. They need `DATABASE_URL` to point
-/// at the throwaway `boogle_test` database that `scripts/setup-test-db.sh`
-/// creates -- never the live index, because these tests write and delete rows.
-///
-/// `MockDB` in `indexer.rs` covers the *policy* around this trait: which jobs get
-/// requeued, when a claim is released, how many attempts a page gets. It cannot
-/// cover the *SQL*, and the SQL is where the interesting failures live -- a
-/// column renamed in `01_schema.sql`, a conflict clause that quietly keeps stale
-/// values, an error that gets logged and dropped. A mock that agrees with broken
-/// SQL is worse than no test, because it is confidently green.
-///
-/// Every test seeds under a `https://it-<name>-<uuid>` URL and deletes it
-/// afterwards, so the tests are order-independent and can be run in parallel.
 #[cfg(test)]
 mod db_integration {
     use super::*;
     use slog::Drain;
     use std::env;
 
-    /// A logger that discards everything, so the tests do not spew slog output.
     fn test_logger() -> Logger {
         Logger::root(slog::Discard.fuse(), slog::o!())
     }
 
-    /// The DSN to test against, or `None` to skip the test.
-    ///
-    /// Skipping rather than failing is deliberate: `cargo test -- --ignored` on a
-    /// machine with no database should be a clean no-op, not a wall of red that
-    /// hides real failures.
     fn dsn() -> Option<String> {
         match env::var("DATABASE_URL") {
             Ok(url) if !url.is_empty() => Some(url),
@@ -583,7 +486,6 @@ mod db_integration {
         }
     }
 
-    /// Connect, or skip the calling test.
     macro_rules! store_or_skip {
         () => {
             match dsn() {
@@ -595,10 +497,6 @@ mod db_integration {
         };
     }
 
-    /// Seed an unindexed page and return its id.
-    ///
-    /// `updated_at` is pushed into the past so the page is old enough for
-    /// `get_stale_unindexed`, which filters on it.
     async fn seed_page(store: &Psql, label: &str) -> (Uuid, Uuid) {
         let url = format!("https://it-{label}-{}/", Uuid::new_v4());
         let url_id: Uuid = sqlx::query_scalar("INSERT INTO urls (url) VALUES ($1) RETURNING id")
@@ -618,7 +516,6 @@ mod db_integration {
         (url_id, page_id)
     }
 
-    /// Remove everything a seeded page owns. Cascades handle pages and page_word.
     async fn cleanup(store: &Psql, url_id: Uuid) {
         sqlx::query("DELETE FROM urls WHERE id = $1")
             .bind(url_id)
@@ -631,16 +528,9 @@ mod db_integration {
         pairs.iter().map(|(w, c)| (w.to_string(), *c)).collect()
     }
 
-    // ── get_page_by_id ───────────────────────────────────────────────────────
-
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn get_page_by_id_returns_the_html_and_claims_the_page() {
-        // Claiming is the whole point of this call: the page is flipped to
-        // indexed with a timestamp so no other worker picks it up, and
-        // get_stale_unindexed will release it if this worker dies. A
-        // `get_page_by_id` that returned the page without claiming it would let
-        // every worker in the pool index the same page.
         let store = store_or_skip!();
         let (url_id, page_id) = seed_page(&store, "claim").await;
 
@@ -666,9 +556,6 @@ mod db_integration {
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn get_page_by_id_reports_a_page_it_already_claimed_as_not_found() {
-        // The second call is what a duplicate delivery of the same RabbitMQ
-        // message looks like. It has to be a NotFound rather than a second
-        // successful claim, or the same page gets indexed twice concurrently.
         let store = store_or_skip!();
         let (url_id, page_id) = seed_page(&store, "dup").await;
 
@@ -686,9 +573,6 @@ mod db_integration {
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn get_page_by_id_reports_a_random_id_as_not_found() {
-        // The caller requeues on any error, so a missing page has to arrive as
-        // an Err. Returning a zero-value Page here would index an empty
-        // document under a real page id.
         let store = store_or_skip!();
 
         match store.get_page_by_id(Uuid::new_v4()).await {
@@ -696,8 +580,6 @@ mod db_integration {
             other => panic!("a random id resolved to a page: {other:?}"),
         }
     }
-
-    // ── batch_words ──────────────────────────────────────────────────────────
 
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
@@ -730,12 +612,6 @@ mod db_integration {
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn batch_words_on_a_recrawled_page_replaces_the_old_term_frequencies() {
-        // Re-crawling is routine, and the HTML often changed in the meantime. The
-        // insert used to be `ON CONFLICT (page_id, word_id) DO NOTHING`, which
-        // silently kept the term frequency from the first crawl forever: a word
-        // that went from 5 occurrences to 9 stayed at 5, and a word that was
-        // deleted from the page kept contributing to its score forever. Nothing
-        // errored; the ranking was just quietly wrong for as long as the page lived.
         let store = store_or_skip!();
         let (url_id, page_id) = seed_page(&store, "recrawl").await;
 
@@ -777,14 +653,6 @@ mod db_integration {
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn batch_words_reports_a_failed_link_instead_of_swallowing_it() {
-        // `link_words_to_page` failing used to be logged and then turned into
-        // `Ok(())`. The caller in `indexer.rs` only requeues on an error, so a
-        // swallowed failure meant the job was acked, the page stayed marked
-        // indexed, and its words were never written -- permanently invisible to
-        // search, with nothing in the logs above ERROR to say why.
-        //
-        // A page id that does not exist makes the page_word insert fail its
-        // foreign key, which is the smallest way to reach that branch.
         let store = store_or_skip!();
 
         let result = store
@@ -801,9 +669,6 @@ mod db_integration {
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn batch_words_with_nothing_to_index_is_a_no_op() {
-        // A page whose HTML is nothing but script and style tokenizes to nothing.
-        // That must be a success, not an error, or every JS-only page is requeued
-        // forever.
         let store = store_or_skip!();
         let (url_id, page_id) = seed_page(&store, "empty").await;
 
@@ -826,16 +691,6 @@ mod db_integration {
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn batch_words_drops_a_token_too_long_for_the_column_instead_of_failing() {
-        // `words.word` is VARCHAR(25) and Postgres raises on a longer value rather
-        // than truncating, so a single long token used to fail the entire upsert
-        // batch -- which is every word on the page. Real pages are full of long
-        // unbroken alphabetic runs: minified JavaScript, CSS class names, base64
-        // blobs, long path segments. Any of them made the whole page silently
-        // unindexable, because the error was swallowed further up.
-        //
-        // The token is dropped and the rest of the page is indexed. Truncating
-        // instead would merge distinct long words onto one key, which is worse
-        // than losing the one.
         let store = store_or_skip!();
         let (url_id, page_id) = seed_page(&store, "longtoken").await;
 
@@ -870,9 +725,6 @@ mod db_integration {
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn batch_words_spans_more_rows_than_the_batch_size_holds() {
-        // The batching is there to keep the parameter list under Postgres's
-        // 65535 limit. Words whose counts are chunked across several batches must
-        // all be linked, and the chunking is invisible from the call site.
         let store = store_or_skip!();
         let (url_id, page_id) = seed_page(&store, "chunked").await;
 
@@ -896,14 +748,9 @@ mod db_integration {
         cleanup(&store, url_id).await;
     }
 
-    // ── undo_indexing ────────────────────────────────────────────────────────
-
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn undo_indexing_returns_the_page_to_the_queue_and_counts_the_attempt() {
-        // The whole retry contract rests on this: a page whose indexing failed
-        // has to go back to being unindexed, and the attempt has to be recorded
-        // so `get_stale_unindexed` eventually gives up on it.
         let store = store_or_skip!();
         let (url_id, page_id) = seed_page(&store, "undo").await;
 
@@ -933,13 +780,6 @@ mod db_integration {
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn undo_indexing_discards_the_words_the_failed_attempt_wrote() {
-        // Un-marking the page is only half of undoing an indexing. A page is
-        // re-indexed whenever it is re-crawled, and the content usually changed in
-        // between. The words this attempt wrote are a partial index of a version
-        // of the page that no longer exists; leaving them means the retry's
-        // `DO UPDATE` refreshes the words it still sees while the ones the page
-        // no longer contains stay behind, scoring the page on content that was
-        // deleted weeks ago.
         let store = store_or_skip!();
         let (url_id, page_id) = seed_page(&store, "undo-words").await;
 
@@ -970,9 +810,6 @@ mod db_integration {
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn undo_indexing_is_safe_on_a_page_that_does_not_exist() {
-        // The rollback path calls this after a failure, and the failure may have
-        // been the page disappearing. It must not raise a second error on top of
-        // the first, or the original cause is lost behind "no page found".
         let store = store_or_skip!();
         store
             .undo_indexing(Uuid::new_v4())
@@ -983,8 +820,6 @@ mod db_integration {
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn undo_indexing_does_not_touch_another_pages_attempt_count() {
-        // A missing `WHERE id = $1` would reset every page's attempts and hand
-        // the whole failed backlog back to the workers at once.
         let store = store_or_skip!();
         let (url_id, page_id) = seed_page(&store, "undo-a").await;
         let (other_url_id, other_page_id) = seed_page(&store, "undo-b").await;
@@ -1013,15 +848,9 @@ mod db_integration {
         cleanup(&store, other_url_id).await;
     }
 
-    // ── get_stale_unindexed ──────────────────────────────────────────────────
-
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn get_stale_unindexed_reclaims_a_page_whose_worker_died() {
-        // A page is claimed by get_page_by_id before any work starts. If the
-        // worker is killed -- OOM, deploy, panic -- the claim is never released
-        // and the page is invisible to search forever. The sweep is the only
-        // thing that brings it back.
         let store = store_or_skip!();
         let (url_id, page_id) = seed_page(&store, "stale").await;
 
@@ -1056,10 +885,6 @@ mod db_integration {
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn get_stale_unindexed_leaves_a_worker_that_is_still_working_alone() {
-        // The mirror image of the test above, and the reason the sweep takes an
-        // age at all: a page claimed seconds ago belongs to a worker that is
-        // still indexing it. Releasing it hands the same page to a second
-        // worker, and the two race to write the same page_word rows.
         let store = store_or_skip!();
         let (url_id, page_id) = seed_page(&store, "fresh").await;
 
@@ -1094,9 +919,6 @@ mod db_integration {
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn get_stale_unindexed_gives_up_on_a_page_after_three_failed_attempts() {
-        // Without a ceiling, a page that reliably fails -- a 500, a login wall,
-        // a malformed body -- is picked up by every sweep forever, and the
-        // backlog never drains. The ceiling is 3, hard-coded in the query.
         let store = store_or_skip!();
         let (url_id, page_id) = seed_page(&store, "gave-up").await;
 
@@ -1122,8 +944,6 @@ mod db_integration {
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn get_stale_unindexed_honours_its_limit() {
-        // The limit is the sweep's only brake. Ignoring it would pull the entire
-        // backlog into memory at once.
         let store = store_or_skip!();
 
         let mut seeded = Vec::new();
@@ -1146,9 +966,6 @@ mod db_integration {
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn get_stale_unindexed_returns_the_oldest_pages_first() {
-        // Ordering is what makes the sweep drain a backlog rather than spin on
-        // the same few pages: the oldest unindexed page is the one most likely
-        // to be sitting in the queue unclaimed.
         let store = store_or_skip!();
 
         let (older_url, older) = seed_page(&store, "older").await;
@@ -1181,13 +998,9 @@ mod db_integration {
         cleanup(&store, newer_url).await;
     }
 
-    // ── connection lifecycle ─────────────────────────────────────────────────
-
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn connecting_to_a_database_that_is_not_there_fails_cleanly() {
-        // A bad DSN is an operator error, and it should surface as an AppError
-        // naming the connection rather than a panic from inside sqlx.
         let bogus = match dsn() {
             Some(url) => url,
             None => return,

@@ -10,14 +10,10 @@ import (
 	"github.com/google/uuid"
 )
 
-// page builds a page whose only varying attributes are the tie-breakers, so a
-// test can force an exact tie on every key the comparator looks at.
 func page(title string, words int, prScore, tfidf float64) *model.Page {
 	return pageWithURL(title, words, 0, prScore, tfidf)
 }
 
-// pageWithURL gives each page a distinct URL and ID, so the only thing that can
-// separate two of them is one of the comparator's keys.
 func pageWithURL(title string, words, n int, prScore, tfidf float64) *model.Page {
 	w := make(map[string]int, words)
 	for i := 0; i < words; i++ {
@@ -32,16 +28,7 @@ func pageWithURL(title string, words, n int, prScore, tfidf float64) *model.Page
 	}
 }
 
-// TestLessIsAsymmetric is the regression test for the comparator defect.
-//
-// The old comparator ended in `return -1`, so for two pages that tied on score,
-// word count and title it reported both cmp(a, b) == -1 and cmp(b, a) == -1.
-// slices.SortStableFunc fed that inconsistent answer straight into the sort, and
-// the resulting order depended on the input order -- which came from a Go map,
-// so it changed from run to run.
 func TestLessIsAsymmetric(t *testing.T) {
-	// Same score, same word count, same title, same URL: the only thing left to
-	// separate them is the ID fallback.
 	for i := 0; i < 500; i++ {
 		a := page("same", 3, 0.5, 0.5)
 		b := page("same", 3, 0.5, 0.5)
@@ -138,17 +125,10 @@ func TestLessIsTransitive(t *testing.T) {
 	}
 }
 
-// TestSortIsDeterministic is the user-visible symptom: one query, many runs,
-// one answer.
 func TestSortIsDeterministic(t *testing.T) {
 	build := func() map[*model.Page]float64 {
 		pages := map[*model.Page]float64{}
 		for i := 0; i < 40; i++ {
-			// Constant tf-idf and PR score, so every GlobalScore is 0.5. Titles
-			// and word counts both cycle with periods coprime to 40, so groups of
-			// four pages tie on score, word count *and* title. Without a total
-			// ordering those groups land in whatever order the map happened to
-			// iterate in, which differs on every run.
 			title := fmt.Sprintf("title-%02d", i%4)
 			words := i % 3
 			pages[pageWithURL(title, words, i, 0.5, 0.5)] = 0.5
@@ -162,8 +142,6 @@ func TestSortIsDeterministic(t *testing.T) {
 	}
 	wantOrder := order(want)
 
-	// Each iteration rebuilds an equal map with fresh UUIDs, which is exactly
-	// what a new request does.
 	for run := 0; run < 200; run++ {
 		got, err := sort(build(), 0.5)
 		if err != nil {
@@ -191,8 +169,6 @@ func order(pages []*model.Page) []string {
 }
 
 func TestSortIsStableForFullyTiedPages(t *testing.T) {
-	// Distinct URLs but identical on every comparator key, so only stability can
-	// decide the order.
 	pages := make([]*model.Page, 0, 10)
 	m := make(map[*model.Page]float64, 10)
 	for i := 0; i < 10; i++ {
@@ -219,7 +195,6 @@ func TestSortIsStableForFullyTiedPages(t *testing.T) {
 			t.Errorf("GlobalScore = %f, want 0.5", p.GlobalScore)
 		}
 	}
-	// No page may be dropped or duplicated.
 	seen := make(map[string]bool, len(got))
 	for _, p := range got {
 		if seen[p.URL] {

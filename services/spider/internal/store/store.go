@@ -13,13 +13,6 @@ import (
 	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
 
-// Cache is the host-metadata half of the store's Redis usage.
-//
-// The frontier, the visited set and the delay bookkeeping used to be here too,
-// and are now policy.State. They moved because they are crawl decisions, not
-// storage: the old frontier script destroyed the entries it popped, and nothing
-// in this file could have prevented that, because nothing in this file knew what
-// a decision was.
 type Cache interface {
 	AddHostMetaData(ctx context.Context, h string, host *entity.Host) error
 	GetHostMetaData(ctx context.Context, h string) (*entity.Host, bool, error)
@@ -41,13 +34,6 @@ type Store struct {
 	log    *slog.Logger
 }
 
-// NewStore builds a store over an already-open cache connection and the policy
-// state layered on the same connection.
-//
-// Both are parameters because they are one thing. The policy manager owns the
-// frontier and the visited set; if the store reached into its own cache for them
-// there would be two frontiers, and the one the crawl read would not be the one
-// the crawl wrote.
 func NewStore(conf config.StoreConfig, log *utils.Logger, cache Cache, state policy.State) *Store {
 	return &Store{
 		db:     NewDbClient(conf.DB),
@@ -105,19 +91,6 @@ func (s *Store) persistPage(ctx context.Context, page *entity.Page) (pageID uuid
 		s.log.Warn("", "url", page.URL, "err", err)
 		return pageID, err
 	}
-	// Nothing here decides anything about the crawl any more.
-	//
-	// This function used to end by marking the page visited and enqueueing its
-	// links, and both of those were crawl decisions made by a database layer: a
-	// store that writes rows is not entitled to decide when a URL has been seen, or
-	// what the crawl should look at next. Two of them were, in particular, invisible
-	// -- nothing counted a refusal, because nothing here could refuse, and the
-	// frontier filled with links that a different function later removed.
-	//
-	// The loop does both now, through the policy manager, after this returns and
-	// only if the insert committed. A page that failed to store stays crawlable,
-	// which is the same rule as before and for the same reason: a page fetched and
-	// then lost to a database error is a page worth fetching again.
 	return pageID, nil
 }
 
@@ -132,14 +105,6 @@ func (s *Store) GetHostMetaData(ctx context.Context, h string) (*entity.Host, bo
 	return s.cache.GetHostMetaData(ctx, h)
 }
 
-// Init seeds the frontier with the start URLs, unless there is work already
-// queued.
-//
-// A frontier length that cannot be read is an error, not an empty frontier. The
-// old CountUrls swallowed the failure and returned 0, which read as "empty" and
-// therefore as "seed it" -- so a Redis blip at startup re-enqueued every start URL
-// on top of a frontier that was already full, and the URLs already crawled got
-// their priority counted up again for no reason.
 func (s *Store) Init(starters []string) error {
 	ctx := context.Background()
 
