@@ -177,16 +177,32 @@ func categorizeError(err error) (ActionKind, Reason) {
 	if errors.As(err, &unknownAuthority) {
 		return ActBackoff, ReasonTLSError
 	}
+	var pUnknown *x509.UnknownAuthorityError
+	if errors.As(err, &pUnknown) {
+		return ActBackoff, ReasonTLSError
+	}
 	var certInvalid x509.CertificateInvalidError
 	if errors.As(err, &certInvalid) {
+		return ActBackoff, ReasonTLSError
+	}
+	var pCertInvalid *x509.CertificateInvalidError
+	if errors.As(err, &pCertInvalid) {
 		return ActBackoff, ReasonTLSError
 	}
 	var hostnameMismatch x509.HostnameError
 	if errors.As(err, &hostnameMismatch) {
 		return ActBackoff, ReasonTLSError
 	}
+	var pHostMismatch *x509.HostnameError
+	if errors.As(err, &pHostMismatch) {
+		return ActBackoff, ReasonTLSError
+	}
 	var recordHeader tls.RecordHeaderError
 	if errors.As(err, &recordHeader) {
+		return ActBackoff, ReasonTLSError
+	}
+	var pRecordHeader *tls.RecordHeaderError
+	if errors.As(err, &pRecordHeader) {
 		return ActBackoff, ReasonTLSError
 	}
 	var certVerify *tls.CertificateVerificationError

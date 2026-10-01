@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"context"
 	"encoding/xml"
 	"fmt"
 	"net/http"
@@ -35,7 +36,7 @@ func parseSitemap(file []byte) (*SiteMaps, error) {
 	return &sitemap, nil
 }
 
-func fetchSitemap(client *http.Client, sitemapURL string, host *url.URL) ([]string, error) {
+func fetchSitemap(ctx context.Context, client *http.Client, sitemapURL string, host *url.URL) ([]string, error) {
 	siteUrl, err := url.Parse(sitemapURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetching sitemap: invalid URL %s: %w", sitemapURL, err)
@@ -50,12 +51,18 @@ func fetchSitemap(client *http.Client, sitemapURL string, host *url.URL) ([]stri
 		siteUrl.Host = host.Host
 	}
 
-	file, _, err := utils.GetReq(client, siteUrl.String(), 1, 5)
+	res, err := utils.GetReq(ctx, client, siteUrl.String(), utils.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("fetching sitemap: %w", err)
 	}
+	// The old code parsed whatever came back and ignored the status, so a sitemap
+	// that answered 404 with an HTML error page was reported as a parse failure --
+	// which reads like a broken sitemap file and is actually a missing one.
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetching sitemap: %s returned %d", sitemapURL, res.StatusCode)
+	}
 
-	d, err := parseSitemap(file)
+	d, err := parseSitemap(res.Body)
 	if err != nil {
 		return nil, fmt.Errorf("parsing sitemap: %w", err)
 	}
@@ -78,10 +85,21 @@ func fetchSitemap(client *http.Client, sitemapURL string, host *url.URL) ([]stri
 	return r, nil
 }
 
-func FetchSitemaps(client *http.Client, s []string, host *url.URL) []string {
+// FetchSitemaps expands the sitemap URLs a host advertises into page URLs.
+//
+// A sitemap that cannot be read is skipped rather than returned as an error, and
+// that is a deliberate choice about severity: a missing or malformed sitemap costs
+// the discovery of some URLs and nothing else. It used to be fatal to the whole
+// host, which is how a site with one broken sitemap reference became a site that
+// could not be crawled at all.
+//
+// The context is honoured so that a crawl shutting down does not wait on a
+// sitemap fetch, and so that the caller can bound a sitemap that is taking
+// minutes to serve a file with fifty thousand entries in it.
+func FetchSitemaps(ctx context.Context, client *http.Client, s []string, host *url.URL) []string {
 	r := make([]string, 0)
 	for _, sitemapURL := range s {
-		if siteUrls, err := fetchSitemap(client, sitemapURL, host); err == nil {
+		if siteUrls, err := fetchSitemap(ctx, client, sitemapURL, host); err == nil {
 			r = append(r, siteUrls...)
 		}
 	}

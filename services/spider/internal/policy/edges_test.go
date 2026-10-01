@@ -344,6 +344,7 @@ func TestReasonStringsAreDistinct(t *testing.T) {
 		ReasonBodyTooLarge,
 		ReasonContentTypeRejected,
 		ReasonAttemptsExhausted,
+		ReasonBodyUnparseable,
 	}
 
 	seen := map[Reason]bool{}

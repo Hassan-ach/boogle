@@ -100,8 +100,7 @@ func TestAdmitLinksCountsEveryRefusal(t *testing.T) {
 		t.Fatalf("refused = %v, want three entries", refused)
 	}
 
-	stats := st.Stats("example.com")
-	if n := stats[ReasonExtensionSkipped]; n != 3 {
+	if n := st.Stats("example.com")[ReasonExtensionSkipped]; n != 3 {
 		t.Errorf("extensions skipped = %d, want 3; a refusal nobody counts is "+
 			"a refusal nobody can explain", n)
 	}
@@ -474,5 +473,56 @@ func TestDefaultUserAgentNamesTheBot(t *testing.T) {
 	// And an empty one still gets something identifiable rather than the Go default.
 	if got := defaultUserAgent(Config{}); !strings.Contains(got, defaultBotUserAgent) {
 		t.Errorf("defaultUserAgent(Config{}) = %q, want the bot name", got)
+	}
+}
+
+// TestHTTPRobotsFetcherGivesUpOnASilentHost is the timeout that does nothing at all
+// unless it is here.
+//
+// A server that accepts the connection and then sends nothing is the failure mode
+// the constant exists for, and it is invisible to every other test in this file: a
+// fetch that hangs produces the same absence of output as a fetch that was never
+// made. So the assertion is about returning at all, and the deadline is what makes
+// the test cost a tenth of a second instead of ten seconds.
+//
+// The deadline is applied as a context deadline on top of whatever the caller and
+// the shared client already have, so a client with no timeout of its own -- which is
+// exactly what WithRobotsClient installs -- cannot reintroduce the hang.
+func TestHTTPRobotsFetcherGivesUpOnASilentHost(t *testing.T) {
+	// Restore it, so one slow test cannot make the rest of the package slower.
+	original := defaultRobotsTimeout
+	defaultRobotsTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { defaultRobotsTimeout = original })
+
+	blocked := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Accept the request, send no status line, no headers and no body, and
+		// wait to be told to stop.
+		<-blocked
+	}))
+	defer srv.Close()
+	defer close(blocked)
+
+	// A client with no timeout of its own, which is the whole point: the deadline
+	// has to be the fetcher's, not inherited from the caller's.
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := newHTTPRobotsFetcher(&http.Client{}, "Bot")(t.Context(), srv.URL+"/robots.txt")
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("a robots.txt fetch against a silent server reported no error")
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("the fetch took %v to give up on a silent host; the deadline is "+
+				"the only thing bounding it", elapsed)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("a silent host held the fetch for the whole test: there is no " +
+			"deadline on the robots.txt request")
 	}
 }

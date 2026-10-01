@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 	"uuid"
@@ -21,12 +21,34 @@ import (
 	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
 
+// pageStore is the part of the store the crawl loop uses.
+//
+// It is an interface rather than *store.Store for one reason: the interesting
+// behaviour of the loop is *which* page it decides to persist and which it
+// decides not to, and a test that has to stand up Postgres to observe that cannot
+// be written. The concrete store satisfies it unchanged.
+type pageStore interface {
+	Init(startUrls []string) error
+	Persist(ctx context.Context, page *entity.Page, host *entity.Host) uuid.UUID
+	Close()
+}
+
+// htmlParser turns a fetched body into a page.
+//
+// Also an interface, for the same reason, and for a second one: a parser that
+// cannot fail is not a parser, so the "fetched fine, would not parse" path --
+// which has to retire the URL rather than re-fetch it for ever -- needs a parser
+// that fails on demand to be reachable at all.
+type htmlParser interface {
+	ParseHTML(r io.Reader, baseURL string) (*entity.Page, error)
+}
+
 type Spider struct {
 	config     *config.Config
 	httpClient *http.Client
-	store      *store.Store
+	store      pageStore
 	mq         messaging.MessagingQueue
-	parser     *parser.Parser
+	parser     htmlParser
 	// policy owns every decision about what to crawl. The loop below asks it
 	// what to fetch and what a fetch outcome means, and forms no opinion of its
 	// own.
@@ -63,13 +85,31 @@ func NewSpider(conf *config.Config) *Spider {
 		conf.Policy.URLStateTTL,
 	)
 
+	policyManager := policy.New(conf.Policy, policyState, logger.Logger).
+		// The crawler already has a connection pool for every URL it fetches;
+		// giving the policy manager a second one would be a second set of sockets
+		// to the same hosts. robots.txt goes through the same pool for the same
+		// reason: it is fetched from the same hosts, at the same rate, under the
+		// same timeout policy, and a caller reading either cannot see the other.
+		WithFetchClient(httpClient).
+		WithRobotsClient(httpClient).
+		// Reading and parsing a sitemap is the parser's job and deciding what to do
+		// with the result is the policy manager's. The seam exists so the manager
+		// never has to know the XML, and so a sitemap is expanded once per host per
+		// robots.txt reading -- rather than once per URL from a host we had never
+		// seen, which is what the old code did, and why a dead domain cost a
+		// request per URL for ever.
+		WithSiteMapResolver(func(ctx context.Context, base *url.URL, sitemaps []string) []string {
+			return parser.FetchSitemaps(ctx, httpClient, sitemaps, base)
+		})
+
 	s := &Spider{
 		config:         conf,
 		httpClient:     httpClient,
 		mq:             mq,
 		parser:         parser.NewParser(httpClient, logger),
 		store:          store.NewStore(conf.Store, logger, cache, policyState),
-		policy:         policy.New(conf.Policy, policyState, logger.Logger),
+		policy:         policyManager,
 		wg:             sync.WaitGroup{},
 		ctx:            ctx,
 		cancel:         cancel,
@@ -162,78 +202,111 @@ func (s *Spider) crawl(crawler_id int) {
 	}
 
 	rawUrl := next.URL
-	logger.Info("Fetched URL from store",
-		"url", rawUrl)
 
-	u, err := url.Parse(rawUrl)
+	// The gate. Everything this function used to decide for itself -- is this host
+	// known, does it have robots rules, is the path refused, is there budget left
+	// -- is answered here, from Redis, in one place. The switch is the only
+	// branching on whether to fetch that exists in the tree.
+	verdict, err := s.policy.Admit(ctx, rawUrl)
 	if err != nil {
-		logger.Error("Failed to parse URL",
-			"url", rawUrl, "error", err)
+		logger.Error("Could not ask the policy manager about a URL", "url", rawUrl, "error", err)
 		return
 	}
-
-	host, ok, err := s.store.GetHostMetaData(ctx, u.Host)
-	if err != nil {
-		s.logger.Warn("Failed to retrieve host metadata from store, will attempt to generate",
-			"host", u.Host, "error", err)
-	}
-	if !ok {
-		logger.Info("Host metadata not found in store, generating new metadata",
-			"host", u.Host)
-		// Host metadata missing; generate using parser
-		host, err = s.newHostMetaData(ctx, u.Host)
-		if err != nil {
-			logger.Error("generate host metadata",
-				"host", u.Host, "error", err)
-
-			// use a safe default
-			host = &entity.Host{
-				MaxRetry:        5,
-				MaxPages:        10,
-				PagesCrawled:    0,
-				Delay:           5,
-				Name:            u.Host,
-				AllowedUrls:     []string{},
-				NotAllowedPaths: []string{},
-			}
-		} else {
-			logger.Info(
-				"Host metadata retrieved",
-				"host",
-				host.Name,
-				"delay",
-				host.Delay,
-				"max_retry",
-				host.MaxRetry,
-				"not_allowed_paths",
-				len(host.NotAllowedPaths),
-				"allowed_urls",
-				len(host.AllowedUrls),
-			)
+	switch verdict.Kind {
+	case policy.Allow:
+		// Carry on below.
+	case policy.Defer:
+		// Parked, and that verb is doing the work. The URL is already off the
+		// frontier: it was popped before the gate was asked. So a deferred URL is
+		// not "still queued", it is gone unless it is put back here, and parking is
+		// the only thing that puts it back.
+		//
+		// Every Defer the policy manager produces carries a due time -- the two
+		// cases where it cannot know when the *host* may be crawled still know
+		// when to ask again -- and TestEveryDeferComesWithADueTime is what holds
+		// them to that. The check below is therefore a backstop against a verdict
+		// kind added later without one, and it shouts when it fires for that
+		// reason: silently doing nothing is exactly the failure this loop is
+		// guarding against.
+		if verdict.Until.IsZero() {
+			logger.Error("The policy manager deferred a URL with no due time, so it "+
+				"cannot be parked and has been dropped from the frontier",
+				"url", rawUrl, "reason", verdict.Reason)
+		} else if err := s.policy.Park(ctx, rawUrl, verdict.Until); err != nil {
+			logger.Error("Could not park a deferred URL", "url", rawUrl, "error", err)
 		}
-	}
-
-	if utils.IsDisallowed(u.Path, host.NotAllowedPaths) {
-		logger.Info("URL path is disallowed by robots.txt, skipping", "url", rawUrl, "path", u.Path)
+		logger.Debug("URL deferred", "url", rawUrl, "reason", verdict.Reason, "until", verdict.Until)
+		return
+	case policy.Skip:
+		// Terminal, and recorded as such: a Skip is the difference between "not now"
+		// and "not ever", and forgetting that is how a disallowed path comes back
+		// every time a page links to it.
+		if err := s.policy.Retire(ctx, rawUrl); err != nil {
+			logger.Error("Could not retire a skipped URL", "url", rawUrl, "error", err)
+		}
+		logger.Debug("URL skipped", "url", rawUrl, "reason", verdict.Reason)
+		return
+	default:
+		logger.Error("The policy manager returned an unknown verdict", "url", rawUrl, "verdict", verdict.Kind)
 		return
 	}
 
-	page, err := s.fetchAndParse(rawUrl, host.MaxRetry, host.Delay)
+	host := verdict.Host
+
+	// One fetch, one decision about it. The retry loop that used to be here slept
+	// inside a worker slot with a fixed count; the retry is now the delayed set,
+	// which is promoted by a later crawl and knows this host's failure history.
+	body, out := s.policy.Fetch(ctx, rawUrl)
+
+	action, err := s.policy.Classify(ctx, rawUrl, out)
 	if err != nil {
-		logger.Error("Failed to fetch and parse page",
-			"url", rawUrl, "error", err)
+		// The outcome could not be recorded, so the URL's state and the host's
+		// counters have not moved. Dropping the round is the only answer that
+		// cannot produce work nobody authorised; the alternative -- treating an
+		// unrecorded outcome as success -- is how a page gets indexed and then
+		// crawled again.
+		logger.Error("Could not record a fetch outcome",
+			"url", rawUrl, "status", out.StatusCode, "error", err)
+		return
+	}
+	if action.Kind != policy.ActSuccess {
+		// Classify has already parked or retired the URL, counted the reason and
+		// set whatever marker the failure implies. Nothing is left for this loop
+		// to do but not fetch it again.
+		logger.Info("URL not crawled", "url", rawUrl,
+			"action", action.Kind, "reason", action.Reason, "retry_after", action.RetryAfter)
 		return
 	}
 
-	// The parser no longer decides this. It reports what the document claims
-	// about its own language, and the policy manager judges. Until Admit owns
-	// the whole decision (a later phase) the check stays here, but it is now a
-	// distinct, named outcome -- previously the parser returned an error here,
-	// so this line logged "failed to fetch and parse page" for every non-English
-	// page ever seen, and no count of them was possible.
+	page, err := s.parser.ParseHTML(bytes.NewReader(body), rawUrl)
+	if err != nil {
+		// Fetched, and then found not to be a page. Retiring it matters: the
+		// alternative is re-fetching the same unparseable body every time anything
+		// links to it, which is a loop with an unbounded budget.
+		logger.Warn("Discarded a page that would not parse", "url", rawUrl, "error", err)
+		if derr := s.policy.Discard(ctx, rawUrl, policy.ReasonBodyUnparseable); derr != nil {
+			logger.Error("Could not discard an unparseable page", "url", rawUrl, "error", derr)
+		}
+		return
+	}
+	if page.URL == "" {
+		// The parser was given the URL as its base and did not use it.
+		page.URL = rawUrl
+	}
+	page.StatusCode = out.StatusCode
+	page.HTML = body
+
+	// The one check the policy manager cannot make. It reads a document, so it
+	// needs the document, and a lang attribute is only knowable after the fetch.
+	// The parser no longer decides this -- it reports what the document claims and
+	// the policy manager judges and counts it, where before the parser returned an
+	// error and every non-English page in the corpus logged as a failed fetch with
+	// nothing counted anywhere.
 	if !policy.IsEnglish(page.Lang) {
-		logger.Info("Skipping non-English page",
-			"url", rawUrl, "lang", page.Lang)
+		logger.Info("Skipping non-English page", "url", rawUrl, "lang", page.Lang)
+		if err := s.policy.Discard(ctx, rawUrl, policy.ReasonLanguageNotEnglish); err != nil {
+			logger.Error("Could not record a discarded page", "url", rawUrl, "error", err)
+		}
 		return
 	}
 
@@ -249,122 +322,26 @@ func (s *Spider) crawl(crawler_id int) {
 		len(page.Images),
 	)
 
-	normUrls := utils.ValidateLinks(page.Links, host.NotAllowedPaths)
-	page.Links = normUrls
+	page.Links = utils.ValidateLinks(page.Links, host.NotAllowedPaths)
 
-	host.PagesCrawled++
 	pageId := s.store.Persist(ctx, page, host)
 	if pageId == uuid.Nil() {
+		// Not indexed, so not visited: the store marks the page visited only once
+		// the insert has committed, and a page that failed to be stored is a page
+		// worth fetching again. The host's page count has already moved, which is
+		// the safe direction to be wrong in -- it spends budget rather than
+		// granting it.
+		logger.Warn("Page was not persisted; leaving it crawlable", "url", page.URL)
 		return
 	}
-	err = queue.Publish(
+
+	if err := queue.Publish(
 		"indexer.jobs",
 		messaging.NewIndexerJobPayload(pageId.String()),
-	)
-
-	if err != nil {
+	); err != nil {
 		s.logger.Error(
 			"Failed to publish job to indexer queue",
 			"url", page.URL, "error", err,
 		)
 	}
-
-}
-
-func (s *Spider) fetchAndParse(
-	u string,
-	maxRetry, delay int,
-) (*entity.Page, error) {
-	body, statusCode, err := utils.GetReq(s.httpClient, u, maxRetry, delay)
-	if err != nil {
-		// Failed to fetch page after retries
-		// Suggest logging the URL and retry parameters
-		return nil, fmt.Errorf("GET request failed: %w", err)
-	}
-
-	page, err := s.parser.ParseHTML(bytes.NewReader(body), u)
-	if err != nil {
-		// Failed to parse HTML
-		return nil, fmt.Errorf("HTML parsing: %w", err)
-	}
-
-	if page.URL == "" {
-		// Ensure Page.Url is always set
-		page.URL = u
-	}
-	page.StatusCode = statusCode // Store HTTP status code
-	page.HTML = body             // Store raw HTML
-
-	return page, nil
-}
-
-func (s *Spider) newHostMetaData(ctx context.Context, raw string) (host *entity.Host, err error) {
-	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
-		raw = "https://" + raw
-	}
-
-	u, err := url.Parse(strings.TrimPrefix(raw, "www."))
-	if err != nil {
-		return
-	}
-
-	r, err := s.newRobots(u)
-	if err != nil {
-		return nil, err
-	}
-
-	sitemaps := parser.FetchSitemaps(s.httpClient, r.SiteMaps, u)
-
-	// create Host object
-	host = &entity.Host{
-		MaxRetry:        5,
-		Delay:           r.CrawlDelay,
-		MaxPages:        10,
-		PagesCrawled:    0,
-		Name:            u.Host,
-		AllowedUrls:     r.Allow,
-		NotAllowedPaths: r.Disallow,
-	}
-
-	s.logger.Info(
-		"Generated host metadata",
-		"component",
-		"spider",
-		"host",
-		host.Name,
-		"delay",
-		host.Delay,
-	)
-
-	// persist in store
-	err = s.store.GetCache().AddHostMetaData(ctx, host.Name, host)
-	if err != nil {
-		s.logger.Error("Failed to store host metadata in cache", "error", err)
-	}
-	s.policy.Discover(ctx, sitemaps)
-
-	return host, nil
-}
-
-func (s *Spider) newRobots(u *url.URL) (*entity.Robots, error) {
-	h := strings.TrimPrefix(u.Host, "www.")
-
-	u.Scheme = "https"
-	u.Host = h
-	u.RawQuery = ""
-	u.Fragment = ""
-	u.Path = "/robots.txt"
-
-	robotsURL := u.String()
-
-	// fetch robots.txt
-	var body []byte
-	body, _, err := utils.GetReq(s.httpClient, robotsURL, 3, 5)
-	if err != nil {
-		return nil, fmt.Errorf("get robots.txt: %w", err)
-	}
-
-	// parse robots.txt for rules and sitemaps
-	r := s.parser.ParseRobots(string(body), "*")
-	return r, nil
 }

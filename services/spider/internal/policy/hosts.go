@@ -51,7 +51,13 @@ type RobotsFetcher func(ctx context.Context, url string) ([]byte, int, error)
 // holds a crawl worker for as long as the OS TCP timeout allows -- thirty seconds
 // or more, twenty times over, which is the loop this package was written to
 // remove arriving by a different door.
-const defaultRobotsTimeout = 10 * time.Second
+//
+// A variable rather than a constant for one reason: this is the only thing standing
+// between a hanging host and a worker, and the only honest test of it takes as long
+// as the timeout itself. Ten seconds is not a test, so the one test that can catch
+// its removal lowers this for the duration of the test rather than asserting that a
+// ten-second wait happened.
+var defaultRobotsTimeout = 10 * time.Second
 
 // maxRobotsBytes caps how much of a robots.txt is read.
 //
@@ -62,14 +68,32 @@ const maxRobotsBytes = 1 << 20
 
 // WithRobotsFetcher returns a copy of the manager reading robots.txt through f.
 //
-// Production passes the spider's shared client so the crawl has one connection
-// pool rather than two. A manager built without one gets a client of its own,
-// which is fine for a test or a short-lived tool and worth replacing in a
-// long-running process.
+// For a caller that needs to control the whole exchange. Production wants
+// WithRobotsClient instead, which keeps this package's own timeout and its own
+// caps and only shares the connection pool.
 func (m *PolicyManager) WithRobotsFetcher(f RobotsFetcher) *PolicyManager {
 	cp := *m
 	if f != nil {
 		cp.fetchRobots = f
+	}
+	return &cp
+}
+
+// WithRobotsClient returns a copy of the manager reading robots.txt over client.
+//
+// This is the spider's counterpart to WithFetchClient, and it exists for the same
+// reason: the crawler already has a connection pool and a configured timeout for
+// every host it talks to, and the policy manager opening a second pool means a
+// second set of sockets to the same sites, plus a second timeout policy that
+// nothing can see at a glance.
+//
+// The per-request timeout stays. It is applied as a context deadline on top of
+// whatever the shared client has, so a client with no timeout of its own cannot
+// reintroduce the hang this default prevents.
+func (m *PolicyManager) WithRobotsClient(client *http.Client) *PolicyManager {
+	cp := *m
+	if client != nil {
+		cp.fetchRobots = newHTTPRobotsFetcher(client, defaultUserAgent(cp.cfg))
 	}
 	return &cp
 }
@@ -216,7 +240,14 @@ func (m *PolicyManager) EnsureHost(ctx context.Context, host string) (HostState,
 	// times the host just refused; writing a whole new record would reset both.
 	st = st.WithRobots(host, robots.Allow, robots.Disallow, robots.SiteMaps, delay, m.now())
 	st.MaxPages = maxPages
-	st.Status = statusReady
+	// Only for a host that has no verdict yet. Reading a robots.txt successfully
+	// says the host answered once, which is not evidence that a host which has
+	// since been failing is working again -- and the status is the one field that
+	// outlives its markers, so overwriting degraded with ready here would erase the
+	// answer to "is this site working" exactly when it was least deserved.
+	if st.Status == "" {
+		st.Status = statusReady
+	}
 	if st.FirstSeen.IsZero() {
 		st.FirstSeen = m.now()
 	}
@@ -230,6 +261,13 @@ func (m *PolicyManager) EnsureHost(ctx context.Context, host string) (HostState,
 		m.log.Error("could not cache host state; the next url will re-fetch robots.txt",
 			"host", host, "error", err)
 	}
+
+	// Last, and only on the path that actually fetched: a cached hit above has
+	// nothing new to say about the host. A failure here is logged inside and costs
+	// some discovery, which is not worth turning into a Defer for a URL whose
+	// robots.txt is in hand.
+	m.discoverSiteMaps(ctx, st)
+
 	return st, nil
 }
 

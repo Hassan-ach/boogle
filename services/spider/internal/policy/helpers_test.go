@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -193,16 +192,6 @@ func admitReason(t *testing.T, m *PolicyManager, rawURL string) (VerdictKind, Re
 
 // itoa is strconv.Itoa for the small positive counters tests build paths from.
 func itoa(n int) string { return strconv.Itoa(n) }
-
-// hostOfURL reads the host out of a URL, for a test that needs to know which host
-// record a refusal will land on.
-func hostOfURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil || u.Hostname() == "" {
-		return ""
-	}
-	return strings.ToLower(u.Hostname())
-}
 
 // uniquePath builds a URL that has not been admitted before, so a test can admit
 // the same page twice without the second call tripping the visited check.

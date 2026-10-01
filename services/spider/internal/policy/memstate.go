@@ -140,7 +140,7 @@ func (m *MemoryState) expired(host string, kind MarkerKind) bool {
 func (m *MemoryState) MarkVisited(ctx context.Context, urls ...string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.begin(); err != nil {
+	if err := m.beginOp("MarkVisited"); err != nil {
 		return err
 	}
 	for _, u := range urls {
@@ -190,7 +190,7 @@ func (m *MemoryState) EnqueueAt(ctx context.Context, url string, priority float6
 func (m *MemoryState) EnqueueDelayed(ctx context.Context, url string, due time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.begin(); err != nil {
+	if err := m.beginOp("EnqueueDelayed"); err != nil {
 		return err
 	}
 	if url != "" {
@@ -295,7 +295,7 @@ func (m *MemoryState) PromoteDelayed(ctx context.Context, now time.Time, batch i
 func (m *MemoryState) URLState(ctx context.Context, url string) (URLState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.begin(); err != nil {
+	if err := m.beginOp("URLState"); err != nil {
 		return URLState{}, err
 	}
 	if st, ok := m.urlState[url]; ok {
@@ -307,7 +307,7 @@ func (m *MemoryState) URLState(ctx context.Context, url string) (URLState, error
 func (m *MemoryState) BumpAttempts(ctx context.Context, url string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.begin(); err != nil {
+	if err := m.beginOp("BumpAttempts"); err != nil {
 		return 0, err
 	}
 	if url == "" {
@@ -324,7 +324,7 @@ func (m *MemoryState) BumpAttempts(ctx context.Context, url string) (int, error)
 func (m *MemoryState) ClearURLState(ctx context.Context, url string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.begin(); err != nil {
+	if err := m.beginOp("ClearURLState"); err != nil {
 		return err
 	}
 	delete(m.urlState, url)
@@ -343,24 +343,59 @@ func (m *MemoryState) HostState(ctx context.Context, host string) (HostState, er
 	return HostState{Name: host}, nil
 }
 
+// SaveHostState stores the record, counters included.
+//
+// The fake keeps the whole struct where RedisState writes only the fields a
+// robots resolution owns. That asymmetry is the fake's one simplification, and
+// it is worth stating rather than hiding: it lets a test assert a record after a
+// merge without a Redis.
+//
+// The one field the fake does not take from its argument is the sitemap claim,
+// because taking it there would make the fake clobber something RedisState
+// deliberately leaves alone -- and a fake that clobbers more than the real thing
+// is worse than one that clobbers less, because the divergence is invisible until
+// a test written against the fake passes and the real one fails. Preserving it here
+// is what lets the concurrency test below mean what it says.
 func (m *MemoryState) SaveHostState(ctx context.Context, host string, st HostState) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.begin(); err != nil {
+	if err := m.beginOp("SaveHostState"); err != nil {
 		return err
 	}
 	if host == "" {
 		return errEmptyHost
 	}
 	st.Name = host
+	st.SiteMapsClaimedAt = m.host[host].SiteMapsClaimedAt
 	m.host[host] = st
 	return nil
 }
 
-func (m *MemoryState) IncrFailures(ctx context.Context, host string) (int, error) {
+// RecordSuccess counts a page, clears the failure count and stamps the host.
+func (m *MemoryState) RecordSuccess(ctx context.Context, host string, at time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.begin(); err != nil {
+	if err := m.beginOp("RecordSuccess"); err != nil {
+		return err
+	}
+	if host == "" {
+		return nil
+	}
+	st := m.host[host]
+	st.Name = host
+	st.PagesCrawled++
+	st.ConsecFailures = 0
+	st.LastSuccess = at
+	st.Status = statusReady
+	m.host[host] = st
+	return nil
+}
+
+// RecordFailure counts a failure and marks the host degraded.
+func (m *MemoryState) RecordFailure(ctx context.Context, host string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.beginOp("RecordFailure"); err != nil {
 		return 0, err
 	}
 	if host == "" {
@@ -369,39 +404,34 @@ func (m *MemoryState) IncrFailures(ctx context.Context, host string) (int, error
 	st := m.host[host]
 	st.Name = host
 	st.ConsecFailures++
+	st.Status = statusDegraded
 	m.host[host] = st
 	return st.ConsecFailures, nil
 }
 
-func (m *MemoryState) ResetFailures(ctx context.Context, host string) error {
+// ClaimSiteMaps hands the claim to exactly one caller.
+//
+// The whole comparison happens under the lock, which is the property HSETNX gives
+// Redis and the reason the claim is a timestamp rather than a flag: a read, a
+// comparison and a write have to be one indivisible step, or two workers resolving
+// the same new host both see an unclaimed site and both queue it.
+func (m *MemoryState) ClaimSiteMaps(ctx context.Context, host string, at time.Time) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.begin(); err != nil {
-		return err
+	if err := m.beginOp("ClaimSiteMaps"); err != nil {
+		return false, err
+	}
+	if host == "" || at.IsZero() {
+		return false, nil
 	}
 	st := m.host[host]
-	st.ConsecFailures = 0
-	if st.Name == "" {
-		st.Name = host
+	if !st.SiteMapsClaimedAt.Before(at) {
+		return false, nil
 	}
-	m.host[host] = st
-	return nil
-}
-
-func (m *MemoryState) IncrPagesCrawled(ctx context.Context, host string, n int64) (int, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if err := m.begin(); err != nil {
-		return 0, err
-	}
-	if host == "" || n == 0 {
-		return 0, nil
-	}
-	st := m.host[host]
 	st.Name = host
-	st.PagesCrawled += int(n)
+	st.SiteMapsClaimedAt = at
 	m.host[host] = st
-	return st.PagesCrawled, nil
+	return true, nil
 }
 
 func (m *MemoryState) ResetWindow(ctx context.Context, host string, at time.Time) error {
@@ -468,7 +498,7 @@ func (m *MemoryState) SetMarker(ctx context.Context, host string, kind MarkerKin
 func (m *MemoryState) ClearMarker(ctx context.Context, host string, kind MarkerKind) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.begin(); err != nil {
+	if err := m.beginOp("ClearMarker"); err != nil {
 		return err
 	}
 	if _, ok := kind.suffix(); !ok {

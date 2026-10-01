@@ -280,17 +280,33 @@ func TestRedisStateHostStateRoundTrips(t *testing.T) {
 		Name:            "example.com",
 		CrawlDelay:      2500 * time.Millisecond,
 		MaxPages:        500,
-		PagesCrawled:    42,
-		ConsecFailures:  3,
 		Status:          "degraded",
 		WindowStartedAt: first,
 		RobotsFetchedAt: first.Add(time.Hour),
 		FirstSeen:       first.Add(-24 * time.Hour),
-		LastSuccess:     first.Add(2 * time.Hour),
 		Allow:           []string{"/wiki/", "/docs"},
 		Disallow:        []string{"/private/", "/admin/"},
 		SiteMaps:        []string{"https://example.com/sitemap.xml", "https://example.com/news.xml"},
 	}
+	if err := st.SaveHostState(ctx, "example.com", saved); err != nil {
+		t.Fatal(err)
+	}
+
+	// The counters are not part of what a save carries: they move one page at a
+	// time, and a save is a write of a record read earlier. They are driven here
+	// the way the crawl drives them, which is also what proves a save does not
+	// clobber them -- the save above and the counters below interleave.
+	for range 42 {
+		if err := st.RecordSuccess(ctx, "example.com", first.Add(2*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 3 {
+		if _, err := st.RecordFailure(ctx, "example.com"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// And a save afterwards, carrying a record that knows none of it.
 	if err := st.SaveHostState(ctx, "example.com", saved); err != nil {
 		t.Fatal(err)
 	}
@@ -332,17 +348,20 @@ func TestRedisStateHostStateRoundTrips(t *testing.T) {
 }
 
 // TestRedisStateHostStateOmitsUnsetTimestamps guards against writing the epoch
-// over a real timestamp. A HostState built for one purpose can easily have an
-// empty LastSuccess, and saving it must not wipe a real one.
+// over a real timestamp. A HostState built for one purpose can easily leave the
+// window unset -- a save that only knows about robots rules, say -- and writing
+// that zero would end the host's budget window and hand it a fresh one.
 func TestRedisStateHostStateOmitsUnsetTimestamps(t *testing.T) {
 	st, _, _ := newTestState(t)
 	ctx := context.Background()
 
 	real := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	if err := st.SaveHostState(ctx, "example.com", HostState{Name: "example.com", LastSuccess: real}); err != nil {
+	if err := st.SaveHostState(ctx, "example.com", HostState{
+		Name: "example.com", WindowStartedAt: real, RobotsFetchedAt: real,
+	}); err != nil {
 		t.Fatal(err)
 	}
-	// Save again without the timestamp set.
+	// Save again without the timestamps set.
 	if err := st.SaveHostState(ctx, "example.com", HostState{Name: "example.com", MaxPages: 10}); err != nil {
 		t.Fatal(err)
 	}
@@ -351,8 +370,11 @@ func TestRedisStateHostStateOmitsUnsetTimestamps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.LastSuccess.Equal(real) {
-		t.Errorf("LastSuccess = %v, want the earlier %v preserved", got.LastSuccess, real)
+	if !got.WindowStartedAt.Equal(real) {
+		t.Errorf("WindowStartedAt = %v, want the earlier %v preserved", got.WindowStartedAt, real)
+	}
+	if !got.RobotsFetchedAt.Equal(real) {
+		t.Errorf("RobotsFetchedAt = %v, want the earlier %v preserved", got.RobotsFetchedAt, real)
 	}
 	if got.MaxPages != 10 {
 		t.Errorf("MaxPages = %d, want the update to land", got.MaxPages)
@@ -382,34 +404,271 @@ func TestRedisStateCounters(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 1; i <= 3; i++ {
-		got, err := st.IncrFailures(ctx, "example.com")
+		got, err := st.RecordFailure(ctx, "example.com")
 		if err != nil {
 			t.Fatal(err)
 		}
 		if got != i {
-			t.Errorf("IncrFailures = %d, want %d", got, i)
+			t.Errorf("RecordFailure = %d, want %d", got, i)
 		}
 	}
-	if err := st.ResetFailures(ctx, "example.com"); err != nil {
-		t.Fatal(err)
+	state, _ := st.HostState(ctx, "example.com")
+	if state.ConsecFailures != 3 {
+		t.Errorf("ConsecFailures = %d, want 3", state.ConsecFailures)
 	}
-	if st, _ := st.HostState(ctx, "example.com"); st.ConsecFailures != 0 {
-		t.Errorf("ConsecFailures = %d after reset, want 0", st.ConsecFailures)
+	if state.Status != statusDegraded {
+		t.Errorf("Status = %q after three failures, want %q", state.Status, statusDegraded)
 	}
 
-	pages, err := st.IncrPagesCrawled(ctx, "example.com", 1)
-	if err != nil {
+	// A success clears the failure count and adds a page in the same call, which
+	// is the property that lets the counters be maintained without a
+	// read-modify-write that twenty workers would lose.
+	at := time.Date(2026, 7, 4, 10, 0, 0, 0, time.UTC)
+	if err := st.RecordSuccess(ctx, "example.com", at); err != nil {
 		t.Fatal(err)
 	}
-	if pages != 1 {
-		t.Errorf("IncrPagesCrawled = %d, want 1", pages)
+	state, _ = st.HostState(ctx, "example.com")
+	if state.ConsecFailures != 0 {
+		t.Errorf("ConsecFailures = %d after a success, want 0", state.ConsecFailures)
 	}
+	if state.PagesCrawled != 1 {
+		t.Errorf("PagesCrawled = %d, want 1", state.PagesCrawled)
+	}
+	if !state.LastSuccess.Equal(at) {
+		t.Errorf("LastSuccess = %v, want %v", state.LastSuccess, at)
+	}
+	if state.Status != statusReady {
+		t.Errorf("Status = %q after a success, want %q", state.Status, statusReady)
+	}
+
 	if err := st.ResetWindow(ctx, "example.com", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	state, _ := st.HostState(ctx, "example.com")
+	state, _ = st.HostState(ctx, "example.com")
 	if state.PagesCrawled != 0 {
 		t.Errorf("PagesCrawled = %d after window reset, want 0", state.PagesCrawled)
+	}
+}
+
+// TestRedisStateSaveDoesNotTouchCounters is the guard on the split of ownership.
+//
+// SaveHostState's argument is a record read at some earlier moment, and every
+// worker holds one of those. If it wrote the counters, a robots.txt re-read --
+// which happens on a daily schedule and takes a millisecond -- would put back
+// whatever the counters said when it read them, and a page crawled in between
+// would stop having happened. The count is how a host's budget is spent, so this
+// is not a rounding error: a host whose pages are quietly forgotten spends its
+// whole budget twice and is crawled for twice as long as MAX_PAGES_PER_HOST.
+func TestRedisStateSaveDoesNotTouchCounters(t *testing.T) {
+	st, client, keys := newTestState(t)
+	ctx := context.Background()
+
+	for range 2 {
+		if err := st.RecordSuccess(ctx, "example.com", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.RecordFailure(ctx, "example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A stale record, exactly as a caller reading before a fetch and writing
+	// after would hold: everything it knows is stale.
+	stale, err := st.HostState(ctx, "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.PagesCrawled = 0
+	stale.ConsecFailures = 0
+	stale.LastSuccess = time.Time{}
+	if err := st.SaveHostState(ctx, "example.com", stale); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.HostState(ctx, "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PagesCrawled != 2 {
+		t.Errorf("PagesCrawled = %d after a save of a stale record, want 2", got.PagesCrawled)
+	}
+	if got.ConsecFailures != 1 {
+		t.Errorf("ConsecFailures = %d after a save of a stale record, want 1", got.ConsecFailures)
+	}
+	if got.LastSuccess.IsZero() {
+		t.Error("LastSuccess was cleared by a save of a stale record")
+	}
+
+	// The fields the save does own, to show the same call did something.
+	if err := st.SaveHostState(ctx, "example.com", HostState{
+		Name: "example.com", MaxPages: 42, CrawlDelay: 3 * time.Second,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := client.HGetAll(ctx, keys.HostState("example.com")).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw[fieldMaxPages] != "42" {
+		t.Errorf("max_pages = %q after a save, want 42", raw[fieldMaxPages])
+	}
+	if raw[fieldCrawlDelay] != "3000" {
+		t.Errorf("crawl_delay_ms = %q after a save, want 3000", raw[fieldCrawlDelay])
+	}
+}
+
+// TestRedisClaimSiteMapsHandsOutOneClaim is why sitemap entries are not queued
+// twice. Sitemap entries go into the frontier by inlink priority, so a second
+// pass over the same file does not re-add the same URLs at the same score; it
+// raises the score of URLs that have not been crawled yet, once per robots.txt
+// re-read, until they are never crawled at all.
+func TestRedisClaimSiteMapsHandsOutOneClaim(t *testing.T) {
+	st, _, _ := newTestState(t)
+	ctx := context.Background()
+
+	// One reading, contended. All eight workers fetched the same robots.txt, so
+	// all eight claim the same reading.
+	readAt := time.Now().UTC().Truncate(time.Second)
+
+	const workers = 8
+	var won int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			ok, err := st.ClaimSiteMaps(ctx, "example.com", readAt)
+			if err != nil {
+				t.Errorf("ClaimSiteMaps: %v", err)
+				return
+			}
+			if ok {
+				atomic.AddInt32(&won, 1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&won); got != 1 {
+		t.Errorf("%d of %d workers won the sitemap claim, want exactly 1", got, workers)
+	}
+}
+
+// TestRedisClaimSiteMapsDecidesByReading is the comparison a flag could not
+// express, and the reason the claim is a timestamp rather than a boolean.
+//
+// The order is the one that breaks a flag: the newer reading claims first, and
+// the older reading then arrives. A flag-based implementation would clear the
+// flag for its own reading and let a stale robots.txt queue the same sitemaps a
+// second time.
+func TestRedisClaimSiteMapsDecidesByReading(t *testing.T) {
+	st, _, _ := newTestState(t)
+	ctx := context.Background()
+
+	base := time.Now().UTC().Truncate(time.Second)
+
+	won, err := st.ClaimSiteMaps(ctx, "example.com", base.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !won {
+		t.Fatal("the first claim was refused")
+	}
+
+	won, err = st.ClaimSiteMaps(ctx, "example.com", base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if won {
+		t.Error("a stale robots.txt reading claimed the sitemaps again")
+	}
+
+	won, err = st.ClaimSiteMaps(ctx, "example.com", base.Add(2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !won {
+		t.Error("a newer robots.txt reading was refused, so a site that publishes a " +
+			"page and updates its sitemap would never be found again")
+	}
+
+	// And a claim with no reading behind it is refused rather than compared. The
+	// zero time is not "older than everything": as a Unix number it is about
+	// -6.2e10, which the comparison would happily accept and then store, leaving
+	// the field claiming a robots.txt that was never read.
+	won, err = st.ClaimSiteMaps(ctx, "example.com", time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if won {
+		t.Error("a claim with no robots.txt reading behind it was granted")
+	}
+	got, err := st.HostState(ctx, "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.SiteMapsClaimedAt.Equal(base.Add(2 * time.Hour)) {
+		t.Errorf("SiteMapsClaimedAt = %v after a claim with no reading, want the "+
+			"earlier claim %v to be untouched", got.SiteMapsClaimedAt, base.Add(2*time.Hour))
+	}
+}
+
+// TestRedisSaveHostStateDoesNotEraseTheSitemapClaim is the reason
+// SiteMapsClaimedAt is absent from SaveHostState, and it is only testable here.
+//
+// The interleaving is not exotic: a host is resolved, its rules are saved, and
+// then the winner claims and starts reading a sitemap that may take seconds. Any
+// worker that resolved the same host a moment later saves the host record again
+// in between. If that write carried the claim -- with the value it read, before
+// the claim was taken -- it would erase the claim the winner holds, and the
+// discovery would run again for the same robots.txt.
+func TestRedisSaveHostStateDoesNotEraseTheSitemapClaim(t *testing.T) {
+	st, _, _ := newTestState(t)
+	ctx := context.Background()
+
+	readAt := time.Now().UTC().Truncate(time.Second)
+
+	// The winner, holding a record read before the claim.
+	stale, err := st.HostState(ctx, "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	won, err := st.ClaimSiteMaps(ctx, "example.com", readAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !won {
+		t.Fatal("the first claim was refused")
+	}
+
+	// A second worker, holding the same stale record, saves it after the claim.
+	stale = stale.WithRobots("example.com", []string{"/"}, nil,
+		[]string{"https://example.com/s.xml"}, 0, readAt)
+	if err := st.SaveHostState(ctx, "example.com", stale); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.HostState(ctx, "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.SiteMapsClaimedAt.Equal(readAt) {
+		t.Errorf("SiteMapsClaimedAt = %v, want %v: saving the host record erased a claim "+
+			"another worker was holding, and the same robots.txt would be expanded again",
+			got.SiteMapsClaimedAt, readAt)
+	}
+
+	// And the claim is still closed to that same reading.
+	won, err = st.ClaimSiteMaps(ctx, "example.com", readAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if won {
+		t.Error("the claim was open again after an unrelated host write")
 	}
 }
 

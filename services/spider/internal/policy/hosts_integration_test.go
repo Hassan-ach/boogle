@@ -257,21 +257,31 @@ func TestRedisCountersPersistAcrossManagers(t *testing.T) {
 // that cleared nothing would make the budget a lifetime cap and the host would
 // disappear from the index permanently.
 func TestRedisWindowRolloverResetsOnlyTheBudget(t *testing.T) {
-	st, _, _ := newTestState(t)
+	st, client, keys := newTestState(t)
 	ctx := context.Background()
 
 	start := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 	if err := st.SaveHostState(ctx, "h.example", HostState{
 		Name:            "h.example",
 		WindowStartedAt: start,
-		PagesCrawled:    5000,
-		LastSuccess:     start.Add(-time.Hour),
 		FirstSeen:       start.Add(-72 * time.Hour),
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// Seeded directly, and that is the point of doing it this way. pages_crawled
+	// and last_success are not SaveHostState's to write -- they move through
+	// RecordSuccess, which is the only writer and which no caller should be
+	// rewriting behind. Five thousand RecordSuccess calls would be a slow way to
+	// say the same thing, and would leave the test asserting nothing about the
+	// field's ownership.
+	if err := client.HSet(ctx, keys.HostState("h.example"),
+		fieldPagesCrawled, 5000,
+		fieldLastSuccess, start.Add(-time.Hour).Unix(),
+	).Err(); err != nil {
+		t.Fatal(err)
+	}
 	for range 5 {
-		if _, err := st.IncrFailures(ctx, "h.example"); err != nil {
+		if _, err := st.RecordFailure(ctx, "h.example"); err != nil {
 			t.Fatal(err)
 		}
 	}

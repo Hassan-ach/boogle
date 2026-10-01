@@ -117,6 +117,17 @@ const (
 	fieldAllow        = "allow"
 	fieldDisallow     = "disallow"
 	fieldSitemaps     = "sitemaps"
+	// fieldSitemapsClaimedAt is the timestamp of the robots.txt reading whose
+	// sitemaps were queued, rather than a flag saying they were.
+	//
+	// A flag cannot be claimed twice and un-claimed atomically in one step, and
+	// "claimed" is not even the right word: the question is whether *this* reading
+	// of robots.txt has been acted on, so what has to be compared is this reading's
+	// time against the last one acted on. With a flag, the reset written by a
+	// robots re-read and the claim taken immediately afterwards are two writes, and
+	// twenty workers on a new host interleave enough to let several through -- which
+	// is the duplicate discovery this field exists to prevent.
+	fieldSitemapsClaimedAt = "sitemaps_claimed_at"
 )
 
 // URL state hash fields.

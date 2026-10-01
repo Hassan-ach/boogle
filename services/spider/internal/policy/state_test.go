@@ -371,7 +371,7 @@ func TestHostStateBudgetIsPerWindow(t *testing.T) {
 	}
 
 	for i := 0; i < maxPages; i++ {
-		if _, err := st.IncrPagesCrawled(ctx, "example.com", 1); err != nil {
+		if err := st.RecordSuccess(ctx, "example.com", time.Now()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -425,25 +425,38 @@ func TestBudgetExhaustedPrefersTheLowerLimit(t *testing.T) {
 }
 
 // TestFailuresCountAndReset drives the counter the backoff schedules read.
+//
+// A success is what clears it, which is the whole point: the count is a count of
+// *consecutive* failures, and a host that recovers has to stop paying for the
+// failures that made it recover.
 func TestFailuresCountAndReset(t *testing.T) {
 	_, st := newTestManager(t)
 	ctx := context.Background()
 
 	for want := 1; want <= 4; want++ {
-		got, err := st.IncrFailures(ctx, "example.com")
+		got, err := st.RecordFailure(ctx, "example.com")
 		if err != nil {
 			t.Fatal(err)
 		}
 		if got != want {
-			t.Errorf("IncrFailures = %d, want %d", got, want)
+			t.Errorf("RecordFailure = %d, want %d", got, want)
 		}
 	}
-	if err := st.ResetFailures(ctx, "example.com"); err != nil {
+	if err := st.RecordSuccess(ctx, "example.com", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	state, _ := st.HostState(ctx, "example.com")
 	if state.ConsecFailures != 0 {
-		t.Errorf("ConsecFailures = %d after reset, want 0", state.ConsecFailures)
+		t.Errorf("ConsecFailures = %d after a success, want 0", state.ConsecFailures)
+	}
+	// And a failure after the success starts from the first step again, rather
+	// than resuming at five.
+	got, err := st.RecordFailure(ctx, "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 1 {
+		t.Errorf("RecordFailure after a success = %d, want 1", got)
 	}
 }
 

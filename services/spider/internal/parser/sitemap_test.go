@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -168,7 +169,7 @@ func TestFetchSitemapNormalizesEveryLoc(t *testing.T) {
 </urlset>`, http.StatusOK)
 
 	host, _ := url.Parse("https://example.com/")
-	got, err := fetchSitemap(srv.Client(), srv.URL, host)
+	got, err := fetchSitemap(context.Background(), srv.Client(), srv.URL, host)
 	if err != nil {
 		t.Fatalf("fetchSitemap() error: %v", err)
 	}
@@ -190,7 +191,7 @@ func TestFetchSitemapResolvesRelativeLocsAgainstTheHost(t *testing.T) {
 </urlset>`, http.StatusOK)
 
 	host, _ := url.Parse("https://example.com")
-	got, err := fetchSitemap(srv.Client(), srv.URL, host)
+	got, err := fetchSitemap(context.Background(), srv.Client(), srv.URL, host)
 	if err != nil {
 		t.Fatalf("fetchSitemap() error: %v", err)
 	}
@@ -204,7 +205,7 @@ func TestFetchSitemapDefaultsToHTTPSForASchemelessURL(t *testing.T) {
 
 	host, _ := url.Parse("https://example.com")
 	// Pass just the host and path, no scheme.
-	got, err := fetchSitemap(srv.Client(), strings.TrimPrefix(srv.URL, "http://"), host)
+	got, err := fetchSitemap(context.Background(), srv.Client(), strings.TrimPrefix(srv.URL, "http://"), host)
 	if err == nil {
 		t.Fatalf("expected an error: the rewritten URL points at https on a plain-HTTP test server; got %v", got)
 	}
@@ -217,7 +218,7 @@ func TestFetchSitemapFillsInAHostlessURL(t *testing.T) {
 	srv, _ := sitemapServer(t, `<urlset><url><loc>https://example.com/a</loc></url></urlset>`, http.StatusOK)
 
 	host, _ := url.Parse("https://example.com")
-	got, err := fetchSitemap(srv.Client(), srv.URL, host)
+	got, err := fetchSitemap(context.Background(), srv.Client(), srv.URL, host)
 	if err != nil {
 		t.Fatalf("fetchSitemap() error: %v", err)
 	}
@@ -230,7 +231,7 @@ func TestFetchSitemapReportsAnHTTPError(t *testing.T) {
 	srv, _ := sitemapServer(t, "nope", http.StatusNotFound)
 
 	host, _ := url.Parse("https://example.com")
-	if _, err := fetchSitemap(srv.Client(), srv.URL, host); err == nil {
+	if _, err := fetchSitemap(context.Background(), srv.Client(), srv.URL, host); err == nil {
 		t.Error("expected an error for a 404 sitemap")
 	}
 }
@@ -239,7 +240,7 @@ func TestFetchSitemapReportsAMalformedDocument(t *testing.T) {
 	srv, _ := sitemapServer(t, `<urlset><url><loc>https://example.com/a</loc></urlset>`, http.StatusOK)
 
 	host, _ := url.Parse("https://example.com")
-	_, err := fetchSitemap(srv.Client(), srv.URL, host)
+	_, err := fetchSitemap(context.Background(), srv.Client(), srv.URL, host)
 	if err == nil {
 		t.Fatal("expected an error for malformed XML")
 	}
@@ -261,7 +262,7 @@ func TestFetchSitemapSkipsUnusableLocsRatherThanFailingTheWholeSitemap(t *testin
 </urlset>`, http.StatusOK)
 
 	host, _ := url.Parse("https://example.com")
-	got, err := fetchSitemap(srv.Client(), srv.URL, host)
+	got, err := fetchSitemap(context.Background(), srv.Client(), srv.URL, host)
 	if err != nil {
 		t.Fatalf("fetchSitemap() error: %v; one bad loc must not discard the sitemap", err)
 	}
@@ -284,7 +285,7 @@ func TestFetchSitemapsCombinesEverySource(t *testing.T) {
 	second, _ := sitemapServer(t, `<urlset><url><loc>https://example.com/b</loc></url></urlset>`, http.StatusOK)
 
 	host, _ := url.Parse("https://example.com")
-	got := FetchSitemaps(http.DefaultClient, []string{first.URL, second.URL}, host)
+	got := FetchSitemaps(context.Background(), http.DefaultClient, []string{first.URL, second.URL}, host)
 
 	if len(got) != 2 {
 		t.Fatalf("FetchSitemaps() = %v, want two URLs", got)
@@ -297,7 +298,7 @@ func TestFetchSitemapsSkipsASourceThatFails(t *testing.T) {
 	bad, _ := sitemapServer(t, "unavailable", http.StatusInternalServerError)
 
 	host, _ := url.Parse("https://example.com")
-	got := FetchSitemaps(http.DefaultClient, []string{bad.URL, ok.URL}, host)
+	got := FetchSitemaps(context.Background(), http.DefaultClient, []string{bad.URL, ok.URL}, host)
 
 	if len(got) != 1 || got[0] != "https://example.com/good" {
 		t.Errorf("FetchSitemaps() = %v, want only the reachable sitemap's URL", got)
@@ -306,7 +307,7 @@ func TestFetchSitemapsSkipsASourceThatFails(t *testing.T) {
 
 func TestFetchSitemapsOnNoSources(t *testing.T) {
 	host, _ := url.Parse("https://example.com")
-	if got := FetchSitemaps(http.DefaultClient, nil, host); len(got) != 0 {
+	if got := FetchSitemaps(context.Background(), http.DefaultClient, nil, host); len(got) != 0 {
 		t.Errorf("FetchSitemaps(nil) = %v, want an empty slice", got)
 	}
 }
@@ -315,7 +316,7 @@ func TestFetchSitemapsWhenEverySourceFails(t *testing.T) {
 	bad, _ := sitemapServer(t, "down", http.StatusServiceUnavailable)
 	host, _ := url.Parse("https://example.com")
 
-	if got := FetchSitemaps(http.DefaultClient, []string{bad.URL}, host); len(got) != 0 {
+	if got := FetchSitemaps(context.Background(), http.DefaultClient, []string{bad.URL}, host); len(got) != 0 {
 		t.Errorf("FetchSitemaps() = %v, want an empty slice", got)
 	}
 }
@@ -333,9 +334,9 @@ func TestFetchSitemapsIsDeterministic(t *testing.T) {
 	defer srv.Close()
 
 	host, _ := url.Parse("https://example.com")
-	first := FetchSitemaps(srv.Client(), []string{srv.URL, srv.URL}, host)
+	first := FetchSitemaps(context.Background(), srv.Client(), []string{srv.URL, srv.URL}, host)
 	for i := 0; i < 100; i++ {
-		got := FetchSitemaps(srv.Client(), []string{srv.URL, srv.URL}, host)
+		got := FetchSitemaps(context.Background(), srv.Client(), []string{srv.URL, srv.URL}, host)
 		if len(got) != len(first) {
 			t.Fatalf("run %d: got %v, want %v", i, got, first)
 		}

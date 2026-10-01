@@ -108,16 +108,40 @@ type State interface {
 	// and no error: absence is a normal condition, not a failure.
 	HostState(ctx context.Context, host string) (HostState, error)
 	// SaveHostState writes a host's record.
+	//
+	// It replaces the fields it is given and leaves the rest alone, and it is
+	// NOT safe to use to change a counter. Reading a record, changing one field
+	// and writing it back loses whatever another worker changed in between, and
+	// twenty workers on one host is the normal case rather than the pathological
+	// one. That is what RecordSuccess and RecordFailure are for.
 	SaveHostState(ctx context.Context, host string, st HostState) error
-	// IncrFailures counts one consecutive failure and returns the new total.
-	IncrFailures(ctx context.Context, host string) (int, error)
-	// ResetFailures clears the counter after a success, so a host that recovers
-	// and later fails again starts from the first backoff step.
-	ResetFailures(ctx context.Context, host string) error
-	// IncrPagesCrawled adds to the window's page count and returns the new total.
-	IncrPagesCrawled(ctx context.Context, host string, n int64) (int, error)
+	// RecordSuccess records one page crawled successfully on a host: the window's
+	// page count goes up, the consecutive-failure count resets, and the host is
+	// stamped as working again.
+	//
+	// One call rather than an increment plus a reset plus a timestamp because
+	// those are three round trips and three chances to build the record wrongly.
+	RecordSuccess(ctx context.Context, host string, at time.Time) error
+	// RecordFailure counts one failed fetch against a host and returns the new
+	// total, which is what every backoff schedule is a function of.
+	RecordFailure(ctx context.Context, host string) (int, error)
 	// ResetWindow starts a new page-budget window at the given time.
 	ResetWindow(ctx context.Context, host string, at time.Time) error
+	// ClaimSiteMaps claims the sitemaps advertised by the robots.txt read at `at`,
+	// and reports whether this caller is the one that gets to act on them.
+	//
+	// Exactly-once matters because discovery is an increment: sitemap entries are
+	// enqueued by inlink priority, so a second pass over the same sitemap does not
+	// produce the same frontier, it produces URLs whose score climbs once per
+	// robots.txt re-read until they are never crawled at all.
+	//
+	// The claim is keyed by the reading's timestamp rather than by a flag, and it
+	// has to be: a flag would need a separate write to clear it on each re-read, and
+	// the clear and the claim cannot both be atomic. `at` is what makes the
+	// comparison self-contained -- a caller holding an older reading than the one
+	// already claimed loses, which is right, and a caller holding a newer one wins
+	// however late it arrives.
+	ClaimSiteMaps(ctx context.Context, host string, at time.Time) (bool, error)
 
 	// --- per-host markers ---
 
@@ -213,6 +237,16 @@ type HostState struct {
 	// crawled for hours. Re-fetching it to re-read a list that has not changed
 	// is a request per host for no information.
 	SiteMaps []string
+
+	// SiteMapsClaimedAt is when the sitemaps advertised by the robots.txt read at
+	// RobotsFetchedAt were expanded into the frontier.
+	//
+	// It is a timestamp rather than a deletion of SiteMaps because the URLs stay
+	// useful afterwards: an operator asking "which sitemaps does this site publish"
+	// gets an answer from the host record alone, long after the crawl has moved
+	// on. A later robots.txt carries a later timestamp and so wins the claim again,
+	// which is what re-queues the list -- the site may have published more since.
+	SiteMapsClaimedAt time.Time
 }
 
 // WithRobots returns a copy of h carrying a freshly read robots.txt, preserving

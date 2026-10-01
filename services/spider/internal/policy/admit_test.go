@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"net"
 	"testing"
 	"time"
 )
@@ -398,6 +399,102 @@ func TestAdmitFailsClosedOnStateErrors(t *testing.T) {
 			}
 			if v.Kind == Allow {
 				t.Fatalf("%s failing produced Allow", op)
+			}
+		})
+	}
+}
+
+// TestEveryDeferComesWithADueTime is the invariant the crawl loop's correctness
+// rests on, and it is the one thing about a Defer that is easy to leave out.
+//
+// A URL is taken off the frontier before this function is asked about it. So by
+// the time a verdict arrives, the queue has already given the URL up, and a Defer
+// is the only thing that can put it back. A Defer with no due time cannot be
+// parked -- there is nothing to score it by -- and an unparked URL is not deferred,
+// it is deleted.
+//
+// Deleted from where is worth being concrete about. Not from the visited set, so
+// nothing stops it being offered again; but the pages that would offer it are
+// themselves gated on the store that is down, so during the outage there is no
+// rediscovery, and when the store comes back the URL is not in the frontier, not in
+// the delayed set, and not in the visited set. It is simply gone, along with every
+// other URL that came up while the cache was unreachable. The crawl restarts
+// apparently healthy with an empty queue and no error anywhere.
+//
+// Each case below is a different path to a Defer, because "every" is the claim and a
+// single example would not establish it.
+func TestEveryDeferComesWithADueTime(t *testing.T) {
+	now := time.Date(2026, 5, 12, 9, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name string
+		// breakIt arranges the state that produces the Defer.
+		breakIt func(m *PolicyManager, st *MemoryState)
+		// host is the host to admit a URL on. Empty means example.com.
+		host string
+		// robots is the fetcher, when the case needs a particular one.
+		robots *fakeRobots
+	}{
+		{
+			// "we could not ask the store anything"
+			name:    "the policy state is unreadable",
+			breakIt: func(_ *PolicyManager, st *MemoryState) { st.FailOn = map[string]error{"IsVisited": errRedisDown} },
+		},
+		{
+			// "the host answered and said wait"
+			name: "the host is cooling down",
+			breakIt: func(_ *PolicyManager, st *MemoryState) {
+				_ = st.SetMarker(context.Background(), "example.com", MarkerCooldown, time.Hour)
+			},
+		},
+		{
+			// "we could not resolve a host nobody has seen" -- the second of the two
+			// ways to end up not knowing when, and the more expensive one, because
+			// resolving a host is the only step in Admit that touches the network.
+			name:    "the host cannot be resolved",
+			breakIt: func(_ *PolicyManager, _ *MemoryState) {},
+			// A host that does not resolve is a Defer, not a Skip, for the ordinary
+			// reason: the domain may be back in ten seconds. The state read behind
+			// that decision is the marker EnsureHost raised, and when it expires the
+			// next Admit is the implicit probe.
+			host: "slow.example",
+			robots: &fakeRobots{reply: map[string]robotsResponse{
+				"slow.example": {err: &net.DNSError{Err: "no such host", Name: "slow.example"}},
+			}},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m, st := newTestManager(t)
+			m = m.WithClock(func() time.Time { return now })
+			host := tc.host
+			if host == "" {
+				host = "example.com"
+			}
+			robots := tc.robots
+			if robots == nil {
+				robots = &fakeRobots{
+					reply: map[string]robotsResponse{host: {body: ""}}, status: 200,
+				}
+			}
+			m = m.WithRobotsFetcher(robots.fetcher())
+			tc.breakIt(m, st)
+
+			v := mustAdmit(t, m, "https://"+host+"/page")
+			if v.Kind != Defer {
+				t.Fatalf("Kind = %v (reason %q), want Defer: this case was supposed "+
+					"to produce a URL whose crawl time is unknown", v.Kind, v.Reason)
+			}
+			if v.Until.IsZero() {
+				t.Fatalf("Reason %q deferred the URL with no due time, so the crawl "+
+					"loop cannot park it and the URL is lost rather than deferred",
+					v.Reason)
+			}
+			if !v.Until.After(now) {
+				t.Errorf("Until = %v, want a time after now (%v): a due time in the "+
+					"past comes straight back off the delayed set and is fetched in "+
+					"the same round", v.Until, now)
 			}
 		})
 	}

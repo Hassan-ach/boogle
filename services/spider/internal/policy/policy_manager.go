@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -44,6 +45,23 @@ type PolicyManager struct {
 	// tests can exercise host resolution without a network; New installs a real
 	// one and WithRobotsFetcher replaces it.
 	fetchRobots RobotsFetcher
+	// fetch retrieves one page. Same reasoning as fetchRobots, and the same
+	// reason it is here rather than on the crawl loop: the loop must not be able
+	// to reach the network without asking this object first, because "what a fetch
+	// means" is decided here and nowhere else.
+	fetch Fetcher
+	// fetchClient is the client the built-in fetcher was built around. Keeping it
+	// is what lets a configuration change rebuild the fetcher around the same
+	// connection pool rather than opening a second one, and its being nil is how
+	// WithConfig knows the fetcher is caller-owned and must be left alone.
+	fetchClient *http.Client
+	// resolveSiteMaps expands the sitemap URLs a host advertises into page URLs.
+	//
+	// It is a field because reading and parsing a sitemap is the parser's job and
+	// deciding what to do with the result is this one's; a nil value means no
+	// sitemap discovery, which is the right default for a manager whose caller
+	// does not want it.
+	resolveSiteMaps SiteMapResolver
 }
 
 // New returns a PolicyManager over the given state.
@@ -55,6 +73,7 @@ func New(cfg Config, state State, logger *slog.Logger) *PolicyManager {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	fetchClient := &http.Client{Timeout: defaultFetchTimeout}
 	return &PolicyManager{
 		cfg:   cfg,
 		state: state,
@@ -62,6 +81,8 @@ func New(cfg Config, state State, logger *slog.Logger) *PolicyManager {
 		now:   time.Now,
 		fetchRobots: newHTTPRobotsFetcher(
 			nil, defaultUserAgent(cfg)),
+		fetch:       NewHTTPFetcher(fetchClient, cfg),
+		fetchClient: fetchClient,
 	}
 }
 
@@ -112,13 +133,23 @@ func (m *PolicyManager) Now() time.Time { return m.now() }
 // with a smaller number in it. Production constructs Config once from the
 // environment.
 //
-// The robots fetcher is *not* rebuilt from the new configuration. It was built
-// with a user agent derived from the old one, and rebuilding it here would
-// silently repoint a fetcher a caller had already installed through
-// WithRobotsFetcher.
+// Two things are deliberately *not* carried over:
+//
+//   - The robots fetcher, because it was built with a user agent derived from the
+//     old configuration and rebuilding it here would silently repoint a fetcher a
+//     caller had already installed through WithRobotsFetcher.
+//   - A caller-installed page fetcher, for the same reason. The distinction
+//     matters: the byte and redirect caps live in *both* the fetcher and the
+//     classifier, and a fetcher built from one configuration being compared
+//     against another is how "the page was truncated" and "the page was too large"
+//     stop meaning the same thing. A built-in fetcher is therefore rebuilt around
+//     the same connection pool, so it cannot fall out of step.
 func (m *PolicyManager) WithConfig(cfg Config) *PolicyManager {
 	cp := *m
 	cp.cfg = cfg
+	if m.fetchClient != nil {
+		cp.fetch = NewHTTPFetcher(m.fetchClient, cfg)
+	}
 	return &cp
 }
 
@@ -155,15 +186,27 @@ func (m *PolicyManager) refuse(ctx context.Context, host, url string, kind Verdi
 // marker and page budget were all unreadable, which is the same as having no
 // policy at all.
 //
-// Until is left zero deliberately. A Defer with no due time is the caller's cue
-// that this URL should simply not be taken from the frontier this round; the
-// value is unknown because the thing that would tell us is what is broken.
+// # The due time is one backoff interval, and that is not a guess
+//
+// A Defer that arrives here has already been taken off the frontier: the crawl
+// loop pops a URL, asks this question, and only then learns it cannot be answered.
+// So a Defer with no due time is not "leave it for later", it is *gone* -- and gone
+// is not rediscovered, because the pages that would rediscover it are themselves
+// gated on the store that is down. One unreachable Redis costs the crawl its entire
+// queue, silently, and the crawl comes back "healthy" with nothing in it.
+//
+// What is genuinely unknown is when the *host* will be crawlable, and no due time
+// can answer that. What is not unknown is when to ask again: the same schedule a
+// failed fetch waits out. So the URL is parked for one URLBackoff interval and
+// asked again, which is the entire difference between an outage that delays the
+// crawl and an outage that ends it.
 func (m *PolicyManager) unavailable(ctx context.Context, host, url string, err error) (*Verdict, error) {
 	m.log.Error("policy state unavailable, refusing to crawl blind",
 		"host", host, "url", url, "error", err)
 	// The host is unknown here as often as not, so a per-host count would land
 	// nowhere useful. The error log is the record.
-	return m.refuse(ctx, host, url, Defer, ReasonPolicyUnavailable, time.Time{})
+	return m.refuse(ctx, host, url, Defer, ReasonPolicyUnavailable,
+		m.now().Add(m.cfg.URLBackoff(1)))
 }
 
 // hostGate reads a host's markers and budget and answers whether its URLs may be

@@ -192,13 +192,21 @@ func TestAdmitResetsFailClosed(t *testing.T) {
 	// that has finished its window. Proceeding with that count, or clearing it and
 	// carrying on, would both fetch past a budget that may or may not exist.
 	assertVerdict(t, v, Defer, ReasonPolicyUnavailable)
-	// The deadline is zero, and that is the contract rather than an oversight: the
-	// due time is a function of the thing that just failed, so it is unknown. A
-	// zero Until is the caller's cue to leave this URL alone for this round
-	// instead of scheduling it.
-	if !v.Until.IsZero() {
-		t.Errorf("the fail-closed verdict carries a deadline of %v; it is derived "+
-			"from the failed state read, so any value here would be invented", v.Until)
+	// The deadline is one backoff interval, and it is not a claim about this host.
+	// The host's own schedule is unreadable -- that is what failed -- so nothing
+	// here says when *it* may be crawled again. What is known is when to ask
+	// again, and that is the same interval a failed fetch waits out.
+	//
+	// It has to be a deadline rather than nothing at all. The URL is already off the
+	// frontier by the time this verdict exists, so a zero Until is not "leave it
+	// alone for this round": it is deleted, and nothing rediscovers it during the
+	// outage because every page that would is gated on the same store.
+	//
+	// See TestEveryDeferComesWithADueTime, which is the same property stated over
+	// every path that produces a Defer rather than over one of them.
+	want := now.Add(m.cfg.HostColdPeriod + time.Second).Add(m.cfg.URLBackoff(1))
+	if !v.Until.Equal(want) {
+		t.Errorf("Until = %v, want %v -- one URLBackoff interval from now", v.Until, want)
 	}
 }
 
@@ -534,11 +542,9 @@ func TestEnsureHostKeepsAHostsCountersAcrossARobotsReRead(t *testing.T) {
 		t.Fatalf("EnsureHost: %v", err)
 	}
 
-	if _, err := st.IncrPagesCrawled(ctx, "h.example", 42); err != nil {
-		t.Fatalf("incr pages: %v", err)
-	}
+	spendPages(t, st, "h.example", 42)
 	for range 5 {
-		if _, err := st.IncrFailures(ctx, "h.example"); err != nil {
+		if _, err := st.RecordFailure(ctx, "h.example"); err != nil {
 			t.Fatalf("incr failures: %v", err)
 		}
 	}
@@ -680,13 +686,22 @@ var (
 
 // --- helpers used only by these tests ---
 
-// spendPages writes a page count the way Classify would, so a test about the
-// budget does not have to run a crawl to get one.
+// spendPages puts a host in the state a long crawl would have left it in, so a
+// test about the budget does not have to run a crawl to get there.
+//
+// It writes the record directly rather than calling RecordSuccess n times. Both
+// reach the same field; only one of them keeps the test about the budget rather
+// than about how the count got there, and 5000 calls in a unit test is a lot of
+// noise for no coverage. The companion integration test seeds a real hash the
+// same way, for the same reason.
 func spendPages(t *testing.T, st *MemoryState, host string, n int) {
 	t.Helper()
-	if _, err := st.IncrPagesCrawled(context.Background(), host, int64(n)); err != nil {
-		t.Fatalf("spend pages on %s: %v", host, err)
-	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	rec := st.host[host]
+	rec.Name = host
+	rec.PagesCrawled = n
+	st.host[host] = rec
 }
 
 // markerNames renders a marker set for a failure message, since MarkerKind is an

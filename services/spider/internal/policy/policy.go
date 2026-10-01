@@ -172,6 +172,17 @@ const (
 	ReasonBodyTooLarge        Reason = "body_too_large"
 	ReasonContentTypeRejected Reason = "content_type_unsupported"
 	ReasonAttemptsExhausted   Reason = "attempts_exhausted"
+	// ReasonBodyUnparseable is a page that fetched perfectly and could not be
+	// turned into a page. It is its own reason rather than folded into
+	// content_type_unsupported because the two call for opposite responses: a
+	// site serving PDFs with a 200 is a site whose robots.txt or content type is
+	// wrong, while a body that will not parse is usually our own parser meeting
+	// markup it does not handle, and the fix for that one is on this side.
+	//
+	// It used to have no reason at all. Parse failures were reported as fetch
+	// failures, so a page that downloaded and then failed to parse was
+	// indistinguishable in the logs from one whose host was gone.
+	ReasonBodyUnparseable Reason = "body_unparseable"
 )
 
 // Backoff configuration. The schedules in backoff.go are pure functions of a

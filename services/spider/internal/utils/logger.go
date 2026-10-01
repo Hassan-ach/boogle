@@ -91,8 +91,23 @@ func NewMultiLogger(fileName string) *Logger {
 	return &Logger{logger, file}
 }
 
+// Close releases the log file, if this Logger has one.
 func (l *Logger) Close() {
-	_ = l.file.Close()
+	if l.file != nil {
+		_ = l.file.Close()
+	}
+}
+
+// NewDiscardLogger returns a Logger that throws everything away.
+//
+// For tests, and for any caller that has no log file. It exists because the only
+// other constructor opens a file and log.Fatals if it cannot -- so a test could not
+// build a Logger at all without a writable path, and every component that takes one
+// would be untestable rather than merely noisy.
+//
+// It returns without an open file, which is why Close tolerates one.
+func NewDiscardLogger() *Logger {
+	return &Logger{Logger: slog.New(slog.DiscardHandler)}
 }
 
 func (m MultiHandler) Enabled(ctx context.Context, l slog.Level) bool {

@@ -222,6 +222,7 @@ func (s *RedisState) HostState(ctx context.Context, host string) (HostState, err
 	st.Allow = splitLines(fields[fieldAllow])
 	st.Disallow = splitLines(fields[fieldDisallow])
 	st.SiteMaps = splitLines(fields[fieldSitemaps])
+	st.SiteMapsClaimedAt = parseUnix(fields[fieldSitemapsClaimedAt])
 	st.WindowStartedAt = parseUnix(fields[fieldWindowStart])
 	st.RobotsFetchedAt = parseUnix(fields[fieldRobotsAt])
 	st.FirstSeen = parseUnix(fields[fieldFirstSeen])
@@ -229,16 +230,32 @@ func (s *RedisState) HostState(ctx context.Context, host string) (HostState, err
 	return st, nil
 }
 
+// SaveHostState writes the fields a robots.txt resolution owns and nothing else.
+//
+// The counters are deliberately absent. They are moved by RecordSuccess and
+// RecordFailure, which every worker calls concurrently, and this method's
+// argument is a record read at some earlier moment -- so writing pages_crawled or
+// consec_failures from it is a read-modify-write that loses whichever increment
+// arrived second. That is not a rare race: twenty workers on one host is the
+// normal case, and the loser is not a page but a count, so the budget silently
+// drifts and a host spends longer than MAX_PAGES_PER_HOST before going cold.
+//
+// SiteMapsClaimedAt is absent for the same reason. It is a claim, won by one
+// worker against all the others, so writing it from here -- with a value read
+// before the claim was taken -- would erase a claim another worker holds, and the
+// erase would land between that worker's claim and its work.
+//
+// A zero value in the fields written here is meaningful (no crawl delay, no
+// host-specific budget), so "leave it alone" is not available as an option the
+// way it is for the timestamps.
 func (s *RedisState) SaveHostState(ctx context.Context, host string, st HostState) error {
 	if host == "" {
 		return errors.New("save host state: empty host")
 	}
 
 	values := map[string]any{
-		fieldMaxPages:     st.MaxPages,
-		fieldPagesCrawled: st.PagesCrawled,
-		fieldFailures:     st.ConsecFailures,
-		fieldCrawlDelay:   st.CrawlDelay.Milliseconds(),
+		fieldMaxPages:   st.MaxPages,
+		fieldCrawlDelay: st.CrawlDelay.Milliseconds(),
 	}
 	// Only the optional fields are written when set. A zero time is not a fact
 	// about the host, and writing it would overwrite a real timestamp with the
@@ -251,9 +268,6 @@ func (s *RedisState) SaveHostState(ctx context.Context, host string, st HostStat
 	}
 	if !st.FirstSeen.IsZero() {
 		values[fieldFirstSeen] = st.FirstSeen.Unix()
-	}
-	if !st.LastSuccess.IsZero() {
-		values[fieldLastSuccess] = st.LastSuccess.Unix()
 	}
 	if st.Status != "" {
 		values[fieldStatus] = st.Status
@@ -274,36 +288,92 @@ func (s *RedisState) SaveHostState(ctx context.Context, host string, st HostStat
 	return nil
 }
 
-func (s *RedisState) IncrFailures(ctx context.Context, host string) (int, error) {
-	if host == "" {
-		return 0, nil
-	}
-	n, err := s.conn.HIncrBy(ctx, s.keys.HostState(host), fieldFailures, 1).Result()
-	if err != nil {
-		return 0, fmt.Errorf("increment failures for %s: %w", host, err)
-	}
-	return int(n), nil
-}
+// RecordSuccess applies a successful page in one round trip.
+//
+// HINCRBY and HSET are in a single script rather than a pipeline because the
+// count and the timestamp have to agree: a page counted without its timestamp
+// recorded reads as a host that is crawling but has never worked, and a
+// timestamp recorded without the count throws away the page the budget was
+// spending. Neither is recoverable by a later read, because the read would find
+// a state neither of them left alone.
+var recordSuccessScript = redis.NewScript(`
+local key = KEYS[1]
+redis.call("hincrby", key, ARGV[1], 1)
+redis.call("hset", key, ARGV[2], 0, ARGV[3], ARGV[4], ARGV[5], ARGV[6])
+return 1
+`)
 
-func (s *RedisState) ResetFailures(ctx context.Context, host string) error {
+func (s *RedisState) RecordSuccess(ctx context.Context, host string, at time.Time) error {
 	if host == "" {
 		return nil
 	}
-	if err := s.conn.HSet(ctx, s.keys.HostState(host), fieldFailures, 0).Err(); err != nil {
-		return fmt.Errorf("reset failures for %s: %w", host, err)
+	if err := recordSuccessScript.Run(ctx, s.conn,
+		[]string{s.keys.HostState(host)},
+		fieldPagesCrawled,
+		fieldFailures,
+		fieldLastSuccess,
+		at.Unix(),
+		fieldStatus,
+		statusReady,
+	).Err(); err != nil {
+		return fmt.Errorf("record a success for %s: %w", host, err)
 	}
 	return nil
 }
 
-func (s *RedisState) IncrPagesCrawled(ctx context.Context, host string, n int64) (int, error) {
-	if host == "" || n == 0 {
+func (s *RedisState) RecordFailure(ctx context.Context, host string) (int, error) {
+	if host == "" {
 		return 0, nil
 	}
-	total, err := s.conn.HIncrBy(ctx, s.keys.HostState(host), fieldPagesCrawled, n).Result()
-	if err != nil {
-		return 0, fmt.Errorf("increment pages crawled for %s: %w", host, err)
+	// The count and the status move together for the same reason as RecordSuccess:
+	// a host counted as failing but still labelled ready is a state the rest of
+	// this package cannot reason about, and the only repair would be a read that
+	// races the next write.
+	pipe := s.conn.Pipeline()
+	incr := pipe.HIncrBy(ctx, s.keys.HostState(host), fieldFailures, 1)
+	pipe.HSet(ctx, s.keys.HostState(host), fieldStatus, statusDegraded)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return 0, fmt.Errorf("record a failure for %s: %w", host, err)
 	}
-	return int(total), nil
+	n, err := incr.Result()
+	if err != nil {
+		return 0, fmt.Errorf("record a failure for %s: %w", host, err)
+	}
+	return int(n), nil
+}
+
+// claimSiteMapsScript compares and sets the claim in one step.
+//
+// HSETNX would do, if the claim were a flag that is only ever set once. It is not:
+// a new robots.txt has to win the claim again, and doing that with a flag needs a
+// clear-then-claim pair that is two writes and therefore two races. Twenty workers
+// reaching a brand-new host is the ordinary case, not the pathological one, so the
+// pair fires.
+var claimSiteMapsScript = redis.NewScript(`
+local claimed = redis.call("hget", KEYS[1], ARGV[1])
+if not claimed or claimed == false or claimed == "" then
+  redis.call("hset", KEYS[1], ARGV[1], ARGV[2])
+  return 1
+end
+if tonumber(claimed) < tonumber(ARGV[2]) then
+  redis.call("hset", KEYS[1], ARGV[1], ARGV[2])
+  return 1
+end
+return 0
+`)
+
+func (s *RedisState) ClaimSiteMaps(ctx context.Context, host string, at time.Time) (bool, error) {
+	if host == "" || at.IsZero() {
+		return false, nil
+	}
+	won, err := claimSiteMapsScript.Run(ctx, s.conn,
+		[]string{s.keys.HostState(host)},
+		fieldSitemapsClaimedAt, at.Unix(),
+	).Int64()
+	if err != nil {
+		return false, fmt.Errorf("claim sitemaps for %s: %w", host, err)
+	}
+	return won == 1, nil
 }
 
 func (s *RedisState) ResetWindow(ctx context.Context, host string, at time.Time) error {

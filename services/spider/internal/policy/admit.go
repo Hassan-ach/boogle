@@ -103,7 +103,9 @@ func (m *PolicyManager) Admit(ctx context.Context, rawURL string) (*Verdict, err
 		return m.refuse(ctx, "", rawURL, Skip, ReasonMalformedURL, time.Time{})
 	}
 
-	host := strings.ToLower(parsed.Hostname())
+	// hostKey, not Hostname: the record has to be findable by the robots.txt URL
+	// built from it later, and a non-default port is part of which site this is.
+	host := hostKey(parsed)
 
 	// Step 3. Already visited.
 	//
@@ -150,11 +152,20 @@ func (m *PolicyManager) Admit(ctx context.Context, rawURL string) (*Verdict, err
 			// and a terminal verdict here would strand every URL ever discovered on
 			// it -- including the ones that were perfectly good.
 			//
+			// The due time is one backoff interval, for the reason on
+			// PolicyManager.unavailable: the URL is already off the frontier by the
+			// time this verdict is produced, so a Defer with no due time does not
+			// mean "ask again soon", it means "this URL is lost". An unresolvable
+			// host is the ordinary case where that bites -- a domain that stopped
+			// resolving takes every URL anyone ever linked to with it, and drops the
+			// whole set rather than parking it.
+			//
 			// The reason distinguishes "we could not ask" from "the host said no".
 			// They are counted separately because the first is our problem and the
 			// second is the site's, and an operator reading a full stats hash needs
 			// to tell them apart.
-			return m.refuse(ctx, host, norm, Defer, hostResolutionReason(rerr), time.Time{})
+			return m.refuse(ctx, host, norm, Defer, hostResolutionReason(rerr),
+				m.now().Add(m.cfg.URLBackoff(1)))
 		}
 		hostState = resolved
 	}
@@ -191,32 +202,8 @@ func (m *PolicyManager) Admit(ctx context.Context, rawURL string) (*Verdict, err
 
 	// Steps 8 to 11. The rules. All in-memory, all cheap, and all last, so a URL
 	// refused above never pays for them.
-	//
-	// They run in this order deliberately. robots.txt is the site's own instruction
-	// to us and gets first refusal; our tables are our judgement about URLs in
-	// general, and applying them first would discard a page the site explicitly
-	// invited us to.
-	if allowed, rule := NewRobotsRules(hostState.Allow, hostState.Disallow).Allows(parsed.EscapedPath()); !allowed {
-		m.log.Debug("refused by robots.txt", "host", host, "url", norm, "rule", rule)
-		return m.refuse(ctx, host, norm, Skip, ReasonRobotsDisallow, time.Time{})
-	}
-
-	rules := m.rules()
-
-	// Step 9. Path prefixes, compared on whole segments. "/cart" does not swallow
-	// "/cartoon".
-	if rules.SkipsPath(parsed.Path) {
-		return m.refuse(ctx, host, norm, Skip, ReasonPathDisallowed, time.Time{})
-	}
-
-	// Step 10. File extensions.
-	if rules.SkipsExtension(parsed.Path) {
-		return m.refuse(ctx, host, norm, Skip, ReasonExtensionSkipped, time.Time{})
-	}
-
-	// Step 11. Translated copies of pages that were not worth indexing anyway.
-	if rules.SkipsWikiLanguageSubpage(parsed.Path) {
-		return m.refuse(ctx, host, norm, Skip, ReasonLanguageNotEnglish, time.Time{})
+	if reason, ok := m.admitsLocally(hostState, parsed); !ok {
+		return m.refuse(ctx, host, norm, Skip, reason, time.Time{})
 	}
 
 	return &Verdict{
@@ -224,6 +211,77 @@ func (m *PolicyManager) Admit(ctx context.Context, rawURL string) (*Verdict, err
 		Reason: ReasonOK,
 		Host:   hostState.ToEntity(m.cfg.URLMaxAttempts),
 	}, nil
+}
+
+// admitsLocally runs the rules that need no stored state, returning the reason a
+// URL is refused or (ReasonOK, true) if it survives.
+//
+// It is the tail of Admit, factored out because a sitemap is filtered by exactly
+// these rules and cannot afford the state-dependent half. One function rather than
+// two is the point: a second copy of "is this path crawlable" is how "/report.pdf/"
+// came to be refused by one caller and fetched by another, and no code review
+// catches that when both copies look correct.
+//
+// The order is deliberate. robots.txt is the site's own instruction to us and gets
+// first refusal; our tables are our judgement about URLs in general, and applying
+// them first would discard a page the site explicitly invited us to.
+func (m *PolicyManager) admitsLocally(st HostState, parsed *url.URL) (Reason, bool) {
+	if allowed, rule := NewRobotsRules(st.Allow, st.Disallow).Allows(parsed.EscapedPath()); !allowed {
+		m.log.Debug("refused by robots.txt", "url", parsed.String(), "rule", rule)
+		return ReasonRobotsDisallow, false
+	}
+
+	rules := m.rules()
+
+	// Path prefixes, compared on whole segments. "/cart" does not swallow
+	// "/cartoon".
+	if rules.SkipsPath(parsed.Path) {
+		return ReasonPathDisallowed, false
+	}
+
+	// File extensions.
+	if rules.SkipsExtension(parsed.Path) {
+		return ReasonExtensionSkipped, false
+	}
+
+	// Translated copies of pages that were not worth indexing anyway.
+	if rules.SkipsWikiLanguageSubpage(parsed.Path) {
+		return ReasonLanguageNotEnglish, false
+	}
+	return ReasonOK, true
+}
+
+// filterLocally applies admitsLocally to a batch of URLs belonging to a known
+// host, splitting them into the ones worth queueing and the reasons the rest were
+// not.
+//
+// A URL that will not canonicalise, or that parses without a host, is refused as
+// malformed -- the same answer Admit gives it. That matters here because a
+// sitemap is a machine-generated file that has been known to contain relative
+// entries and typos, and a queue is the wrong place to find out.
+func (m *PolicyManager) filterLocally(st HostState, urls []string) (admitted []string, refused []Reason) {
+	admitted = make([]string, 0, len(urls))
+	refused = make([]Reason, 0, len(urls))
+
+	for _, raw := range urls {
+		norm, ok := utils.CanonicalizeUrl(raw, "")
+		if !ok {
+			refused = append(refused, ReasonMalformedURL)
+			continue
+		}
+		parsed, err := url.Parse(norm)
+		if err != nil || parsed.Hostname() == "" {
+			refused = append(refused, ReasonMalformedURL)
+			continue
+		}
+		reason, ok := m.admitsLocally(st, parsed)
+		if !ok {
+			refused = append(refused, reason)
+			continue
+		}
+		admitted = append(admitted, norm)
+	}
+	return admitted, refused
 }
 
 // errWindowReset marks a state read whose count could not be trusted because the
