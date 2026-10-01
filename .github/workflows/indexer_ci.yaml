@@ -1,0 +1,26 @@
+name: Indexer CI
+
+on:
+  pull_request:
+    branches:
+      - main
+      - dev
+    paths:
+      - "services/indexer/**"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/indexer
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+
+      - name: Run tests
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo test
+      - name: Build executable
+        run: cargo build
