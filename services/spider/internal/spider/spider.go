@@ -271,7 +271,7 @@ func (s *Spider) crawl(crawler_id int) {
 	s.policy.Discover(ctx, page.Links)
 
 	if err := queue.Publish(
-		"indexer.jobs",
+		s.config.App.JobQueue,
 		messaging.NewIndexerJobPayload(pageId.String()),
 	); err != nil {
 		s.logger.Error(

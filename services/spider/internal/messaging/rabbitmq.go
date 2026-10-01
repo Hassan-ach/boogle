@@ -33,7 +33,7 @@ func NewRabbitMQ(conf *config.RabbitMqConfig, log *utils.Logger) (*RabbitMQ, err
 		logger: log,
 	}
 
-	err = mq.DeclareQueue("indexer.jobs")
+	err = mq.DeclareQueue(conf.JobQueue)
 	if err != nil {
 		return nil, err
 	}
