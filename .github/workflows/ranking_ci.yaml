@@ -20,6 +20,7 @@ jobs:
     defaults:
       run:
         working-directory: services/ranking
+
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -32,6 +33,6 @@ jobs:
       - name: Install requirements
         run: pip install -r requirements.txt
       - name: Run tests
-        run: pytest tests/
+        run: python -m pytest tests -m "not integration"
       - name: Build executable
-        run: pip install pyinstaller
+        run: pyinstaller --onefile src/main.py

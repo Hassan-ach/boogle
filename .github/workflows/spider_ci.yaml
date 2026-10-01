@@ -13,10 +13,10 @@ on:
       - dev
     paths:
       - "services/spider/**"
+
 jobs:
   test:
     runs-on: ubuntu-latest
-
     defaults:
       run:
         working-directory: services/spider
