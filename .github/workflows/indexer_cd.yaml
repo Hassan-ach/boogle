@@ -1,0 +1,45 @@
+name: Indexer CD
+
+on:
+  push:
+    tags:
+      - "indexer@v*"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/indexer
+  VERSION: ${{ github.ref_name }}
+
+jobs:
+  build_and_push:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: services/indexer
+
+    steps:
+      - name: Chackout code
+        uses: actions/checkout@v7
+
+      - name: Set up latest git tag
+        run: |
+          RAW_TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${RAW_TAG#*@}"
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "Version: $VERSION"
+
+      - name: Build Docker images
+        run: |
+          docker build \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION} \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            .
+
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+      - name: Push Docker images
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
