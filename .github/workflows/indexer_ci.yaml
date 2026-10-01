@@ -1,0 +1,28 @@
+name: Indexer CI
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+    paths:
+      - "services/indexer/**"
+  pull_request:
+    branches:
+      - main
+      - dev
+    paths:
+      - "services/indexer/**"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: services/indexer
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - run: cargo test
+      - run: cargo build

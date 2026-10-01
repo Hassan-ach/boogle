@@ -1,0 +1,37 @@
+name: Ranking CI
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+    paths:
+      - "services/ranking/**"
+  pull_request:
+    branches:
+      - main
+      - dev
+    paths:
+      - "services/ranking/**"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/ranking
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12.10"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install --upgrade pip
+      - name: Install requirements
+        run: pip install -r requirements.txt
+      - name: Run tests
+        run: pytest tests/
+      - name: Build executable
+        run: pip install pyinstaller

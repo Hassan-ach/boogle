@@ -1,0 +1,51 @@
+name: Spider CI
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+    paths:
+      - "services/spider/**"
+  pull_request:
+    branches:
+      - main
+      - dev
+    paths:
+      - "services/spider/**"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: services/spider
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install dependencies
+        run: go mod tidy
+      - name: Run tests
+        run: go test -v ./...
+      - name: Build executable
+        run: go build -v ./...
+      - name: Run vet
+        run: go vet -v ./...
+
+  # i don't need this for now
+  # lint:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v3
+  #     - uses: actions/setup-go@v5
+  #       with:
+  #         go-version-file: go.mod
+  #         cache: true
+  #     - uses: golangci/golangci-lint-action@v4
+  #       with:
+  #         version: latest
