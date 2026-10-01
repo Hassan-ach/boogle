@@ -1,6 +1,7 @@
 package spellchecker
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -30,7 +31,11 @@ func NewAspellSpellingService() (AspellSpeller, error) {
 }
 
 func (s AspellSpeller) GetSuggestions(q string) []string {
-	return suggestionsFor(q, s.speller, 3)
+	sug := suggestionsFor(q, s.speller, 3)
+	for i, w := range sug {
+		fmt.Printf("suggestion %d for %s: %s\n", i, q, w)
+	}
+	return sug
 }
 
 func suggestionsFor(q string, speller dictionary, maxSuggestions int) []string {
