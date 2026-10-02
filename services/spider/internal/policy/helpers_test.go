@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"errors"
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"net"
 	"strconv"
 	"strings"
@@ -130,10 +131,10 @@ func (c *clock) Advance(d time.Duration) {
 	c.t += d.Nanoseconds()
 }
 
-func atClock(t *testing.T, now time.Time) (*PolicyManager, *MemoryState, *clock) {
+func atClock(t *testing.T, now time.Time) (*PolicyManager, *state.MemoryState, *clock) {
 	t.Helper()
 	c := newClock(now)
-	st := NewMemoryStateAt(c.Now)
+	st := state.NewMemoryStateAt(c.Now)
 	m := New(DefaultConfig(), st, testLogger()).
 		WithClock(c.Now).
 		WithRobotsFetcher((&fakeRobots{reply: map[string]robotsResponse{}}).fetcher())
@@ -153,3 +154,9 @@ var uniquePath atomic.Int64
 func uniqueURL(host, path string) string {
 	return "https://" + host + path + "?n=" + strconv.FormatInt(uniquePath.Add(1), 10)
 }
+
+var errRedisDown = errTest("redis is unreachable")
+
+type errTest string
+
+func (e errTest) Error() string { return string(e) }

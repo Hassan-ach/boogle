@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"net/url"
 	"strings"
 	"testing"
@@ -207,7 +208,7 @@ func TestRuleSetZeroMeansDefaultRules(t *testing.T) {
 	}
 
 	var zero Config
-	m2 := New(zero, NewMemoryState(), testLogger())
+	m2 := New(zero, state.NewMemoryState(), testLogger())
 	if r := m2.rules(); r.isZero() {
 		t.Error("a zero Config produced no rules; every skip rule would be disabled")
 	} else if !r.SkipsPath("/login") {
@@ -220,27 +221,34 @@ func TestRuleSetZeroMeansDefaultRules(t *testing.T) {
 		SkipFileExtensions:   []string{},
 		WikiNoisyNamespaces:  []string{},
 	}
-	m3 := New(permissive, NewMemoryState(), testLogger())
+	m3 := New(permissive, state.NewMemoryState(), testLogger())
 	if m3.rules().SkipsPath("/login") {
 		t.Error("an explicitly emptied rule list was replaced by the defaults")
 	}
 }
 
 // The compiled cache is derived from Allow/Disallow, so it has to answer the
-// same as compiling fresh would. A HostState from WithRobots has a cache; one
+// same as compiling fresh would. A state.HostState from WithRobots has a cache; one
 // built by hand or rebuilt from Redis does not, and both must behave alike.
 func TestHostStateRulesMatchesAFreshCompile(t *testing.T) {
 	allow := []string{"/private/public/"}
 	disallow := []string{"/private/", "/tag/", "/a*b/"}
 
-	fromCache := HostState{}.WithRobots("example.com", allow, disallow, nil, time.Second, time.Unix(1, 0))
-	if fromCache.compiled == nil {
-		t.Fatal("WithRobots did not compile the rules it was given")
+	fromCache := state.HostState{}.WithRobots("example.com", allow, disallow, nil, time.Second, time.Unix(1, 0))
+	fromCache = fromCache.WithCompiled(NewRobotsRules(allow, disallow))
+	if fromCache.Rules() == nil {
+		t.Fatal("the compiled rules were not attached to the HostState")
 	}
-	byHand := HostState{Name: "example.com", Allow: allow, Disallow: disallow}
-	if byHand.compiled != nil {
-		t.Fatal("test setup: a hand-built HostState should fall back to a fresh compile")
+	byHand := state.HostState{Name: "example.com", Allow: allow, Disallow: disallow}
+	if byHand.Rules() != nil {
+		t.Fatal("test setup: a hand-built state.HostState should fall back to a fresh compile")
 	}
+
+	// A hand-built HostState carries no compiled value, so the manager is the
+	// thing that has to supply one. This is the shape every HostState read back
+	// out of RedisState arrives in.
+	m := New(DefaultConfig(), state.NewMemoryState(), testLogger())
+	byHandRules := m.robotsRules(byHand)
 
 	fresh := NewRobotsRules(allow, disallow)
 	for _, path := range []string{
@@ -253,9 +261,9 @@ func TestHostStateRulesMatchesAFreshCompile(t *testing.T) {
 			t.Errorf("Rules().Allows(%q) = (%v, %q), want (%v, %q)",
 				path, gotAllowed, gotRule, wantAllowed, wantRule)
 		}
-		gotAllowed, gotRule = byHand.Rules().Allows(path)
+		gotAllowed, gotRule = byHandRules.Allows(path)
 		if gotAllowed != wantAllowed || gotRule != wantRule {
-			t.Errorf("hand-built Rules().Allows(%q) = (%v, %q), want (%v, %q)",
+			t.Errorf("hand-built compiled Rules().Allows(%q) = (%v, %q), want (%v, %q)",
 				path, gotAllowed, gotRule, wantAllowed, wantRule)
 		}
 	}
@@ -264,8 +272,10 @@ func TestHostStateRulesMatchesAFreshCompile(t *testing.T) {
 // WithRobots re-reading a host's robots.txt must replace the cache, not append
 // to or outlive the previous one.
 func TestWithRobotsReplacesTheCompiledRules(t *testing.T) {
-	st := HostState{}.WithRobots("example.com", nil, []string{"/old/"}, nil, time.Second, time.Unix(1, 0))
+	st := state.HostState{}.WithRobots("example.com", nil, []string{"/old/"}, nil, time.Second, time.Unix(1, 0))
+	st = st.WithCompiled(NewRobotsRules(nil, []string{"/old/"}))
 	st = st.WithRobots("example.com", nil, []string{"/new/"}, nil, time.Second, time.Unix(2, 0))
+	st = st.WithCompiled(NewRobotsRules(nil, []string{"/new/"}))
 
 	if st.Rules().Refuses("/old/") {
 		t.Error("the cache still carries a rule from the previous robots.txt")

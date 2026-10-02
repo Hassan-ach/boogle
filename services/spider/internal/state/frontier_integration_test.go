@@ -1,6 +1,6 @@
 //go:build integration
 
-package policy
+package state
 
 import (
 	"context"
@@ -249,7 +249,7 @@ func TestRedisPopFrontierWithNonPositiveBudget(t *testing.T) {
 			st, _, _ := newTestState(t)
 			ctx := context.Background()
 
-			for i := 0; i < defaultPopBatch+4; i++ {
+			for i := 0; i < DefaultPopBatch+4; i++ {
 				url := fmt.Sprintf("https://example.com/seen%02d", i)
 				if err := st.Enqueue(ctx, url, url); err != nil {
 					t.Fatal(err)
@@ -269,11 +269,11 @@ func TestRedisPopFrontierWithNonPositiveBudget(t *testing.T) {
 			if got.Found {
 				t.Errorf("budget %d reached %q past %d stale entries; a nonsense budget "+
 					"must resolve to the default scan, not to an unlimited one",
-					budget, got.URL, defaultPopBatch+4)
+					budget, got.URL, DefaultPopBatch+4)
 			}
-			if got.VisitedSkipped != defaultPopBatch {
+			if got.VisitedSkipped != DefaultPopBatch {
 				t.Errorf("VisitedSkipped = %d at budget %d, want the default %d",
-					got.VisitedSkipped, budget, defaultPopBatch)
+					got.VisitedSkipped, budget, DefaultPopBatch)
 			}
 			if got.Exhausted {
 				t.Errorf("Exhausted at budget %d with unvisited work still in the frontier", budget)
@@ -305,7 +305,7 @@ func TestRedisPromoteDelayedWithNonPositiveBatch(t *testing.T) {
 			ctx := context.Background()
 			now := time.Now()
 
-			const due = defaultPromoteBatch + 10
+			const due = DefaultPromoteBatch + 10
 			for i := 0; i < due; i++ {
 				if err := st.EnqueueDelayed(ctx, fmt.Sprintf("https://example.com/r%03d", i), now); err != nil {
 					t.Fatal(err)
@@ -316,9 +316,9 @@ func TestRedisPromoteDelayedWithNonPositiveBatch(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if n != defaultPromoteBatch {
+			if n != DefaultPromoteBatch {
 				t.Errorf("batch %d promoted %d, want the default %d -- a nonsense batch "+
-					"must not park every retry forever", batch, n, defaultPromoteBatch)
+					"must not park every retry forever", batch, n, DefaultPromoteBatch)
 			}
 
 			total := n

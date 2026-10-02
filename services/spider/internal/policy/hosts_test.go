@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -85,14 +86,14 @@ func TestAdmitBudgetCountsPerWindowNotForEver(t *testing.T) {
 	windowStarted := clock.Now()
 
 	clock.Advance(m.cfg.HostColdPeriod - time.Second)
-	st.ClearMarker(ctx, "big.example", MarkerCold)
+	st.ClearMarker(ctx, "big.example", state.MarkerCold)
 	if kind, reason := admitReason(t, m, uniqueURL("big.example", "/b")); kind == Allow {
 		t.Errorf("Admit inside the window = %v/%s, want a refusal", kind, reason)
 	}
 
 	_ = windowStarted
 	clock.Advance(2 * time.Second)
-	st.ClearMarker(ctx, "big.example", MarkerCold)
+	st.ClearMarker(ctx, "big.example", state.MarkerCold)
 	if v := mustAdmit(t, m, uniqueURL("big.example", "/c")); v.Kind != Allow {
 		t.Errorf("Admit after the window = %s, want Allow", FormatVerdict(v))
 	}
@@ -119,7 +120,7 @@ func TestAdmitZeroColdPeriodDoesNotResetEveryURL(t *testing.T) {
 
 	for range 5 {
 		clock.Advance(time.Millisecond)
-		st.ClearMarker(context.Background(), "big.example", MarkerCold)
+		st.ClearMarker(context.Background(), "big.example", state.MarkerCold)
 		if v := mustAdmit(t, m, uniqueURL("big.example", "/b")); v.Kind == Allow {
 			t.Fatal("a zero cold period reset the budget on every URL, making the budget unenforceable")
 		}
@@ -241,13 +242,13 @@ func TestEnsureHostTreatsATimeoutAsSlowNotGone(t *testing.T) {
 	cases := []struct {
 		name    string
 		err     error
-		marker  MarkerKind
-		notMark MarkerKind
+		marker  state.MarkerKind
+		notMark state.MarkerKind
 	}{
-		{"timeout", &timeoutError{}, MarkerCooldown, MarkerDead},
-		{"dns failure", &net.DNSError{Err: "no such host"}, MarkerDead, MarkerCooldown},
-		{"connection refused", errConnRefused, MarkerDead, MarkerCooldown},
-		{"tls failure", errTLSHandshake, MarkerDead, MarkerCooldown},
+		{"timeout", &timeoutError{}, state.MarkerCooldown, state.MarkerDead},
+		{"dns failure", &net.DNSError{Err: "no such host"}, state.MarkerDead, state.MarkerCooldown},
+		{"connection refused", errConnRefused, state.MarkerDead, state.MarkerCooldown},
+		{"tls failure", errTLSHandshake, state.MarkerDead, state.MarkerCooldown},
 	}
 
 	for _, tc := range cases {
@@ -346,10 +347,10 @@ func TestEnsureHostCooldownOnARefusingHost(t *testing.T) {
 			if err != nil {
 				t.Fatalf("markers: %v", err)
 			}
-			if _, ok := markers[MarkerCooldown]; !ok {
+			if _, ok := markers[state.MarkerCooldown]; !ok {
 				t.Errorf("status %d: no cooldown was set; markers = %v", tc.status, markerNames(markers))
 			}
-			if _, ok := markers[MarkerDead]; ok {
+			if _, ok := markers[state.MarkerDead]; ok {
 				t.Errorf("status %d: an overloaded host was marked dead", tc.status)
 			}
 		})
@@ -535,17 +536,16 @@ var (
 	errTLSHandshake = &tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}
 )
 
-func spendPages(t *testing.T, st *MemoryState, host string, n int) {
+func spendPages(t *testing.T, st *state.MemoryState, host string, n int) {
 	t.Helper()
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	rec := st.host[host]
-	rec.Name = host
-	rec.PagesCrawled = n
-	st.host[host] = rec
+	for i := 0; i < n; i++ {
+		if err := st.RecordSuccess(context.Background(), host, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
-func markerNames(m map[MarkerKind]time.Duration) []string {
+func markerNames(m map[state.MarkerKind]time.Duration) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k.String())
@@ -784,7 +784,7 @@ func (e *sentinelError) Error() string { return e.msg }
 
 func TestTheSitemapClaimIsDecidedByWhichRobotsReadingItIs(t *testing.T) {
 	ctx := context.Background()
-	st := NewMemoryState()
+	st := state.NewMemoryState()
 	first := time.Date(2026, 6, 2, 9, 0, 0, 0, time.UTC)
 	later := first.Add(time.Hour)
 
@@ -926,7 +926,7 @@ func TestHostKeyKeepsThePortThatIdentifiesTheSite(t *testing.T) {
 }
 
 func TestAClaimWithNoReadingIsRefused(t *testing.T) {
-	st := NewMemoryState()
+	st := state.NewMemoryState()
 	won, err := st.ClaimSiteMaps(context.Background(), "unset.example", time.Time{})
 	if err != nil {
 		t.Fatal(err)
@@ -949,7 +949,7 @@ func TestExactlyOneWorkerExpandsASiteMapsReading(t *testing.T) {
 	m = m.WithSiteMapResolver(res)
 
 	readAt := time.Date(2026, 6, 2, 9, 0, 0, 0, time.UTC)
-	st := HostState{
+	st := state.HostState{
 		Name:            host,
 		SiteMaps:        []string{"https://contended.example/sitemap.xml"},
 		RobotsFetchedAt: readAt,

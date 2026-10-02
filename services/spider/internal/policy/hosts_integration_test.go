@@ -4,6 +4,7 @@ package policy
 
 import (
 	"context"
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"net"
 	"strconv"
 	"testing"
@@ -90,7 +91,7 @@ func TestRedisNegativeCacheSurvivesARestart(t *testing.T) {
 		t.Fatalf("first Admit made %d fetches, want 1", calls)
 	}
 
-	ttl, err := conn.PTTL(ctx, keys.HostMarker("dead.example", MarkerDead)).Result()
+	ttl, err := conn.PTTL(ctx, keys.HostMarker("dead.example", state.MarkerDead)).Result()
 	if err != nil {
 		t.Fatalf("the dead marker is not in Redis: %v", err)
 	}
@@ -199,7 +200,7 @@ func TestRedisWindowRolloverResetsOnlyTheBudget(t *testing.T) {
 	ctx := context.Background()
 
 	start := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	if err := st.SaveHostState(ctx, "h.example", HostState{
+	if err := st.SaveHostState(ctx, "h.example", state.HostState{
 		Name:            "h.example",
 		WindowStartedAt: start,
 		FirstSeen:       start.Add(-72 * time.Hour),

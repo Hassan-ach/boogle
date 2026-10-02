@@ -1,6 +1,6 @@
 //go:build integration
 
-package policy
+package state
 
 import (
 	"context"
@@ -360,8 +360,8 @@ func TestRedisStateCounters(t *testing.T) {
 	if state.ConsecFailures != 3 {
 		t.Errorf("ConsecFailures = %d, want 3", state.ConsecFailures)
 	}
-	if state.Status != statusDegraded {
-		t.Errorf("Status = %q after three failures, want %q", state.Status, statusDegraded)
+	if state.Status != StatusDegraded {
+		t.Errorf("Status = %q after three failures, want %q", state.Status, StatusDegraded)
 	}
 
 	at := time.Date(2026, 7, 4, 10, 0, 0, 0, time.UTC)
@@ -378,8 +378,8 @@ func TestRedisStateCounters(t *testing.T) {
 	if !state.LastSuccess.Equal(at) {
 		t.Errorf("LastSuccess = %v, want %v", state.LastSuccess, at)
 	}
-	if state.Status != statusReady {
-		t.Errorf("Status = %q after a success, want %q", state.Status, statusReady)
+	if state.Status != StatusReady {
+		t.Errorf("Status = %q after a success, want %q", state.Status, StatusReady)
 	}
 
 	if err := st.ResetWindow(ctx, "example.com", time.Now()); err != nil {
@@ -709,26 +709,35 @@ func TestRedisStateCountReason(t *testing.T) {
 	st, conn, keys := newTestState(t)
 	ctx := context.Background()
 
+	// The reason vocabulary belongs to the policy layer, which this package
+	// deliberately does not depend on. Spelling the labels out here is the
+	// point: these are the literal hash fields on the wire, and renaming a
+	// policy constant must not silently renumber everyone's stats.
+	const (
+		pathDisallowed   = Reason("path_disallowed")
+		extensionSkipped = Reason("extension_skipped")
+	)
+
 	for i := 0; i < 5; i++ {
-		if err := st.CountReason(ctx, "example.com", ReasonPathDisallowed); err != nil {
+		if err := st.CountReason(ctx, "example.com", pathDisallowed); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := st.CountReason(ctx, "example.com", ReasonExtensionSkipped); err != nil {
+	if err := st.CountReason(ctx, "example.com", extensionSkipped); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.CountReason(ctx, "example.com", ReasonExtensionSkipped); err != nil {
+	if err := st.CountReason(ctx, "example.com", extensionSkipped); err != nil {
 		t.Fatal(err)
 	}
 
-	disallowed, err := conn.HGet(ctx, keys.Stats("example.com"), string(ReasonPathDisallowed)).Int()
+	disallowed, err := conn.HGet(ctx, keys.Stats("example.com"), string(pathDisallowed)).Int()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if disallowed != 5 {
 		t.Errorf("path_disallowed = %d, want 5", disallowed)
 	}
-	ext, _ := conn.HGet(ctx, keys.Stats("example.com"), string(ReasonExtensionSkipped)).Int()
+	ext, _ := conn.HGet(ctx, keys.Stats("example.com"), string(extensionSkipped)).Int()
 	if ext != 2 {
 		t.Errorf("extension_skipped = %d, want 2", ext)
 	}

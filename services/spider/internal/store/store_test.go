@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/Hassan-ach/boogle/services/spider/internal/entity"
-	"github.com/Hassan-ach/boogle/services/spider/internal/policy"
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"uuid"
 )
 
@@ -59,13 +59,13 @@ type fakeCache struct{}
 
 func (c *fakeCache) Close() {}
 
-func newTestStore(t *testing.T) (*Store, *policy.MemoryState) {
+func newTestStore(t *testing.T) (*Store, *state.MemoryState) {
 	t.Helper()
-	st := policy.NewMemoryState()
+	st := state.NewMemoryState()
 	return &Store{
 		db:    &fakeDB{pageID: uuid.New()},
 		cache: &fakeCache{},
-		state: st,
+		st:    st,
 		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}, st
 }

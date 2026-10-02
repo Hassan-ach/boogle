@@ -1,4 +1,4 @@
-package policy
+package state
 
 import (
 	"context"
@@ -8,7 +8,7 @@ import (
 )
 
 func TestPopFrontierTakesHighestPriorityFirst(t *testing.T) {
-	_, st := newTestManager(t)
+	st := NewMemoryState()
 	ctx := context.Background()
 
 	for i := 0; i < 5; i++ {
@@ -41,7 +41,7 @@ func TestPopFrontierTakesHighestPriorityFirst(t *testing.T) {
 }
 
 func TestPopFrontierRemovesWhatItReturns(t *testing.T) {
-	_, st := newTestManager(t)
+	st := NewMemoryState()
 	ctx := context.Background()
 
 	const entries = 3
@@ -71,7 +71,7 @@ func TestPopFrontierRemovesWhatItReturns(t *testing.T) {
 }
 
 func TestPopFrontierSkipsVisitedWithoutLosingWork(t *testing.T) {
-	_, st := newTestManager(t)
+	st := NewMemoryState()
 	ctx := context.Background()
 
 	if err := st.Enqueue(ctx, "https://example.com/seen", "https://example.com/seen", "https://example.com/seen"); err != nil {
@@ -102,7 +102,7 @@ func TestPopFrontierSkipsVisitedWithoutLosingWork(t *testing.T) {
 
 func TestPopFrontierExhaustedIsDistinctFromNotFound(t *testing.T) {
 	t.Run("an empty frontier reports exhausted", func(t *testing.T) {
-		_, st := newTestManager(t)
+		st := NewMemoryState()
 		got, err := st.PopFrontier(context.Background(), 16)
 		if err != nil {
 			t.Fatal(err)
@@ -117,7 +117,7 @@ func TestPopFrontierExhaustedIsDistinctFromNotFound(t *testing.T) {
 	})
 
 	t.Run("a budget-limited scan of stale entries is not exhausted", func(t *testing.T) {
-		_, st := newTestManager(t)
+		st := NewMemoryState()
 		ctx := context.Background()
 
 		for i := 0; i < 10; i++ {
@@ -151,7 +151,7 @@ func TestPopFrontierExhaustedIsDistinctFromNotFound(t *testing.T) {
 }
 
 func TestPopFrontierEventuallyDrainsAnAllStaleFrontier(t *testing.T) {
-	_, st := newTestManager(t)
+	st := NewMemoryState()
 	ctx := context.Background()
 
 	const entries = 50
@@ -233,10 +233,10 @@ func TestToStringAndToIntCoverWhatRedisActuallySends(t *testing.T) {
 func TestPopFrontierWithNonPositiveBudget(t *testing.T) {
 	for _, budget := range []int{0, -1} {
 		t.Run(fmt.Sprintf("budget=%d", budget), func(t *testing.T) {
-			_, st := newTestManager(t)
+			st := NewMemoryState()
 			ctx := context.Background()
 
-			for i := 0; i < defaultPopBatch+4; i++ {
+			for i := 0; i < DefaultPopBatch+4; i++ {
 				url := fmt.Sprintf("https://example.com/seen%02d", i)
 				if err := st.Enqueue(ctx, url, url); err != nil {
 					t.Fatal(err)
@@ -256,11 +256,11 @@ func TestPopFrontierWithNonPositiveBudget(t *testing.T) {
 			if got.Found {
 				t.Errorf("budget %d reached %q past %d stale entries; a nonsense budget "+
 					"must resolve to the default scan, not to an unlimited one",
-					budget, got.URL, defaultPopBatch+4)
+					budget, got.URL, DefaultPopBatch+4)
 			}
-			if got.VisitedSkipped != defaultPopBatch {
+			if got.VisitedSkipped != DefaultPopBatch {
 				t.Errorf("VisitedSkipped = %d at budget %d, want the default %d",
-					got.VisitedSkipped, budget, defaultPopBatch)
+					got.VisitedSkipped, budget, DefaultPopBatch)
 			}
 			if got.Exhausted {
 				t.Errorf("Exhausted at budget %d with unvisited work still in the frontier", budget)
@@ -297,7 +297,7 @@ func drainMemory(t *testing.T, st *MemoryState, budget int) []string {
 }
 
 func TestPopFrontierBreaksScoreTiesByMember(t *testing.T) {
-	_, st := newTestManager(t)
+	st := NewMemoryState()
 	ctx := context.Background()
 
 	for _, u := range []string{"zebra", "mango", "apple", "kiwi"} {
@@ -334,7 +334,7 @@ func TestPopFrontierBreaksScoreTiesByMember(t *testing.T) {
 }
 
 func TestPromoteDelayedRespectsDueTime(t *testing.T) {
-	_, st := newTestManager(t)
+	st := NewMemoryState()
 	ctx := context.Background()
 	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
@@ -367,7 +367,7 @@ func TestPromoteDelayedRespectsDueTime(t *testing.T) {
 }
 
 func TestPromoteDelayedIsIdempotent(t *testing.T) {
-	_, st := newTestManager(t)
+	st := NewMemoryState()
 	ctx := context.Background()
 	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
@@ -402,7 +402,7 @@ func TestPromoteDelayedIsIdempotent(t *testing.T) {
 }
 
 func TestMemoryPromoteDelayedEntersAtZero(t *testing.T) {
-	_, st := newTestManager(t)
+	st := NewMemoryState()
 	ctx := context.Background()
 	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
@@ -432,7 +432,7 @@ func TestMemoryPromoteDelayedEntersAtZero(t *testing.T) {
 }
 
 func TestPromoteDelayedPreservesPriorityOnRediscovery(t *testing.T) {
-	_, st := newTestManager(t)
+	st := NewMemoryState()
 	ctx := context.Background()
 	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
@@ -457,7 +457,7 @@ func TestPromoteDelayedPreservesPriorityOnRediscovery(t *testing.T) {
 }
 
 func TestPromoteDelayedRespectsBatchLimit(t *testing.T) {
-	_, st := newTestManager(t)
+	st := NewMemoryState()
 	ctx := context.Background()
 	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
@@ -492,7 +492,7 @@ func TestPromoteDelayedRespectsBatchLimit(t *testing.T) {
 }
 
 func TestPromoteDelayedAndPopRoundTrip(t *testing.T) {
-	_, st := newTestManager(t)
+	st := NewMemoryState()
 	ctx := context.Background()
 	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
@@ -524,7 +524,7 @@ func TestPromoteDelayedAndPopRoundTrip(t *testing.T) {
 }
 
 func TestFrontierRoundTripFailsClosed(t *testing.T) {
-	_, st := newTestManager(t)
+	st := NewMemoryState()
 	ctx := context.Background()
 	st.FailWith = errRedisDown
 

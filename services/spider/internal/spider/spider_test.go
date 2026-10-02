@@ -18,6 +18,7 @@ import (
 	"github.com/Hassan-ach/boogle/services/spider/internal/messaging"
 	"github.com/Hassan-ach/boogle/services/spider/internal/parser"
 	"github.com/Hassan-ach/boogle/services/spider/internal/policy"
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 	"uuid"
 )
@@ -188,7 +189,7 @@ func (s *site) pageURL(path string) string {
 
 type harness struct {
 	spider *Spider
-	state  *policy.MemoryState
+	state  *state.MemoryState
 	policy *policy.PolicyManager
 	site   *site
 	store  *fakeStore
@@ -227,10 +228,10 @@ func newHarnessWithConfig(
 	if adjust != nil {
 		adjust(&cfg)
 	}
-	state := policy.NewMemoryStateAt(clock.Now)
+	mem := state.NewMemoryStateAt(clock.Now)
 	logs := utils.NewDiscardLogger()
 
-	pm := policy.New(cfg, state, logs.Logger).WithClock(clock.Now).
+	pm := policy.New(cfg, mem, logs.Logger).WithClock(clock.Now).
 		WithRobotsClient(s.srv.Client()).
 		WithFetchClient(s.srv.Client())
 
@@ -240,7 +241,7 @@ func newHarnessWithConfig(
 
 	st := newFakeStore()
 	return &harness{
-		state:  state,
+		state:  mem,
 		policy: pm,
 		site:   s,
 		store:  st,
@@ -343,7 +344,7 @@ func TestADeadHostCostsNothingPerURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, dead := markers[policy.MarkerDead]; !dead {
+	if _, dead := markers[state.MarkerDead]; !dead {
 		t.Errorf("the host was never marked dead (markers: %v), so every one of its "+
 			"URLs will try again", markers)
 	}

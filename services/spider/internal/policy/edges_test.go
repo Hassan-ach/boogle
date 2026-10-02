@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"os"
 	"strings"
 	"testing"
@@ -96,31 +97,31 @@ func TestParseRobotsOnlyAppliesEachGroupOnce(t *testing.T) {
 func TestRobotsStaleTreatsANeverReadHostAsStale(t *testing.T) {
 	m, _ := newTestManager(t)
 
-	if !m.robotsStale(HostState{Name: "h.example"}) {
+	if !m.robotsStale(state.HostState{Name: "h.example"}) {
 		t.Error("a host that was never read was reported as fresh; its rules " +
 			"would be treated as an empty set that permits everything")
 	}
 
-	if m.robotsStale(HostState{Name: "h.example", RobotsFetchedAt: m.now()}) {
+	if m.robotsStale(state.HostState{Name: "h.example", RobotsFetchedAt: m.now()}) {
 		t.Error("a robots.txt read a moment ago was reported as stale")
 	}
 }
 
 func TestMemoryStateReportsItsOwnClock(t *testing.T) {
 	want := time.Date(2026, 5, 1, 8, 30, 0, 0, time.UTC)
-	st := NewMemoryStateAt(func() time.Time { return want })
+	st := state.NewMemoryStateAt(func() time.Time { return want })
 
 	if got := st.Now(); !got.Equal(want) {
 		t.Errorf("Now() = %v, want %v", got, want)
 	}
 
-	if got := NewMemoryStateAt(nil).Now(); got.IsZero() {
-		t.Error("NewMemoryStateAt(nil).Now() returned the zero time")
+	if got := state.NewMemoryStateAt(nil).Now(); got.IsZero() {
+		t.Error("state.NewMemoryStateAt(nil).Now() returned the zero time")
 	}
 }
 
 func TestMemoryStateEnqueueAtIsAPriorityAndEnqueueIsAnIncrement(t *testing.T) {
-	st := NewMemoryState()
+	st := state.NewMemoryState()
 	ctx := context.Background()
 
 	if err := st.EnqueueAt(ctx, "https://example.com/fixed", 7); err != nil {
@@ -142,11 +143,11 @@ func TestMemoryStateEnqueueAtIsAPriorityAndEnqueueIsAnIncrement(t *testing.T) {
 }
 
 func TestMemoryStateHostsListsWhatItKnows(t *testing.T) {
-	st := NewMemoryState()
+	st := state.NewMemoryState()
 	ctx := context.Background()
 
 	for _, host := range []string{"a.example", "b.example", "c.example"} {
-		if err := st.SaveHostState(ctx, host, HostState{Name: host, MaxPages: 10}); err != nil {
+		if err := st.SaveHostState(ctx, host, state.HostState{Name: host, MaxPages: 10}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -168,10 +169,10 @@ func TestMemoryStateHostsListsWhatItKnows(t *testing.T) {
 }
 
 func TestManagerStateIsTheSameStore(t *testing.T) {
-	st := NewMemoryState()
+	st := state.NewMemoryState()
 	m := New(DefaultConfig(), st, testLogger())
 
-	if m.State() != State(st) {
+	if m.State() != state.State(st) {
 		t.Error("State() returned a different store than the one the manager was built with")
 	}
 }

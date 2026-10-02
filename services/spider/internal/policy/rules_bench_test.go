@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"net/url"
 	"testing"
 	"time"
@@ -28,16 +29,16 @@ func benchURL() *url.URL {
 }
 
 func benchManager() *PolicyManager {
-	return New(DefaultConfig(), NewMemoryState(), testLogger())
+	return New(DefaultConfig(), state.NewMemoryState(), testLogger())
 }
 
 // admitsLocally compiles a host's robots rules into regexps. A large sitemap
-// runs it over thousands of entries against one HostState, so the per-call
+// runs it over thousands of entries against one state.HostState, so the per-call
 // compile dominates. Reuses is the path that has the cache; Recompiles is the
 // path a state rebuilt from Redis hands back.
 func BenchmarkAdmitsLocallyReusesCompiled(b *testing.B) {
 	m := benchManager()
-	st := HostState{}.WithRobots("example.com", benchAllow(), benchDisallow(), nil, time.Second, time.Unix(1, 0))
+	st := state.HostState{}.WithRobots("example.com", benchAllow(), benchDisallow(), nil, time.Second, time.Unix(1, 0))
 	u := benchURL()
 
 	b.ReportAllocs()
@@ -50,12 +51,12 @@ func BenchmarkAdmitsLocallyReusesCompiled(b *testing.B) {
 
 func BenchmarkAdmitsLocallyRecompiles(b *testing.B) {
 	m := benchManager()
-	st := HostState{}.WithRobots("example.com", benchAllow(), benchDisallow(), nil, time.Second, time.Unix(1, 0))
+	st := state.HostState{}.WithRobots("example.com", benchAllow(), benchDisallow(), nil, time.Second, time.Unix(1, 0))
 	u := benchURL()
 
 	b.ReportAllocs()
 	for b.Loop() {
-		st.compiled = nil
+		st = st.WithCompiled(nil)
 		if _, ok := m.admitsLocally(st, u); !ok {
 			b.Fatal("the benchmark url was refused; nothing is being measured")
 		}

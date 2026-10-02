@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"io"
 	"net"
 	"net/http"
@@ -76,7 +77,7 @@ func TestAdmitChecksDeadHostBeforeTheNetwork(t *testing.T) {
 	m = m.WithRobotsFetcher(fetch.fetcher())
 	ctx := context.Background()
 
-	if err := st.SetMarker(ctx, "dead.example", MarkerDead, time.Minute); err != nil {
+	if err := st.SetMarker(ctx, "dead.example", state.MarkerDead, time.Minute); err != nil {
 		t.Fatalf("set marker: %v", err)
 	}
 	fetch.forbidCalls(t)
@@ -98,12 +99,12 @@ func TestAdmitChecksDeadHostBeforeTheNetwork(t *testing.T) {
 func TestAdmitChecksColdAndCooldownBeforeTheNetwork(t *testing.T) {
 	cases := []struct {
 		name       string
-		marker     MarkerKind
+		marker     state.MarkerKind
 		wantKind   VerdictKind
 		wantReason Reason
 	}{
-		{"cold", MarkerCold, Skip, ReasonHostCold},
-		{"cooldown", MarkerCooldown, Defer, ReasonHostCoolingDown},
+		{"cold", state.MarkerCold, Skip, ReasonHostCold},
+		{"cooldown", state.MarkerCooldown, Defer, ReasonHostCoolingDown},
 	}
 
 	for _, tc := range cases {
@@ -136,7 +137,7 @@ func TestAdmitCooldownDefersRatherThanSkips(t *testing.T) {
 	ctx := context.Background()
 
 	const target = "https://slow.example/page"
-	if err := st.SetMarker(ctx, "slow.example", MarkerCooldown, time.Minute); err != nil {
+	if err := st.SetMarker(ctx, "slow.example", state.MarkerCooldown, time.Minute); err != nil {
 		t.Fatalf("set marker: %v", err)
 	}
 
@@ -309,23 +310,23 @@ func TestEveryDeferComesWithADueTime(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		breakIt func(m *PolicyManager, st *MemoryState)
+		breakIt func(m *PolicyManager, st *state.MemoryState)
 		host    string
 		robots  *fakeRobots
 	}{
 		{
 			name:    "the policy state is unreadable",
-			breakIt: func(_ *PolicyManager, st *MemoryState) { st.FailOn = map[string]error{"IsVisited": errRedisDown} },
+			breakIt: func(_ *PolicyManager, st *state.MemoryState) { st.FailOn = map[string]error{"IsVisited": errRedisDown} },
 		},
 		{
 			name: "the host is cooling down",
-			breakIt: func(_ *PolicyManager, st *MemoryState) {
-				_ = st.SetMarker(context.Background(), "example.com", MarkerCooldown, time.Hour)
+			breakIt: func(_ *PolicyManager, st *state.MemoryState) {
+				_ = st.SetMarker(context.Background(), "example.com", state.MarkerCooldown, time.Hour)
 			},
 		},
 		{
 			name:    "the host cannot be resolved",
-			breakIt: func(_ *PolicyManager, _ *MemoryState) {},
+			breakIt: func(_ *PolicyManager, _ *state.MemoryState) {},
 			host:    "slow.example",
 			robots: &fakeRobots{reply: map[string]robotsResponse{
 				"slow.example": {err: &net.DNSError{Err: "no such host", Name: "slow.example"}},
@@ -408,13 +409,13 @@ Disallow: /private/
 	cases := []struct {
 		name       string
 		url        string
-		marker     MarkerKind
+		marker     state.MarkerKind
 		withMarker bool
 		wantReason Reason
 	}{
-		{"dead host", "https://dead.example/x", MarkerDead, true, ReasonHostDead},
-		{"cold host", "https://cold.example/x", MarkerCold, true, ReasonHostCold},
-		{"cooling host", "https://cool.example/x", MarkerCooldown, true, ReasonHostCoolingDown},
+		{"dead host", "https://dead.example/x", state.MarkerDead, true, ReasonHostDead},
+		{"cold host", "https://cold.example/x", state.MarkerCold, true, ReasonHostCold},
+		{"cooling host", "https://cool.example/x", state.MarkerCooldown, true, ReasonHostCoolingDown},
 		{"path rule", "https://rules.example/login", 0, false, ReasonPathDisallowed},
 		{"extension rule", "https://rules.example/a.pdf", 0, false, ReasonExtensionSkipped},
 		{"robots rule", "https://rules.example/private/x", 0, false, ReasonRobotsDisallow},
@@ -517,7 +518,7 @@ func TestAdmitLinksSeparatesTheTwoOutcomes(t *testing.T) {
 	}).fetcher())
 	ctx := context.Background()
 
-	if err := m.State().SetMarker(ctx, "dead.example", MarkerDead, time.Minute); err != nil {
+	if err := m.State().SetMarker(ctx, "dead.example", state.MarkerDead, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 
