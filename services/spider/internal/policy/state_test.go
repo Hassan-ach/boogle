@@ -299,6 +299,65 @@ func TestCountingAFailureNeverBreaksARefusal(t *testing.T) {
 	}
 }
 
+// SaveHostState must not disturb the fields the counters own. Another spider
+// process sharing this Redis can record a success or take the sitemap claim
+// between this process's read and its save, and the two backends have to behave
+// the same way or a host's budget depends on which store it was running against.
+func TestSaveHostStateDoesNotDisturbTheCounters(t *testing.T) {
+	_, st := newTestManager(t)
+	ctx := context.Background()
+	const host = "example.com"
+
+	if won, err := st.ClaimSiteMaps(ctx, host, time.Unix(1000, 0)); err != nil || !won {
+		t.Fatalf("first sitemap claim: won=%v err=%v", won, err)
+	}
+	if err := st.RecordSuccess(ctx, host, time.Unix(2000, 0)); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		if _, err := st.RecordFailure(ctx, host); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A snapshot taken before any of the above, as a reader that raced a
+	// concurrent spider would hold.
+	stale := HostState{Name: host}
+	stale = stale.WithRobots(host, nil, []string{"/x"}, nil, time.Second, time.Unix(3000, 0))
+	if err := st.SaveHostState(ctx, host, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.HostState(ctx, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PagesCrawled != 1 {
+		t.Errorf("PagesCrawled = %d, want 1: saving a stale snapshot rolled the counter back, "+
+			"so the host's page budget restarts from zero", got.PagesCrawled)
+	}
+	if got.ConsecFailures != 5 {
+		t.Errorf("ConsecFailures = %d, want 5: a stale save cleared the failure run that "+
+			"keeps a flapping host from looking healthy", got.ConsecFailures)
+	}
+	if !got.LastSuccess.Equal(time.Unix(2000, 0)) {
+		t.Errorf("LastSuccess = %v, want the recorded success at %v", got.LastSuccess, time.Unix(2000, 0))
+	}
+	if !got.SiteMapsClaimedAt.Equal(time.Unix(1000, 0)) {
+		t.Errorf("SiteMapsClaimedAt = %v, want %v", got.SiteMapsClaimedAt, time.Unix(1000, 0))
+	}
+
+	// The fields SaveHostState does own still land. Read through NewRobotsRules,
+	// not Rules(): a value read back out of the store has no compiled cache.
+	if !NewRobotsRules(got.Allow, got.Disallow).Refuses("/x") {
+		t.Errorf("the saved robots.txt rules were not applied: Allow=%v Disallow=%v",
+			got.Allow, got.Disallow)
+	}
+	if !got.RobotsFetchedAt.Equal(time.Unix(3000, 0)) {
+		t.Errorf("RobotsFetchedAt = %v, want %v", got.RobotsFetchedAt, time.Unix(3000, 0))
+	}
+}
+
 func TestHostStateBudgetIsPerWindow(t *testing.T) {
 	_, st := newTestManager(t)
 	ctx := context.Background()

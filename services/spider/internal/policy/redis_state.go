@@ -227,6 +227,9 @@ func (s *RedisState) SaveHostState(ctx context.Context, host string, st HostStat
 		values[fieldSitemaps] = strings.Join(st.SiteMaps, "\n")
 	}
 
+	// HSet only touches the fields named above, so the counter-owned fields stay
+	// put. That is the behaviour MemoryState.SaveHostState has to match; see
+	// State.SaveHostState.
 	if err := s.conn.HSet(ctx, s.keys.HostState(host), values).Err(); err != nil {
 		return fmt.Errorf("save host state for %s: %w", host, err)
 	}

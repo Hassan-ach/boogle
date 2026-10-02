@@ -313,9 +313,18 @@ func (m *MemoryState) SaveHostState(ctx context.Context, host string, st HostSta
 		return errEmptyHost
 	}
 	st.Name = host
-	st.SiteMapsClaimedAt = m.host[host].SiteMapsClaimedAt
+	st.carryCountersFrom(m.host[host])
 	m.host[host] = st
 	return nil
+}
+
+// carryCountersFrom moves the counter-owned fields across from the stored record.
+// See State.SaveHostState for why a whole-struct assignment is not safe here.
+func (h *HostState) carryCountersFrom(stored HostState) {
+	h.PagesCrawled = stored.PagesCrawled
+	h.ConsecFailures = stored.ConsecFailures
+	h.LastSuccess = stored.LastSuccess
+	h.SiteMapsClaimedAt = stored.SiteMapsClaimedAt
 }
 
 func (m *MemoryState) RecordSuccess(ctx context.Context, host string, at time.Time) error {

@@ -38,7 +38,19 @@ type State interface {
 	ClearURLState(ctx context.Context, url string) error
 
 	HostState(ctx context.Context, host string) (HostState, error)
+
+	// SaveHostState persists the fields a robots.txt reading determines:
+	// CrawlDelay, MaxPages, WindowStartedAt, RobotsFetchedAt, FirstSeen,
+	// Status, Allow, Disallow and SiteMaps.
+	//
+	// It must not disturb the fields the counters own -- PagesCrawled,
+	// ConsecFailures, LastSuccess and SiteMapsClaimedAt. Those move under
+	// RecordSuccess, RecordFailure and ClaimSiteMaps, which can run against the
+	// same host from another spider process between a caller's read and its
+	// save. RedisState gets this for free by never writing them; an in-memory
+	// store that assigns the whole struct has to carry them over explicitly.
 	SaveHostState(ctx context.Context, host string, st HostState) error
+
 	RecordSuccess(ctx context.Context, host string, at time.Time) error
 	RecordFailure(ctx context.Context, host string) (int, error)
 	ResetWindow(ctx context.Context, host string, at time.Time) error
