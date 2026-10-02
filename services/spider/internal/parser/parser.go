@@ -63,5 +63,3 @@ func (p *Parser) ParseHTML(r io.Reader, baseURL string) (*entity.Page, error) {
 		Images: utils.NewSetFromSlice(c.Imags).GetAll(),
 	}, nil
 }
-
-

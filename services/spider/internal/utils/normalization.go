@@ -156,37 +156,3 @@ func CanonicalizeUrls(raws []string, baseHost string) []string {
 	}
 	return result
 }
-
-func ValidateLinks(links []string, disallowed []string) []string {
-	normUrls := NewSet[string]()
-	for _, x := range links {
-		ur, err := url.Parse(x)
-		if err != nil || isDisallowed(ur.Path, disallowed) {
-			continue
-		}
-		normUrls.Add(ur.String())
-	}
-	return normUrls.GetAll()
-}
-
-func IsDisallowed(path string, disallowed []string) bool {
-	for _, d := range disallowed {
-		if d == "" {
-			continue
-		}
-		if strings.ContainsAny(d, `.^$*+?[]|()`) {
-			if matched, err := regexp.MatchString(d, path); err == nil && matched {
-				return true
-			}
-		} else {
-			if strings.HasPrefix(path, d) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func isDisallowed(p string, disallowed []string) bool {
-	return IsDisallowed(p, disallowed)
-}

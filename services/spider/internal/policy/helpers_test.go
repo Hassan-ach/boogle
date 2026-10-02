@@ -28,17 +28,6 @@ type fakeRobots struct {
 	failCall bool
 }
 
-func newFakeRobots(body string) *fakeRobots {
-	return &fakeRobots{reply: map[string]robotsResponse{}, body: body, status: 200}
-}
-
-func (f *fakeRobots) script(host string, r robotsResponse) *fakeRobots {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.reply[host] = r
-	return f
-}
-
 func (f *fakeRobots) fetcher() RobotsFetcher {
 	return func(_ context.Context, rawURL string) ([]byte, int, error) {
 		f.mu.Lock()

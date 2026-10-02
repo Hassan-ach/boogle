@@ -198,30 +198,6 @@ func TestSkipsWikiLanguageSubpageRequiresBothConditions(t *testing.T) {
 	}
 }
 
-func TestFoldsLanguageSubdomainOnlyOnKnownDomains(t *testing.T) {
-	r := DefaultRules()
-
-	cases := []struct{ in, want string }{
-		{"fr.wikipedia.org", "en.wikipedia.org"},
-		{"de.wikibooks.org", "en.wikibooks.org"},
-		{"zh-min-nan.wikivoyage.org", "en.wikivoyage.org"},
-		{"en.wikipedia.org", "en.wikipedia.org"},
-		{"wikipedia.org", "wikipedia.org"},
-		{"www.fr.wikipedia.org", "en.wikipedia.org"},
-
-		{"go.example.com", "go.example.com"},
-		{"it.example.co.uk", "it.example.co.uk"},
-		{"FR.EXAMPLE.COM", "fr.example.com"},
-		{"blog.example.com", "blog.example.com"},
-	}
-
-	for _, tc := range cases {
-		if got := r.FoldsLanguageSubdomain(tc.in); got != tc.want {
-			t.Errorf("FoldsLanguageSubdomain(%q) = %q, want %q", tc.in, got, tc.want)
-		}
-	}
-}
-
 func TestRuleSetZeroMeansDefaultRules(t *testing.T) {
 	m, _ := newTestManager(t)
 

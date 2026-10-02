@@ -93,35 +93,6 @@ func TestParseRobotsOnlyAppliesEachGroupOnce(t *testing.T) {
 	}
 }
 
-func TestDropsQueryParam(t *testing.T) {
-	r := DefaultRules()
-
-	for _, q := range []string{"sort", "page", "filter", "q", "search"} {
-		if !r.DropsQueryParam(q) {
-			t.Errorf("DropsQueryParam(%q) = false, want true", q)
-		}
-	}
-
-	for _, q := range []string{
-		"", "id", "lang", "v",
-		"page_size", "sort_order", "query", "searching",
-		"utm_source", "fbclid",
-	} {
-		if r.DropsQueryParam(q) {
-			t.Errorf("DropsQueryParam(%q) = true, want false", q)
-		}
-	}
-}
-
-func TestDropsQueryParamOnAnEmptyTable(t *testing.T) {
-	var empty RuleSet
-	for _, q := range []string{"", "sort", "anything"} {
-		if empty.DropsQueryParam(q) {
-			t.Errorf("an empty table dropped %q", q)
-		}
-	}
-}
-
 func TestRobotsStaleTreatsANeverReadHostAsStale(t *testing.T) {
 	m, _ := newTestManager(t)
 

@@ -5,21 +5,22 @@ import (
 	"strings"
 )
 
+// RuleSet is the crawler's own hygiene table, applied after robots.txt has had
+// its say: paths that are never worth a fetch no matter what a site allows, and
+// file types that are never indexable.
+//
+// Query parameters are deliberately absent. utils.CanonicalizeUrl strips the
+// pagination and search params while canonicalizing, so they are already gone
+// by the time Admit evaluates a URL.
 type RuleSet struct {
 	DisallowPathPrefixes []string
 
-	DisallowQueryParams []string
-
 	SkipFileExtensions []string
-
-	LangSubdomainDomains []string
 
 	WikiNoisyNamespaces []string
 }
 
 var wikiLangSubpageRE = regexp.MustCompile(`(?i)/[a-z]{2,3}(-[a-z]{2,4})?/?$`)
-
-var languageSubtagRE = regexp.MustCompile(`^[a-z]{2,8}(-[a-z]{2,8}){0,2}$`)
 
 func DefaultRules() RuleSet {
 	return RuleSet{
@@ -29,9 +30,6 @@ func DefaultRules() RuleSet {
 			"/search", "/filter/", "/admin/", "/dashboard/", "/settings/",
 			"/404", "/error/", "/maintenance", "/test/", "/print/", "/preview/", "/tag/",
 		},
-		DisallowQueryParams: []string{
-			"sort", "page", "filter", "q", "search",
-		},
 		SkipFileExtensions: []string{
 			".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
 			".zip", ".rar", ".7z", ".tar", ".gz", ".exe", ".msi", ".dmg", ".apk",
@@ -40,15 +38,14 @@ func DefaultRules() RuleSet {
 			".mp4", ".avi", ".mov", ".wmv", ".mkv", ".flv", ".webm",
 			".css", ".js", ".ico",
 		},
-		LangSubdomainDomains: []string{
-			"wikipedia.org",
-			"wikibooks.org",
-			"wikivoyage.org",
-		},
 		WikiNoisyNamespaces: []string{"/Template:", "/Help:", "/Manual:", "/Extension:"},
 	}
 }
 
+// rules is the effective table. A Config built by hand rather than by
+// DefaultConfig has no Rules at all, and an empty table disables every skip, so
+// that case falls back to the shipped rules. A Config that sets Rules to an
+// explicitly empty slice is respected as an intentional "skip nothing".
 func (m *PolicyManager) rules() RuleSet {
 	if m.cfg.Rules.isZero() {
 		return DefaultRules()
@@ -58,9 +55,7 @@ func (m *PolicyManager) rules() RuleSet {
 
 func (r RuleSet) isZero() bool {
 	return r.DisallowPathPrefixes == nil &&
-		r.DisallowQueryParams == nil &&
 		r.SkipFileExtensions == nil &&
-		r.LangSubdomainDomains == nil &&
 		r.WikiNoisyNamespaces == nil
 }
 
@@ -91,15 +86,6 @@ func (r RuleSet) SkipsExtension(p string) bool {
 	return false
 }
 
-func (r RuleSet) DropsQueryParam(q string) bool {
-	for _, drop := range r.DisallowQueryParams {
-		if q == drop {
-			return true
-		}
-	}
-	return false
-}
-
 func (r RuleSet) SkipsWikiLanguageSubpage(p string) bool {
 	if !wikiLangSubpageRE.MatchString(p) {
 		return false
@@ -110,36 +96,6 @@ func (r RuleSet) SkipsWikiLanguageSubpage(p string) bool {
 		}
 	}
 	return false
-}
-
-func (r RuleSet) FoldsLanguageSubdomain(host string) string {
-	host = strings.ToLower(host)
-	host = strings.TrimPrefix(host, "www.")
-
-	isKnownLangDomain := false
-	for _, d := range r.LangSubdomainDomains {
-		if host == d || strings.HasSuffix(host, "."+d) {
-			isKnownLangDomain = true
-			break
-		}
-	}
-	if !isKnownLangDomain {
-		return host
-	}
-
-	parts := strings.Split(host, ".")
-	if len(parts) < 3 {
-		return host
-	}
-
-	potentialLang := parts[0]
-	if potentialLang == "en" {
-		return host
-	}
-	if !languageSubtagRE.MatchString(potentialLang) {
-		return host
-	}
-	return "en." + strings.Join(parts[1:], ".")
 }
 
 func IsEnglish(lang string) bool {

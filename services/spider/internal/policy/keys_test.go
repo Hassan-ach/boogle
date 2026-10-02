@@ -131,8 +131,10 @@ func TestKeyspaceBracesInHostCannotEscapeTheTag(t *testing.T) {
 		}
 	}
 
-	if ks.HostState(host) != ks.HostState(host) {
-		t.Error("host state key is not deterministic")
+	// Determinism across independently built keyspaces, since the same host is
+	// keyed by every spider process and they all have to agree on the slot.
+	if got, want := ks.HostState(host), NewKeyspace(ks.Prefix()).HostState(host); got != want {
+		t.Errorf("HostState = %q from two keyspaces, want the same key %q", got, want)
 	}
 }
 
