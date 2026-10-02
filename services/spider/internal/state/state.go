@@ -1,7 +1,8 @@
-package policy
+package state
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -13,14 +14,36 @@ const (
 	MarkerCold
 )
 
+// Host statuses. A host is ready until enough consecutive failures make it
+// degraded.
+const (
+	StatusReady    = "ready"
+	StatusDegraded = "degraded"
+)
+
+// ErrEmptyHost is returned by the host-keyed operations when given no host. It
+// is exported because a caller holding a host name has to be able to recognise
+// this case rather than treat it as a backend failure.
+var ErrEmptyHost = errors.New("empty host")
+
 // Markers are independent TTL keys rather than one status field, so a host can
 // be dead and cooling down simultaneously. AllMarkers is the complete set that
 // State.Markers reports.
 var AllMarkers = [...]MarkerKind{MarkerDead, MarkerCold, MarkerCooldown}
 
-// State is the durable half of the policy manager: the frontier, the visited
-// set, per-URL attempts and per-host budgets. MemoryState and RedisState both
+var (
+	errMemoryClosed  = errors.New("state is closed")
+	errUnknownMarker = errors.New("unknown marker kind")
+)
+
+// State is the durable half of the crawler: the frontier, the visited set,
+// per-URL attempts and per-host budgets. MemoryState and RedisState both
 // implement it, and both must be safe for concurrent use.
+//
+// The two implementations are not interchangeable in every respect, and one
+// difference is load-bearing: SaveHostState must not disturb the fields the
+// counters own, because another process sharing the same Redis can move them
+// between a caller's read and its save.
 type State interface {
 	MarkVisited(ctx context.Context, urls ...string) error
 	IsVisited(ctx context.Context, url string) (bool, error)
@@ -92,21 +115,41 @@ type HostState struct {
 
 	SiteMapsClaimedAt time.Time
 
-	// compiled caches the regex form of Allow/Disallow. NewRobotsRules compiles
-	// every rule into a regexp on each call, and Admit runs per URL, so without
-	// this the same host's rules are recompiled for every link on the page.
-	// Built in WithRobots alongside the rules it derives from, and read only
-	// through Rules so a HostState built by hand still works.
-	compiled *RobotsRules
+	// compiled caches the compiled form of Allow/Disallow. Rules are compiled
+	// once and reused across the URLs of a page, which matters because the
+	// frontier admits URLs one at a time and a large sitemap admits thousands
+	// against a single HostState.
+	//
+	// The type is an interface rather than policy.RobotsRules so that this
+	// package does not have to know how rules are compiled -- only that they
+	// were. Nil means "not compiled", which is the case for every HostState that
+	// came back out of a store rather than off a robots.txt reading; the caller
+	// that knows the rules compiles them.
+	compiled PathRules
 }
 
-// Rules returns the compiled robots rules for this host, compiling them if this
-// HostState did not come from WithRobots.
-func (h HostState) Rules() RobotsRules {
-	if h.compiled == nil {
-		return NewRobotsRules(h.Allow, h.Disallow)
-	}
-	return *h.compiled
+// PathRules decides whether robots.txt allows a path. policy.RobotsRules is the
+// implementation; this package only stores and passes it along.
+type PathRules interface {
+	// Allows reports whether path is allowed, and the rule that decided it.
+	Allows(path string) (allowed bool, rule string)
+	Refuses(path string) bool
+}
+
+// Rules returns the compiled rules carried by this HostState, or nil if it has
+// none. A nil return is normal, not an error: RedisState rebuilds HostState from
+// hash fields on every read and so never carries a compiled value across a
+// round trip. Callers must compile from Allow/Disallow when they get nil.
+func (h HostState) Rules() PathRules {
+	return h.compiled
+}
+
+// WithCompiled attaches compiled rules to this HostState. Kept separate from
+// WithRobots because compiling is policy's job: WithRobots records what
+// robots.txt said, and this records the result of reading it back.
+func (h HostState) WithCompiled(rules PathRules) HostState {
+	h.compiled = rules
+	return h
 }
 
 func (h HostState) WithRobots(name string, allow, disallow, siteMaps []string, crawlDelay time.Duration, fetchedAt time.Time) HostState {
@@ -120,8 +163,6 @@ func (h HostState) WithRobots(name string, allow, disallow, siteMaps []string, c
 	if out.WindowStartedAt.IsZero() {
 		out.WindowStartedAt = fetchedAt
 	}
-	rules := NewRobotsRules(allow, disallow)
-	out.compiled = &rules
 	return out
 }
 
@@ -157,3 +198,8 @@ type URLState struct {
 	LastError  string
 	EnqueuedAt time.Time
 }
+
+// Reason is a label for a refusal, so a host's stats can be read as "why are
+// these urls not being crawled". The values are policy's vocabulary; the state
+// layer only counts them and never interprets one.
+type Reason string

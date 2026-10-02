@@ -1,4 +1,4 @@
-package policy
+package state
 
 import (
 	"context"
@@ -194,7 +194,7 @@ func (m *MemoryState) PopFrontier(ctx context.Context, budget int) (PopResult, e
 		return PopResult{}, err
 	}
 	if budget < 1 {
-		budget = defaultPopBatch
+		budget = DefaultPopBatch
 	}
 
 	order := m.frontierOrderLocked()
@@ -229,7 +229,7 @@ func (m *MemoryState) PromoteDelayed(ctx context.Context, now time.Time, batch i
 		return 0, err
 	}
 	if batch < 1 {
-		batch = defaultPromoteBatch
+		batch = DefaultPromoteBatch
 	}
 
 	due := make([]string, 0, len(m.delayed))
@@ -310,7 +310,7 @@ func (m *MemoryState) SaveHostState(ctx context.Context, host string, st HostSta
 		return err
 	}
 	if host == "" {
-		return errEmptyHost
+		return ErrEmptyHost
 	}
 	st.Name = host
 	st.carryCountersFrom(m.host[host])
@@ -341,7 +341,7 @@ func (m *MemoryState) RecordSuccess(ctx context.Context, host string, at time.Ti
 	st.PagesCrawled++
 	st.ConsecFailures = 0
 	st.LastSuccess = at
-	st.Status = statusReady
+	st.Status = StatusReady
 	m.host[host] = st
 	return nil
 }
@@ -358,7 +358,7 @@ func (m *MemoryState) RecordFailure(ctx context.Context, host string) (int, erro
 	st := m.host[host]
 	st.Name = host
 	st.ConsecFailures++
-	st.Status = statusDegraded
+	st.Status = StatusDegraded
 	m.host[host] = st
 	return st.ConsecFailures, nil
 }

@@ -9,12 +9,12 @@ import (
 
 	"github.com/Hassan-ach/boogle/services/spider/internal/config"
 	"github.com/Hassan-ach/boogle/services/spider/internal/entity"
-	"github.com/Hassan-ach/boogle/services/spider/internal/policy"
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
 
 // Cache is the Redis connection the store holds open. Host state and the
-// frontier live under policy.RedisState's keys, so all this has to do is share
+// frontier live under state.RedisState's keys, so all this has to do is share
 // the pool and close it.
 type Cache interface {
 	Close()
@@ -30,16 +30,16 @@ type DB interface {
 type Store struct {
 	db     DB
 	cache  Cache
-	state  policy.State
+	st     state.State
 	config *config.StoreConfig
 	log    *slog.Logger
 }
 
-func NewStore(conf config.StoreConfig, log *utils.Logger, cache Cache, state policy.State) *Store {
+func NewStore(conf config.StoreConfig, log *utils.Logger, cache Cache, st state.State) *Store {
 	return &Store{
 		db:     NewDbClient(conf.DB),
 		cache:  cache,
-		state:  state,
+		st:     st,
 		config: &conf,
 		log:    log.With("component", "store"),
 	}
@@ -93,7 +93,7 @@ func (s *Store) persistPage(ctx context.Context, page *entity.Page) (pageID uuid
 func (s *Store) Init(starters []string) error {
 	ctx := context.Background()
 
-	queued, err := s.state.FrontierLen(ctx)
+	queued, err := s.st.FrontierLen(ctx)
 	if err != nil {
 		return fmt.Errorf("read frontier length: %w", err)
 	}
@@ -103,7 +103,7 @@ func (s *Store) Init(starters []string) error {
 		return nil
 	}
 
-	if err := s.state.Enqueue(ctx, starters...); err != nil {
+	if err := s.st.Enqueue(ctx, starters...); err != nil {
 		return fmt.Errorf("seed frontier: %w", err)
 	}
 	s.log.Info("frontier seeded", "starters", len(starters))

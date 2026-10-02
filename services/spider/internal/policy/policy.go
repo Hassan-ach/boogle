@@ -2,11 +2,12 @@ package policy
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 )
 
 type VerdictKind int
@@ -81,7 +82,10 @@ type Outcome struct {
 	FinalURL    string
 }
 
-type Reason string
+// Reason labels a refusal so a host's stats read as "why are these urls not
+// being crawled". The type lives in state because State.CountReason and
+// State.Stats are what store it; the vocabulary of values below is policy's.
+type Reason = state.Reason
 
 const (
 	ReasonOK Reason = "ok"
@@ -238,19 +242,13 @@ func scale(base time.Duration, n, maxExp int) time.Duration {
 	return d
 }
 
-var (
-	errMemoryClosed  = errors.New("state is closed")
-	errEmptyHost     = errors.New("empty host")
-	errUnknownMarker = errors.New("unknown marker kind")
-)
-
 // PolicyManager holds every crawl decision the spider makes: whether a URL may
 // be fetched, how a host is feeling, and what a finished fetch did to the state.
 // It owns policy but not persistence -- the State it is handed does that, so the
-// same logic runs against Redis in production and MemoryState in tests.
+// same logic runs against Redis in production and state.MemoryState in tests.
 type PolicyManager struct {
 	cfg             Config
-	state           State
+	st              state.State
 	log             *slog.Logger
 	now             func() time.Time
 	fetchRobots     RobotsFetcher
@@ -262,16 +260,16 @@ type PolicyManager struct {
 // New builds a PolicyManager over the given state. The returned manager is a
 // value that the With* methods copy, so a caller can derive a manager with a
 // different clock or fetcher without disturbing the original.
-func New(cfg Config, state State, logger *slog.Logger) *PolicyManager {
+func New(cfg Config, st state.State, logger *slog.Logger) *PolicyManager {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	fetchClient := &http.Client{Timeout: defaultFetchTimeout}
 	return &PolicyManager{
-		cfg:   cfg,
-		state: state,
-		log:   logger,
-		now:   time.Now,
+		cfg: cfg,
+		st:  st,
+		log: logger,
+		now: time.Now,
 		fetchRobots: robotsFetcherFrom(
 			nil, defaultUserAgent(cfg)),
 		fetch:       NewHTTPFetcher(fetchClient, cfg),
@@ -316,10 +314,10 @@ func (m *PolicyManager) WithConfig(cfg Config) *PolicyManager {
 	return &cp
 }
 
-func (m *PolicyManager) State() State { return m.state }
+func (m *PolicyManager) State() state.State { return m.st }
 
 func (m *PolicyManager) refuse(ctx context.Context, host, url string, kind VerdictKind, reason Reason, until time.Time) (*Verdict, error) {
-	if err := m.state.CountReason(ctx, host, reason); err != nil {
+	if err := m.st.CountReason(ctx, host, reason); err != nil {
 		m.log.Warn("could not record refusal reason",
 			"host", host, "url", url, "reason", reason, "error", err)
 	}
@@ -336,41 +334,41 @@ func (m *PolicyManager) unavailable(ctx context.Context, host, url string, err e
 // hostGate applies the host-level gates in severity order: dead, cold, then
 // cooling down. Markers are checked before any further work because they are the
 // cheapest possible refusal -- one read, no policy evaluation.
-func (m *PolicyManager) hostGate(ctx context.Context, host string) (HostState, *Verdict, error) {
-	markers, err := m.state.Markers(ctx, host)
+func (m *PolicyManager) hostGate(ctx context.Context, host string) (state.HostState, *Verdict, error) {
+	markers, err := m.st.Markers(ctx, host)
 	if err != nil {
 		v, verr := m.unavailable(ctx, host, "", err)
-		return HostState{}, v, verr
+		return state.HostState{}, v, verr
 	}
 
-	if ttl, ok := markers[MarkerDead]; ok {
-		return HostState{}, &Verdict{
+	if ttl, ok := markers[state.MarkerDead]; ok {
+		return state.HostState{}, &Verdict{
 			Kind:   Skip,
 			Reason: ReasonHostDead,
 			Until:  m.now().Add(ttl),
 		}, nil
 	}
 
-	if ttl, ok := markers[MarkerCold]; ok {
-		return HostState{}, &Verdict{
+	if ttl, ok := markers[state.MarkerCold]; ok {
+		return state.HostState{}, &Verdict{
 			Kind:   Skip,
 			Reason: ReasonHostCold,
 			Until:  m.now().Add(ttl),
 		}, nil
 	}
 
-	if ttl, ok := markers[MarkerCooldown]; ok {
-		return HostState{}, &Verdict{
+	if ttl, ok := markers[state.MarkerCooldown]; ok {
+		return state.HostState{}, &Verdict{
 			Kind:   Defer,
 			Reason: ReasonHostCoolingDown,
 			Until:  m.now().Add(ttl),
 		}, nil
 	}
 
-	st, err := m.state.HostState(ctx, host)
+	st, err := m.st.HostState(ctx, host)
 	if err != nil {
 		v, verr := m.unavailable(ctx, host, "", err)
-		return HostState{}, v, verr
+		return state.HostState{}, v, verr
 	}
 	return st, nil, nil
 }

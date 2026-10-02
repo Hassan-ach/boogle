@@ -1,4 +1,4 @@
-package policy
+package state
 
 import (
 	"context"
@@ -198,7 +198,7 @@ func (s *RedisState) HostState(ctx context.Context, host string) (HostState, err
 
 func (s *RedisState) SaveHostState(ctx context.Context, host string, st HostState) error {
 	if host == "" {
-		return errors.New("save host state: empty host")
+		return ErrEmptyHost
 	}
 
 	values := map[string]any{
@@ -254,7 +254,7 @@ func (s *RedisState) RecordSuccess(ctx context.Context, host string, at time.Tim
 		fieldLastSuccess,
 		at.Unix(),
 		fieldStatus,
-		statusReady,
+		StatusReady,
 	).Err(); err != nil {
 		return fmt.Errorf("record a success for %s: %w", host, err)
 	}
@@ -267,7 +267,7 @@ func (s *RedisState) RecordFailure(ctx context.Context, host string) (int, error
 	}
 	pipe := s.conn.Pipeline()
 	incr := pipe.HIncrBy(ctx, s.keys.HostState(host), fieldFailures, 1)
-	pipe.HSet(ctx, s.keys.HostState(host), fieldStatus, statusDegraded)
+	pipe.HSet(ctx, s.keys.HostState(host), fieldStatus, StatusDegraded)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return 0, fmt.Errorf("record a failure for %s: %w", host, err)
 	}
@@ -475,7 +475,7 @@ return {'', 0, 0, skipped}
 
 func (s *RedisState) PopFrontier(ctx context.Context, budget int) (PopResult, error) {
 	if budget < 1 {
-		budget = defaultPopBatch
+		budget = DefaultPopBatch
 	}
 
 	raw, err := popFrontierScript.Run(ctx, s.conn,
@@ -547,7 +547,7 @@ return #due
 
 func (s *RedisState) PromoteDelayed(ctx context.Context, now time.Time, batch int) (int, error) {
 	if batch < 1 {
-		batch = defaultPromoteBatch
+		batch = DefaultPromoteBatch
 	}
 
 	nowUnix := now.Unix()
@@ -567,7 +567,7 @@ func (s *RedisState) PromoteDelayed(ctx context.Context, now time.Time, batch in
 }
 
 func (s *RedisState) PromoteAllDue(ctx context.Context, now time.Time) (int, error) {
-	batch := defaultPromoteBatch
+	batch := DefaultPromoteBatch
 	total := 0
 
 	for {
@@ -590,9 +590,12 @@ func (s *RedisState) PromoteAllDue(ctx context.Context, now time.Time) (int, err
 // backlog cannot hold Redis inside the Lua loop for an unbounded time.
 const maxPromotionsPerCall = 1_000_000
 
+// Batch sizes used when the caller does not name one. They are exported because
+// the crawler asks for a frontier read and a retry promotion in the same tick
+// and has to reason about the two limits together.
 const (
-	defaultPopBatch     = 16
-	defaultPromoteBatch = 100
+	DefaultPopBatch     = 16
+	DefaultPromoteBatch = 100
 )
 
 func toString(v any) string {

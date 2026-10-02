@@ -16,6 +16,7 @@ import (
 	"github.com/Hassan-ach/boogle/services/spider/internal/messaging"
 	"github.com/Hassan-ach/boogle/services/spider/internal/parser"
 	"github.com/Hassan-ach/boogle/services/spider/internal/policy"
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"github.com/Hassan-ach/boogle/services/spider/internal/store"
 	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
@@ -59,13 +60,13 @@ func NewSpider(conf *config.Config) *Spider {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	cache := store.NewRedisClient(conf.Store.Cache)
-	policyState := policy.NewRedisState(
+	crawlState := state.NewRedisState(
 		cache.Conn(),
 		conf.Policy.RedisPrefix,
 		conf.Policy.URLStateTTL,
 	)
 
-	policyManager := policy.New(conf.Policy, policyState, logger.Logger).
+	policyManager := policy.New(conf.Policy, crawlState, logger.Logger).
 		WithFetchClient(httpClient).
 		WithRobotsClient(httpClient).
 		WithSiteMapResolver(func(ctx context.Context, base *url.URL, sitemaps []string) []string {
@@ -77,7 +78,7 @@ func NewSpider(conf *config.Config) *Spider {
 		httpClient:     httpClient,
 		mq:             mq,
 		parser:         parser.NewParser(httpClient, logger),
-		store:          store.NewStore(conf.Store, logger, cache, policyState),
+		store:          store.NewStore(conf.Store, logger, cache, crawlState),
 		policy:         policyManager,
 		wg:             sync.WaitGroup{},
 		ctx:            ctx,

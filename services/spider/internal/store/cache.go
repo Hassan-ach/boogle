@@ -39,7 +39,7 @@ func (c *RedisClient) Close() {
 	_ = c.conn.Close()
 }
 
-// Conn is the shared connection policy.RedisState reads and writes host state
+// Conn is the shared connection state.RedisState reads and writes host state
 // through. One pool for both, so a spider does not hold two sets of idle
 // connections to the same server.
 func (c *RedisClient) Conn() *redis.Client {

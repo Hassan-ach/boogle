@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
 
@@ -20,10 +21,10 @@ type Next struct {
 func (m *PolicyManager) TakeNext(ctx context.Context) (Next, error) {
 	batch := m.cfg.DelayedPromoteBatch
 	if batch < 1 {
-		batch = defaultPromoteBatch
+		batch = state.DefaultPromoteBatch
 	}
 
-	promoted, err := m.state.PromoteDelayed(ctx, m.now(), batch)
+	promoted, err := m.st.PromoteDelayed(ctx, m.now(), batch)
 	if err != nil {
 		m.log.Warn("could not promote due retries; the frontier is crawled without them",
 			"error", err)
@@ -31,10 +32,10 @@ func (m *PolicyManager) TakeNext(ctx context.Context) (Next, error) {
 
 	popBatch := m.cfg.FrontierPopBatch
 	if popBatch < 1 {
-		popBatch = defaultPopBatch
+		popBatch = state.DefaultPopBatch
 	}
 
-	got, err := m.state.PopFrontier(ctx, popBatch)
+	got, err := m.st.PopFrontier(ctx, popBatch)
 	if err != nil {
 		return Next{}, err
 	}
@@ -49,12 +50,12 @@ func (m *PolicyManager) TakeNext(ctx context.Context) (Next, error) {
 func (m *PolicyManager) DrainFrontier(ctx context.Context, limit int) ([]string, error) {
 	popBatch := m.cfg.FrontierPopBatch
 	if popBatch < 1 {
-		popBatch = defaultPopBatch
+		popBatch = state.DefaultPopBatch
 	}
 
 	var out []string
 	for i := 0; limit <= 0 || i < limit; i++ {
-		got, err := m.state.PopFrontier(ctx, popBatch)
+		got, err := m.st.PopFrontier(ctx, popBatch)
 		if err != nil {
 			return out, err
 		}
@@ -73,21 +74,21 @@ func (m *PolicyManager) Discover(ctx context.Context, links []string) {
 	if len(links) == 0 {
 		return
 	}
-	if err := m.state.Enqueue(ctx, links...); err != nil {
+	if err := m.st.Enqueue(ctx, links...); err != nil {
 		m.log.Warn("could not enqueue discovered links",
 			"count", len(links), "error", err)
 	}
 }
 
 func (m *PolicyManager) Park(ctx context.Context, url string, due time.Time) error {
-	if err := m.state.EnqueueDelayed(ctx, url, due); err != nil {
+	if err := m.st.EnqueueDelayed(ctx, url, due); err != nil {
 		return err
 	}
 	return nil
 }
 
 func (m *PolicyManager) Retire(ctx context.Context, url string) error {
-	return m.state.MarkVisited(ctx, url)
+	return m.st.MarkVisited(ctx, url)
 }
 
 var errNoFetcher = errors.New("no fetcher configured")
