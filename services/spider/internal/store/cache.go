@@ -19,7 +19,7 @@ func NewRedisClient(conf config.RedisConfig) *RedisClient {
 	port := strconv.Itoa(conf.Port)
 	client := redis.NewClient(&redis.Options{
 		Addr:         conf.Addr + ":" + port,
-		Password:     conf.Password,
+		Password:     conf.Password.Reveal(),
 		DB:           conf.DB,
 		Protocol:     2,
 		DialTimeout:  5 * time.Second,

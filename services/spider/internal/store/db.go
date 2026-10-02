@@ -20,12 +20,15 @@ type SQLClient struct {
 }
 
 func NewDbClient(conf config.PSQLConfig) *SQLClient {
+	// Reveal, not the bare Secret: %s on a Secret prints the redaction marker,
+	// so the connection would silently be attempted with the literal password
+	// "[redacted]". Do not log psqlconn.
 	psqlconn := fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
 		conf.Host,
 		conf.Port,
 		conf.User,
-		conf.Password,
+		conf.Password.Reveal(),
 		conf.DBname,
 	)
 
@@ -45,8 +48,6 @@ func NewDbClient(conf config.PSQLConfig) *SQLClient {
 	db.SetConnMaxLifetime(conf.MaxConnLifetime)
 	db.SetMaxOpenConns(conf.MaxOpenConns)
 	db.SetMaxIdleConns(conf.MaxIdleConns)
-
-	fmt.Println("Data Base Connectd")
 
 	return &SQLClient{
 		conn: db,

@@ -1,7 +1,9 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"time"
@@ -12,7 +14,7 @@ import (
 type RabbitMqConfig struct {
 	Protocol string
 	User     string
-	Password string
+	Password Secret
 	Host     string
 	Port     int
 	JobQueue string
@@ -20,7 +22,7 @@ type RabbitMqConfig struct {
 
 type RedisConfig struct {
 	Addr     string
-	Password string
+	Password Secret
 	DB       int
 	Port     int
 }
@@ -30,7 +32,7 @@ type PSQLConfig struct {
 	Port     int
 	User     string
 	DBname   string
-	Password string
+	Password Secret
 
 	MaxOpenConns    int
 	MaxIdleConns    int
@@ -73,9 +75,70 @@ func LoadConfig() (*Config, error) {
 		Policy:   loadPolicyConfig(),
 	}
 
-	fmt.Printf("%+v\n", c)
-
 	return c, nil
+}
+
+// redacted is a copy safe to print. Config holds three credentials, and the
+// startup dump this replaces went to stdout where it lands in whatever collects
+// the container's output, so the struct itself is no longer formattable by
+// accident -- every password type carries a String method that redacts, and
+// Config carries one too. A password reaching a log now has to be asked for
+// explicitly.
+// Redacted returns a copy of the config with every password replaced by a fixed
+// marker. With Password typed as Secret it is already safe to print, so this is
+// only about being explicit at the call site.
+func (c Config) Redacted() Config {
+	return c
+}
+
+// Secret is a password that cannot be printed by accident.
+//
+// fmt reaches String() for %v, %+v and %s, and GoString() for %#v, so both are
+// implemented. Leaving %#v to the default would defeat the point: %#v prints
+// the raw string with its type name, which is the verb a developer reaches for
+// when debugging why a connection is refused -- exactly the moment the value
+// would otherwise be pasted into an issue.
+//
+// The zero value is an unset password, not the literal word "redacted", since
+// marking an absent password would imply one is configured where there is none.
+type Secret string
+
+func (s Secret) String() string {
+	if s == "" {
+		return ""
+	}
+	return "[redacted]"
+}
+
+// GoString covers the %#v verb. See Secret.
+func (s Secret) GoString() string {
+	return s.String()
+}
+
+// LogValue covers slog handling Secret as a whole attribute.
+//
+// MarshalJSON covers it nested inside a struct, which LogValue does not: slog
+// only resolves LogValuer on the attribute itself, then falls back to encoding/
+// json for the fields of a struct. Both are needed, and the spider's production
+// logger is exactly the case that needs the second -- Config goes out as an
+// attribute, so its passwords are nested fields.
+func (s Secret) LogValue() slog.Value {
+	if s == "" {
+		return slog.StringValue("")
+	}
+	return slog.StringValue("[redacted]")
+}
+
+// MarshalJSON covers the nested case. See Secret.
+func (s Secret) MarshalJSON() ([]byte, error) {
+	return json.Marshal(s.String())
+}
+
+// Reveal returns the underlying password. It is deliberately a separate call so
+// that handing a secret to a client is a visible decision at the call site
+// rather than an implicit conversion.
+func (s Secret) Reveal() string {
+	return string(s)
 }
 
 // loadPolicyConfig starts from policy.DefaultConfig and overrides only the fields
@@ -132,7 +195,7 @@ func loadRabbitMqConfig() RabbitMqConfig {
 
 	protocol := getWithDefault("RABBITMQ_PROTOCOL", "amqp")
 	user := getWithDefault("RABBITMQ_USER", "guest")
-	password := getWithDefault("RABBITMQ_PASSWORD", "guest")
+	password := Secret(getWithDefault("RABBITMQ_PASSWORD", "guest"))
 	host := getWithDefault("RABBITMQ_HOST", "localhost")
 	port := getIntWithDefault("RABBITMQ_PORT", 5672)
 	jobQueue := getWithDefault("RABBITMQ_JOB_QUEUE", "indexer.job")
@@ -158,7 +221,7 @@ func loadDatabaseConfig() PSQLConfig {
 	host := getWithDefault("PG_HOST", "localhost")
 	port := getIntWithDefault("PG_PORT", 5432)
 	user := getWithDefault("PG_USER", "admin")
-	password := getWithDefault("PG_PASSWORD", "1234")
+	password := Secret(getWithDefault("PG_PASSWORD", "1234"))
 	dbname := getWithDefault("PG_DBNAME", "se")
 	maxOpenConns := getIntWithDefault("PG_MAX_OPEN_CONNS", 20)
 	maxIdleConns := getIntWithDefault("PG_MAX_IDLE_CONNS", 20)
@@ -180,7 +243,7 @@ func loadDatabaseConfig() PSQLConfig {
 
 func loadRedisConfig() RedisConfig {
 	addr := getWithDefault("REDIS_ADDR", "localhost")
-	password := getWithDefault("REDIS_PASSWORD", "")
+	password := Secret(getWithDefault("REDIS_PASSWORD", ""))
 	db := getIntWithDefault("REDIS_DB", 1)
 	port := getIntWithDefault("REDIS_PORT", 6379)
 

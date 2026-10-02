@@ -1,7 +1,12 @@
 package config
 
 import (
+	"bytes"
+	"fmt"
+	"log/slog"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -188,6 +193,123 @@ func TestLoadPolicyConfigRejectsUnusableDurations(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// A password must not reach a log through the struct that holds it. %#v is in
+// this list because it is the verb a developer reaches for when debugging why a
+// connection is refused, and it prints raw values unless the type supplies
+// GoString.
+func TestPrintingTheConfigRedactsEveryPassword(t *testing.T) {
+	const secret = "hunter2-do-not-log"
+
+	t.Setenv("RABBITMQ_PASSWORD", secret)
+	t.Setenv("REDIS_PASSWORD", secret)
+	t.Setenv("PG_PASSWORD", secret)
+
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if c.RabbitMq.Password.Reveal() != secret || c.Store.Cache.Password.Reveal() != secret ||
+		c.Store.DB.Password.Reveal() != secret {
+		t.Fatal("test setup: the secrets did not reach the config, so nothing is " +
+			"being proved by the checks below")
+	}
+
+	for _, tc := range []struct {
+		name string
+		got  string
+	}{
+		{"Config %v", fmt.Sprintf("%v", *c)},
+		{"Config %+v", fmt.Sprintf("%+v", *c)},
+		{"Config %#v", fmt.Sprintf("%#v", *c)},
+		{"Config pointer %v", fmt.Sprintf("%v", c)},
+		{"Config pointer %#v", fmt.Sprintf("%#v", c)},
+		{"RabbitMqConfig %+v", fmt.Sprintf("%+v", c.RabbitMq)},
+		{"RedisConfig %+v", fmt.Sprintf("%+v", c.Store.Cache)},
+		{"PSQLConfig %+v", fmt.Sprintf("%+v", c.Store.DB)},
+		{"StoreConfig %#v", fmt.Sprintf("%#v", c.Store)},
+		{"Secret alone %v", fmt.Sprintf("%v", c.RabbitMq.Password)},
+		{"Secret alone %s", fmt.Sprintf("%s", c.RabbitMq.Password)},
+		{"Secret alone %q", fmt.Sprintf("%q", c.RabbitMq.Password)},
+		{"Secret alone %#v", fmt.Sprintf("%#v", c.RabbitMq.Password)},
+		{"Redacted %+v", fmt.Sprintf("%+v", c.Redacted())},
+		{"slog JSON", slogRedact(t, *c)},
+	} {
+		if strings.Contains(tc.got, secret) {
+			t.Errorf("%s printed a password: %s", tc.name, tc.got)
+		}
+	}
+}
+
+// slog writes any value through its own formatter, so the JSON handler gets its
+// own case rather than relying on fmt's verbs.
+func slogRedact(t *testing.T, c Config) string {
+	t.Helper()
+	var buf bytes.Buffer
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("cfg", "config", c)
+	return buf.String()
+}
+
+// Redaction must not cost the fields an operator actually reads at startup.
+func TestRedactedConfigStillShowsWhatAnOperatorNeeds(t *testing.T) {
+	t.Setenv("RABBITMQ_PASSWORD", "secret")
+	t.Setenv("REDIS_PASSWORD", "secret")
+	t.Setenv("PG_PASSWORD", "secret")
+
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out := fmt.Sprintf("%+v", c.Redacted())
+	for _, want := range []string{
+		c.RabbitMq.User, c.RabbitMq.Host, strconv.Itoa(c.RabbitMq.Port),
+		c.Store.DB.Host, c.Store.DB.User, c.Store.DB.DBname, strconv.Itoa(c.Store.DB.Port),
+		c.Store.Cache.Addr, strconv.Itoa(c.Store.Cache.Port), strconv.Itoa(c.Store.Cache.DB),
+		c.Policy.UserAgent, c.Policy.RedisPrefix, c.App.JobQueue,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the printed config dropped %q:\n%s", want, out)
+		}
+	}
+	if n := strings.Count(out, "[redacted]"); n != 3 {
+		t.Errorf("%d redaction markers, want 3 (rabbitmq, redis, postgres):\n%s", n, out)
+	}
+}
+
+// An unset password is not a secret, and marking it would imply one is
+// configured where there is none -- and would make it impossible to tell a
+// working unauthenticated setup from a broken one.
+func TestAnUnsetPasswordIsNotMarked(t *testing.T) {
+	t.Setenv("REDIS_PASSWORD", "")
+
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Store.Cache.Password; got != "" {
+		t.Errorf("an unset redis password came back as %q, want empty", got)
+	}
+	if got := fmt.Sprintf("%v", c.Store.Cache); strings.Contains(got, "[redacted]") {
+		t.Errorf("an unset redis password was marked as set:\n%s", got)
+	}
+}
+
+// Reveal is the single deliberate escape hatch. If it were the empty string
+// when a password is loaded, every connection would be attempted without one.
+func TestRevealGivesBackThePassword(t *testing.T) {
+	const secret = "correct-horse"
+	t.Setenv("RABBITMQ_PASSWORD", secret)
+
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.RabbitMq.Password.Reveal(); got != secret {
+		t.Errorf("Reveal() = %q, want %q", got, secret)
 	}
 }
 

@@ -3,7 +3,6 @@ package spider
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -89,7 +88,10 @@ func NewSpider(conf *config.Config) *Spider {
 		logger:         logger,
 	}
 
-	fmt.Printf("Spider initialized: %+v\n", s)
+	// config is a *config.Config, whose String redacts, so this cannot print a
+	// password even though it dumps the whole struct.
+	logger.Info("Spider initialized", "config", conf.Redacted())
+
 	return s
 }
 
@@ -154,7 +156,7 @@ func (s *Spider) crawl(crawler_id int) {
 	select {
 	case s.fetchpool <- struct{}{}:
 	case <-ctx.Done():
-		fmt.Println("Crawler timed out waiting for fetch slot")
+		logger.Error("Crawler timed out waiting for fetch slot", "crawler_id", crawler_id)
 		return
 	}
 	defer func() { <-s.fetchpool }()

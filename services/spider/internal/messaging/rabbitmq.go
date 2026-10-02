@@ -126,7 +126,9 @@ func (m *RabbitMQChannel) Close() {
 	m.channel.Close()
 }
 
+// getRabbitURL is the one place the password is handed to a client. It is a
+// URL, so the secret is unavoidably in the string: do not log the result.
 func getRabbitURL(conf *config.RabbitMqConfig) string {
 	port := strconv.Itoa(conf.Port)
-	return "amqp://" + conf.User + ":" + conf.Password + "@" + conf.Host + ":" + port
+	return "amqp://" + conf.User + ":" + conf.Password.Reveal() + "@" + conf.Host + ":" + port
 }
