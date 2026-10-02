@@ -81,6 +81,22 @@ type HostState struct {
 	SiteMaps []string
 
 	SiteMapsClaimedAt time.Time
+
+	// compiled caches the regex form of Allow/Disallow. NewRobotsRules compiles
+	// every rule into a regexp on each call, and Admit runs per URL, so without
+	// this the same host's rules are recompiled for every link on the page.
+	// Built in WithRobots alongside the rules it derives from, and read only
+	// through Rules so a HostState built by hand still works.
+	compiled *RobotsRules
+}
+
+// Rules returns the compiled robots rules for this host, compiling them if this
+// HostState did not come from WithRobots.
+func (h HostState) Rules() RobotsRules {
+	if h.compiled == nil {
+		return NewRobotsRules(h.Allow, h.Disallow)
+	}
+	return *h.compiled
 }
 
 func (h HostState) WithRobots(name string, allow, disallow, siteMaps []string, crawlDelay time.Duration, fetchedAt time.Time) HostState {
@@ -94,6 +110,8 @@ func (h HostState) WithRobots(name string, allow, disallow, siteMaps []string, c
 	if out.WindowStartedAt.IsZero() {
 		out.WindowStartedAt = fetchedAt
 	}
+	rules := NewRobotsRules(allow, disallow)
+	out.compiled = &rules
 	return out
 }
 

@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
@@ -222,6 +223,55 @@ func TestRuleSetZeroMeansDefaultRules(t *testing.T) {
 	m3 := New(permissive, NewMemoryState(), testLogger())
 	if m3.rules().SkipsPath("/login") {
 		t.Error("an explicitly emptied rule list was replaced by the defaults")
+	}
+}
+
+// The compiled cache is derived from Allow/Disallow, so it has to answer the
+// same as compiling fresh would. A HostState from WithRobots has a cache; one
+// built by hand or rebuilt from Redis does not, and both must behave alike.
+func TestHostStateRulesMatchesAFreshCompile(t *testing.T) {
+	allow := []string{"/private/public/"}
+	disallow := []string{"/private/", "/tag/", "/a*b/"}
+
+	fromCache := HostState{}.WithRobots("example.com", allow, disallow, nil, time.Second, time.Unix(1, 0))
+	if fromCache.compiled == nil {
+		t.Fatal("WithRobots did not compile the rules it was given")
+	}
+	byHand := HostState{Name: "example.com", Allow: allow, Disallow: disallow}
+	if byHand.compiled != nil {
+		t.Fatal("test setup: a hand-built HostState should fall back to a fresh compile")
+	}
+
+	fresh := NewRobotsRules(allow, disallow)
+	for _, path := range []string{
+		"/private/public/x", "/private/y", "/tag/z", "/zzz", "/a/b/", "/a/b/c",
+		"/", "", "/private",
+	} {
+		wantAllowed, wantRule := fresh.Allows(path)
+		gotAllowed, gotRule := fromCache.Rules().Allows(path)
+		if gotAllowed != wantAllowed || gotRule != wantRule {
+			t.Errorf("Rules().Allows(%q) = (%v, %q), want (%v, %q)",
+				path, gotAllowed, gotRule, wantAllowed, wantRule)
+		}
+		gotAllowed, gotRule = byHand.Rules().Allows(path)
+		if gotAllowed != wantAllowed || gotRule != wantRule {
+			t.Errorf("hand-built Rules().Allows(%q) = (%v, %q), want (%v, %q)",
+				path, gotAllowed, gotRule, wantAllowed, wantRule)
+		}
+	}
+}
+
+// WithRobots re-reading a host's robots.txt must replace the cache, not append
+// to or outlive the previous one.
+func TestWithRobotsReplacesTheCompiledRules(t *testing.T) {
+	st := HostState{}.WithRobots("example.com", nil, []string{"/old/"}, nil, time.Second, time.Unix(1, 0))
+	st = st.WithRobots("example.com", nil, []string{"/new/"}, nil, time.Second, time.Unix(2, 0))
+
+	if st.Rules().Refuses("/old/") {
+		t.Error("the cache still carries a rule from the previous robots.txt")
+	}
+	if !st.Rules().Refuses("/new/") {
+		t.Error("the cache was not rebuilt from the new robots.txt")
 	}
 }
 

@@ -89,7 +89,7 @@ func (m *PolicyManager) Admit(ctx context.Context, rawURL string) (*Verdict, err
 }
 
 func (m *PolicyManager) admitsLocally(st HostState, parsed *url.URL) (Reason, bool) {
-	if allowed, rule := NewRobotsRules(st.Allow, st.Disallow).Allows(parsed.EscapedPath()); !allowed {
+	if allowed, rule := st.Rules().Allows(parsed.EscapedPath()); !allowed {
 		m.log.Debug("refused by robots.txt", "url", parsed.String(), "rule", rule)
 		return ReasonRobotsDisallow, false
 	}
