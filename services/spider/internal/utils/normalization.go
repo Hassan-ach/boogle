@@ -104,35 +104,42 @@ func normalizeURLParts(u *url.URL, baseHost string, hadTrailingSlash bool) {
 // identical content. It is scoped to the Wikimedia hosts in langSubdomainDomains
 // rather than applied generally, because elsewhere a language subdomain is a
 // genuinely different site.
+//
+// The caller has already lowercased and stripped one leading www. The second
+// pass here is deliberate: it is what turns www.www.example.com into
+// example.com, which a single strip leaves as www.example.com.
 func forceEnglishSubdomain(u *url.URL) {
 	u.Host = strings.ToLower(u.Host)
 	u.Host = strings.TrimPrefix(u.Host, "www.")
 
-	isKnownLangDomain := false
 	for _, d := range langSubdomainDomains {
-		if strings.HasSuffix(u.Host, d) {
-			isKnownLangDomain = true
-			break
+		if u.Host == d || strings.HasSuffix(u.Host, "."+d) {
+			foldLangSubdomain(u)
+			return
 		}
 	}
-	if !isKnownLangDomain {
-		return
-	}
+}
 
+// foldLangSubdomain rewrites the leading label to "en" when it looks like a
+// language subtag.
+//
+// The label-boundary check in the caller is what keeps fr.notwikipedia.org out.
+// A bare strings.HasSuffix against the domain matches any host ending in those
+// characters, and that host belongs to someone else: folding it would merge two
+// unrelated sites into one host bucket in the visited set and the frontier.
+func foldLangSubdomain(u *url.URL) {
 	hostParts := strings.Split(u.Host, ".")
 	if len(hostParts) < 3 {
 		return
 	}
 
 	potentialLang := hostParts[0]
-	rest := strings.Join(hostParts[1:], ".")
-
 	if potentialLang == "en" {
 		return
 	}
 
 	if languageSubtagRE.MatchString(potentialLang) {
-		u.Host = "en." + rest
+		u.Host = "en." + strings.Join(hostParts[1:], ".")
 	}
 }
 

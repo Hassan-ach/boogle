@@ -97,6 +97,41 @@ func TestNormalizeUrlKeepsNonWwwSubdomains(t *testing.T) {
 	}
 }
 
+func TestNormalizeUrlDoesNotFoldAPrefixLookalike(t *testing.T) {
+	// A host that merely ends in the Wikimedia domain belongs to someone else.
+	// Folding it would merge two unrelated sites into one visited-set bucket.
+	for _, host := range []string{
+		"fr.notwikipedia.org",
+		"de.fakewikibooks.org",
+		"pt.notwikivoyage.org",
+	} {
+		got, ok := NormalizeUrl("https://"+host+"/a", "")
+		if !ok {
+			t.Fatalf("NormalizeUrl rejected %q", host)
+		}
+		if want := "https://" + host + "/a"; got != want {
+			t.Errorf("NormalizeUrl(%q) = %q, want %q", host, got, want)
+		}
+	}
+}
+
+func TestNormalizeUrlStillFoldsRealWikimediaHosts(t *testing.T) {
+	for _, tc := range []struct{ raw, want string }{
+		{"https://fr.wikipedia.org/a", "https://en.wikipedia.org/a"},
+		{"https://de.m.wikipedia.org/a", "https://en.m.wikipedia.org/a"},
+		{"https://zh.wikibooks.org/a", "https://en.wikibooks.org/a"},
+		{"https://en.wikipedia.org/a", "https://en.wikipedia.org/a"},
+	} {
+		got, ok := NormalizeUrl(tc.raw, "")
+		if !ok {
+			t.Fatalf("NormalizeUrl rejected %q", tc.raw)
+		}
+		if got != tc.want {
+			t.Errorf("NormalizeUrl(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
 func TestNormalizeUrlFillsInTheBaseHostForRelativeURLs(t *testing.T) {
 	for _, tc := range []struct{ raw, base, want string }{
 		{"/a", "example.com", "https://example.com/a"},
