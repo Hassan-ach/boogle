@@ -15,31 +15,6 @@ func newTestLogger() *utils.Logger {
 	}
 }
 
-func TestParseRobots(t *testing.T) {
-	robotsTxt := `
-User-agent: *
-Disallow: /private/
-Disallow: /admin/
-Crawl-delay: 10
-Sitemap: https://example.com/sitemap.xml
-`
-
-	p := NewParser(nil, newTestLogger())
-	r := p.ParseRobots(robotsTxt, "*")
-
-	if r.CrawlDelay != 10 {
-		t.Errorf("expected CrawlDelay 10, got %d", r.CrawlDelay)
-	}
-
-	if len(r.Disallow) != 2 {
-		t.Errorf("expected 2 Disallow rules, got %d", len(r.Disallow))
-	}
-
-	if len(r.SiteMaps) != 1 || r.SiteMaps[0] != "https://example.com/sitemap.xml" {
-		t.Errorf("expected Sitemap https://example.com/sitemap.xml, got %v", r.SiteMaps)
-	}
-}
-
 func TestParseHTML(t *testing.T) {
 	htmlContent := `
 <!DOCTYPE html>

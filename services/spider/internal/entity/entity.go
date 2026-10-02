@@ -26,13 +26,6 @@ type MetaData struct {
 	CrawledAt   time.Time `json:"crawledAt"`
 }
 
-type Robots struct {
-	Allow      []string
-	Disallow   []string
-	SiteMaps   []string
-	CrawlDelay int
-}
-
 type Page struct {
 	MetaData
 	StatusCode int
