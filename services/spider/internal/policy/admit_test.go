@@ -682,15 +682,17 @@ func TestFormatVerdict(t *testing.T) {
 }
 
 func TestHTTPRobotsFetcherFetchesWhatARobotWould(t *testing.T) {
-	var gotPath, gotAgent string
+	var gotPath, gotAgent, gotAccept, gotLang string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotAgent = r.Header.Get("User-Agent")
+		gotAccept = r.Header.Get("Accept")
+		gotLang = r.Header.Get("Accept-Language")
 		io.WriteString(w, "User-agent: *\nDisallow: /x\n")
 	}))
 	defer srv.Close()
 
-	body, status, err := newHTTPRobotsFetcher(nil, "BoogleBot")(t.Context(), srv.URL+"/robots.txt")
+	body, status, err := robotsFetcherFrom(nil, "BoogleBot")(t.Context(), srv.URL+"/robots.txt")
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -706,6 +708,15 @@ func TestHTTPRobotsFetcherFetchesWhatARobotWould(t *testing.T) {
 	if !strings.Contains(string(body), "Disallow: /x") {
 		t.Errorf("body = %q, want the robots.txt", body)
 	}
+	// robots.txt is the one resource a site will serve different rules per
+	// language, so this request has to identify an English reader. Both headers
+	// come from the shared utils.GetReq path.
+	if gotAccept != "text/html" {
+		t.Errorf("Accept = %q, want text/html", gotAccept)
+	}
+	if gotLang != "en-US" {
+		t.Errorf("Accept-Language = %q, want en-US", gotLang)
+	}
 }
 
 func TestHTTPRobotsFetcherFollowsRedirects(t *testing.T) {
@@ -719,7 +730,7 @@ func TestHTTPRobotsFetcherFollowsRedirects(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		body, status, err := newHTTPRobotsFetcher(nil, "Bot")(t.Context(), srv.URL+"/robots.txt")
+		body, status, err := robotsFetcherFrom(nil, "Bot")(t.Context(), srv.URL+"/robots.txt")
 		if err != nil {
 			t.Fatalf("Fetch: %v", err)
 		}
@@ -735,7 +746,7 @@ func TestHTTPRobotsFetcherFollowsRedirects(t *testing.T) {
 		defer srv.Close()
 
 		start := time.Now()
-		_, _, err := newHTTPRobotsFetcher(nil, "Bot")(t.Context(), srv.URL+"/robots.txt")
+		_, _, err := robotsFetcherFrom(nil, "Bot")(t.Context(), srv.URL+"/robots.txt")
 		if err == nil {
 			t.Fatal("a redirect loop returned no error")
 		}
@@ -760,7 +771,7 @@ func TestHTTPRobotsFetcherBoundsTheResponse(t *testing.T) {
 		var err error
 		go func() {
 			defer close(done)
-			body, status, err = newHTTPRobotsFetcher(nil, "Bot")(t.Context(), srv.URL+"/robots.txt")
+			body, status, err = robotsFetcherFrom(nil, "Bot")(t.Context(), srv.URL+"/robots.txt")
 		}()
 
 		select {
@@ -783,7 +794,7 @@ func TestHTTPRobotsFetcherTruncatesAtTheLimit(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	body, _, err := newHTTPRobotsFetcher(nil, "Bot")(t.Context(), srv.URL+"/robots.txt")
+	body, _, err := robotsFetcherFrom(nil, "Bot")(t.Context(), srv.URL+"/robots.txt")
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -813,7 +824,7 @@ func TestHTTPRobotsFetcherStopsReadingAtTheLimit(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _, _ = newHTTPRobotsFetcher(nil, "Bot")(t.Context(), srv.URL+"/robots.txt")
+		_, _, _ = robotsFetcherFrom(nil, "Bot")(t.Context(), srv.URL+"/robots.txt")
 	}()
 	select {
 	case <-done:
@@ -882,7 +893,7 @@ func TestHTTPRobotsFetcherGivesUpOnASilentHost(t *testing.T) {
 	start := time.Now()
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := newHTTPRobotsFetcher(&http.Client{}, "Bot")(t.Context(), srv.URL+"/robots.txt")
+		_, _, err := robotsFetcherFrom(&http.Client{}, "Bot")(t.Context(), srv.URL+"/robots.txt")
 		done <- err
 	}()
 

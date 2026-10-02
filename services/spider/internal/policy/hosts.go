@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
 
 const (
@@ -36,45 +37,50 @@ func (m *PolicyManager) WithRobotsFetcher(f RobotsFetcher) *PolicyManager {
 func (m *PolicyManager) WithRobotsClient(client *http.Client) *PolicyManager {
 	cp := *m
 	if client != nil {
-		cp.fetchRobots = newHTTPRobotsFetcher(client, defaultUserAgent(cp.cfg))
+		cp.fetchRobots = robotsFetcherFrom(client, defaultUserAgent(cp.cfg))
 	}
 	return &cp
 }
 
-func newHTTPRobotsFetcher(client *http.Client, userAgent string) RobotsFetcher {
+// robotsFetcherFrom adapts utils.GetReq to the RobotsFetcher shape, so robots
+// requests go out over the same HTTP path as every other fetch and pick up its
+// Accept and Accept-Language headers. The Accept-Language hint matters here:
+// the index is English only, and a robots.txt is the one resource where a
+// site will happily serve a different set of rules per language.
+func robotsFetcherFrom(client *http.Client, userAgent string) RobotsFetcher {
 	if client == nil {
 		client = &http.Client{Timeout: defaultRobotsTimeout}
 	}
 
-	return func(ctx context.Context, url string) ([]byte, int, error) {
+	return func(ctx context.Context, rawURL string) ([]byte, int, error) {
 		ctx, cancel := context.WithTimeout(ctx, defaultRobotsTimeout)
 		defer cancel()
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return nil, 0, fmt.Errorf("build robots request: %w", err)
-		}
-		if userAgent != "" {
-			req.Header.Set("User-Agent", userAgent)
-		}
-
-		resp, err := client.Do(req)
+		res, err := utils.GetReq(ctx, client, rawURL, utils.GetOptions{
+			UserAgent: userAgent,
+			MaxBytes:  maxRobotsBytes,
+		})
 		if err != nil {
 			return nil, 0, fmt.Errorf("fetch robots: %w", err)
 		}
-		defer drainAndClose(resp)
-
-		body, err := io.ReadAll(io.LimitReader(resp.Body, maxRobotsBytes))
-		if err != nil {
-			return nil, resp.StatusCode, fmt.Errorf("read robots: %w", err)
+		// 429 and 5xx are returned rather than raised: EnsureHost branches on the
+		// status to put the host into cooldown instead of treating it as dead.
+		if res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500 {
+			return nil, res.StatusCode, nil
 		}
-		return body, resp.StatusCode, nil
+		if res.StatusCode != http.StatusOK {
+			return nil, res.StatusCode, fmt.Errorf("robots %s returned %d", rawURL, res.StatusCode)
+		}
+		// utils.GetReq reads one byte past the limit so a caller can detect an
+		// oversized body, which the content path relies on. There is nothing to
+		// detect here: a truncated robots.txt still yields the rules at its front,
+		// so trim back to the cap rather than let the bound creep by one byte.
+		body := res.Body
+		if len(body) > maxRobotsBytes {
+			body = body[:maxRobotsBytes]
+		}
+		return body, res.StatusCode, nil
 	}
-}
-
-func drainAndClose(resp *http.Response) {
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxRobotsBytes))
-	_ = resp.Body.Close()
 }
 
 func (m *PolicyManager) EnsureHost(ctx context.Context, host string) (HostState, error) {
@@ -114,7 +120,11 @@ func (m *PolicyManager) EnsureHost(ctx context.Context, host string) (HostState,
 		return HostState{}, &robotsRefusedError{host: host, status: status, reason: reason}
 	}
 
-	robots := parseRobots(string(body), m.cfg.UserAgent)
+	// Match agents against the string actually sent on the wire, not the
+	// configured token. defaultUserAgent appends a version and contact to a bare
+	// token, so "BoogleBot" reaches robots.txt as "BoogleBot/1.0 (+...)" and a
+	// site naming only the bare token would otherwise match nothing.
+	robots := parseRobots(string(body), defaultUserAgent(m.cfg))
 
 	delay := time.Duration(robots.CrawlDelay) * time.Second
 	if delay < m.cfg.MinCrawlDelay {

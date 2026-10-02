@@ -275,7 +275,7 @@ func New(cfg Config, state State, logger *slog.Logger) *PolicyManager {
 		state: state,
 		log:   logger,
 		now:   time.Now,
-		fetchRobots: newHTTPRobotsFetcher(
+		fetchRobots: robotsFetcherFrom(
 			nil, defaultUserAgent(cfg)),
 		fetch:       NewHTTPFetcher(fetchClient, cfg),
 		fetchClient: fetchClient,

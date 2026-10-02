@@ -395,6 +395,30 @@ Sitemap: https://example.com/sitemap.xml
 	}
 }
 
+// Agent matching must run against the string actually sent on the wire, not the
+// configured token. defaultUserAgent appends a version and contact to a bare
+// token, so the two differ: a site that echoes back the exact agent it was
+// addressed as would match neither the bare token nor a substring of it.
+func TestParseRobotsMatchesTheVersionedAgentOnTheWire(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.UserAgent = "BoogleBot"
+	sent := defaultUserAgent(cfg)
+
+	if sent == cfg.UserAgent {
+		t.Fatal("this test needs a UserAgent that defaultUserAgent rewrites")
+	}
+
+	body := "User-agent: " + sent + "\nDisallow: /boogle-only/\n"
+
+	if got := parseRobots(body, cfg.UserAgent); len(got.Disallow) != 0 {
+		t.Errorf("matching against the configured token picked up %#v; the agent "+
+			"on the wire is %q", got.Disallow, sent)
+	}
+	if got := parseRobots(body, sent); !equalStrings(got.Disallow, []string{"/boogle-only/"}) {
+		t.Errorf("Disallow = %#v, want the site's own rules to apply for %q", got.Disallow, sent)
+	}
+}
+
 func TestParseRobotsMergesEveryMatchingGroup(t *testing.T) {
 	t.Run("consecutive agents share the rules below them", func(t *testing.T) {
 		got := parseRobots("User-agent: *\nUser-agent: BoogleBot\nDisallow: /x\n", "BoogleBot")

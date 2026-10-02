@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -841,6 +842,45 @@ func TestWithRobotsClientSharesTheConnectionPool(t *testing.T) {
 	}
 	if len(st2.Disallow) != 1 || st2.Disallow[0] != "/private" {
 		t.Errorf("Disallow = %v, want the rule the shared client just read", st2.Disallow)
+	}
+}
+
+// EnsureHost must match robots.txt agent groups against the string it actually
+// put on the wire, not the bare configured token. A site that echoes back the
+// exact agent it was addressed as -- "BoogleBot/1.0 (+https://...)" -- names a
+// group that the bare token is not a substring of, so those rules used to be
+// dropped entirely.
+func TestEnsureHostMatchesTheAgentItSentOnTheWire(t *testing.T) {
+	// robotsURLFor forces https, so this has to be a TLS server.
+	var mu sync.Mutex
+	var served string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		served = r.Header.Get("User-Agent")
+		agent := served
+		mu.Unlock()
+		_, _ = fmt.Fprintf(w, "User-agent: %s\nDisallow: /private\n", agent)
+	}))
+	defer srv.Close()
+
+	m, _ := newTestManager(t)
+	m = m.WithRobotsClient(srv.Client())
+
+	st, err := m.EnsureHost(context.Background(), srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("EnsureHost: %v", err)
+	}
+
+	mu.Lock()
+	agent := served
+	mu.Unlock()
+
+	if want := defaultUserAgent(m.cfg); agent != want {
+		t.Fatalf("the site was asked as %q, want %q", agent, want)
+	}
+	if len(st.Disallow) != 1 || st.Disallow[0] != "/private" {
+		t.Errorf("Disallow = %v; the rules addressed to us were dropped even though "+
+			"the site named us as %q", st.Disallow, agent)
 	}
 }
 
