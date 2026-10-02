@@ -84,7 +84,6 @@ func (m *PolicyManager) Admit(ctx context.Context, rawURL string) (*Verdict, err
 	return &Verdict{
 		Kind:   Allow,
 		Reason: ReasonOK,
-		Host:   hostState.ToEntity(m.cfg.URLMaxAttempts),
 	}, nil
 }
 

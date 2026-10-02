@@ -13,9 +13,10 @@ import (
 	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
 
+// Cache is the Redis connection the store holds open. Host state and the
+// frontier live under policy.RedisState's keys, so all this has to do is share
+// the pool and close it.
 type Cache interface {
-	AddHostMetaData(ctx context.Context, h string, host *entity.Host) error
-	GetHostMetaData(ctx context.Context, h string) (*entity.Host, bool, error)
 	Close()
 }
 type DB interface {
@@ -44,13 +45,8 @@ func NewStore(conf config.StoreConfig, log *utils.Logger, cache Cache, state pol
 	}
 }
 
-func (s *Store) GetCache() Cache {
-	return s.cache
-}
-
-func (s *Store) Persist(ctx context.Context, page *entity.Page, host *entity.Host) uuid.UUID {
-	s.log.Info("Persisting page and host metadata", "url", page.URL, "host", host.Name)
-	s.persistHost(ctx, host)
+func (s *Store) Persist(ctx context.Context, page *entity.Page) uuid.UUID {
+	s.log.Info("Persisting page data", "url", page.URL)
 	pageID, err := s.persistPage(ctx, page)
 	if err != nil {
 		s.log.Error("persist page data", "url", page.URL, "error", err)
@@ -92,17 +88,6 @@ func (s *Store) persistPage(ctx context.Context, page *entity.Page) (pageID uuid
 		return pageID, err
 	}
 	return pageID, nil
-}
-
-func (s *Store) persistHost(ctx context.Context, host *entity.Host) {
-	err := s.cache.AddHostMetaData(ctx, host.Name, host)
-	if err != nil {
-		s.log.Warn("add host metadata to cache", "host", host.Name, "error", err)
-	}
-}
-
-func (s *Store) GetHostMetaData(ctx context.Context, h string) (*entity.Host, bool, error) {
-	return s.cache.GetHostMetaData(ctx, h)
 }
 
 func (s *Store) Init(starters []string) error {

@@ -55,26 +55,7 @@ func (f *fakeDB) WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 
 func (f *fakeDB) Close() {}
 
-type fakeCache struct {
-	written map[string]*entity.Host
-	err     error
-}
-
-func (c *fakeCache) AddHostMetaData(ctx context.Context, h string, host *entity.Host) error {
-	if c.err != nil {
-		return c.err
-	}
-	if c.written == nil {
-		c.written = map[string]*entity.Host{}
-	}
-	c.written[h] = host
-	return nil
-}
-
-func (c *fakeCache) GetHostMetaData(ctx context.Context, h string) (*entity.Host, bool, error) {
-	host, ok := c.written[h]
-	return host, ok, nil
-}
+type fakeCache struct{}
 
 func (c *fakeCache) Close() {}
 
@@ -192,45 +173,5 @@ func TestStorePersistPageStopsAtAFailedInsert(t *testing.T) {
 	}
 	if got := len(st.Frontier()); got != 0 {
 		t.Errorf("frontier holds %d urls after a failed persist, want 0", got)
-	}
-}
-
-func TestStorePersistHostNoLongerWritesAWaitedMarker(t *testing.T) {
-	s, _ := newTestStore(t)
-
-	host := &entity.Host{Name: "example.com", Delay: 5}
-	s.persistHost(context.Background(), host)
-
-	cache, ok := s.cache.(*fakeCache)
-	if !ok {
-		t.Fatal("unexpected cache type")
-	}
-	if _, ok := cache.written["example.com"]; !ok {
-		t.Error("host metadata was not written")
-	}
-}
-
-func TestStoreGetHostMetaData(t *testing.T) {
-	s, _ := newTestStore(t)
-	ctx := context.Background()
-
-	host := &entity.Host{Name: "example.com", Delay: 5}
-	s.persistHost(ctx, host)
-
-	got, found, err := s.GetHostMetaData(ctx, "example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !found {
-		t.Fatal("host metadata was not found")
-	}
-	if got.Delay != 5 {
-		t.Errorf("Delay = %d, want 5", got.Delay)
-	}
-
-	if _, found, err := s.GetHostMetaData(ctx, "absent.com"); err != nil {
-		t.Fatal(err)
-	} else if found {
-		t.Error("a host that was never written was reported as found")
 	}
 }

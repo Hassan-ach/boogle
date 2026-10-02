@@ -3,8 +3,6 @@ package policy
 import (
 	"context"
 	"time"
-
-	"github.com/Hassan-ach/boogle/services/spider/internal/entity"
 )
 
 type MarkerKind int
@@ -113,18 +111,6 @@ func (h HostState) WithRobots(name string, allow, disallow, siteMaps []string, c
 	rules := NewRobotsRules(allow, disallow)
 	out.compiled = &rules
 	return out
-}
-
-func (h HostState) ToEntity(maxRetry int) *entity.Host {
-	return &entity.Host{
-		MaxRetry:        maxRetry,
-		MaxPages:        h.MaxPages,
-		PagesCrawled:    h.PagesCrawled,
-		Delay:           int(h.CrawlDelay / time.Second),
-		Name:            h.Name,
-		AllowedUrls:     h.Allow,
-		NotAllowedPaths: h.Disallow,
-	}
 }
 
 func (h HostState) BudgetExhausted(globalMax int) bool {

@@ -4,15 +4,6 @@ import (
 	"time"
 )
 
-type Host struct {
-	MaxRetry        int
-	MaxPages        int
-	PagesCrawled    int
-	Delay           int
-	Name            string
-	AllowedUrls     []string
-	NotAllowedPaths []string
-}
 type MetaData struct {
 	URL         string    `json:"url"`
 	Title       string    `json:"title,omitempty"`

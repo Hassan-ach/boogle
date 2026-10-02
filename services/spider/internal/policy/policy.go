@@ -7,8 +7,6 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
-	"github.com/Hassan-ach/boogle/services/spider/internal/entity"
 )
 
 type VerdictKind int
@@ -39,7 +37,6 @@ func (k VerdictKind) String() string {
 type Verdict struct {
 	Kind   VerdictKind
 	Reason Reason
-	Host   *entity.Host
 	Until  time.Time
 }
 

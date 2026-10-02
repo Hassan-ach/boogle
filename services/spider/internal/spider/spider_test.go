@@ -25,7 +25,6 @@ import (
 type fakeStore struct {
 	mu    sync.Mutex
 	pages []*entity.Page
-	hosts []string
 
 	pageID uuid.UUID
 }
@@ -38,13 +37,10 @@ func (s *fakeStore) Init([]string) error { return nil }
 
 func (s *fakeStore) Close() {}
 
-func (s *fakeStore) Persist(_ context.Context, page *entity.Page, host *entity.Host) uuid.UUID {
+func (s *fakeStore) Persist(_ context.Context, page *entity.Page) uuid.UUID {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pages = append(s.pages, page)
-	if host != nil {
-		s.hosts = append(s.hosts, host.Name)
-	}
 	return s.pageID
 }
 
@@ -52,12 +48,6 @@ func (s *fakeStore) persisted() []*entity.Page {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]*entity.Page(nil), s.pages...)
-}
-
-func (s *fakeStore) persistedHosts() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]string(nil), s.hosts...)
 }
 
 type fakeQueue struct{}
@@ -510,12 +500,6 @@ func TestASuccessfulPageIsPersistedOnceAndPublished(t *testing.T) {
 	if pages[0].StatusCode != 200 {
 		t.Errorf("persisted StatusCode = %d, want 200: the loop was handing the store "+
 			"a page with no status", pages[0].StatusCode)
-	}
-
-	hosts := h.store.persistedHosts()
-	if len(hosts) != 1 || hosts[0] != hostOf(s.srv.URL) {
-		t.Errorf("persisted host = %v, want [%s]: the host record has to be the one "+
-			"the policy manager resolved", hosts, hostOf(s.srv.URL))
 	}
 }
 

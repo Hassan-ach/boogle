@@ -23,7 +23,7 @@ import (
 
 type pageStore interface {
 	Init(startUrls []string) error
-	Persist(ctx context.Context, page *entity.Page, host *entity.Host) uuid.UUID
+	Persist(ctx context.Context, page *entity.Page) uuid.UUID
 	Close()
 }
 
@@ -198,8 +198,6 @@ func (s *Spider) crawl(crawler_id int) {
 		return
 	}
 
-	host := verdict.Host
-
 	body, out := s.policy.Fetch(ctx, rawUrl)
 
 	action, err := s.policy.Classify(ctx, rawUrl, out)
@@ -258,7 +256,7 @@ func (s *Spider) crawl(crawler_id int) {
 	}
 	page.Links = admitted
 
-	pageId := s.store.Persist(ctx, page, host)
+	pageId := s.store.Persist(ctx, page)
 	if pageId == uuid.Nil() {
 		logger.Warn("Page was not persisted; leaving it crawlable", "url", page.URL)
 		return
