@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Ranking service calculates page importance and relevance scores using TF-IDF and PageRank algorithms, then stores them for fast search result ordering.
+The Ranking service is event-driven via RabbitMQ (indexer confirmations). It counts indexed pages and triggers IDF and PageRank computation once a threshold is reached, writing scores to Postgres for fast search result ordering.
 
 ## Architecture
 
