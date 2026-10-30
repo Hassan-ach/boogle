@@ -24,9 +24,6 @@ cp .env.example .env
 
 # Open browser
 open http://localhost:1323
-
-# Live monitoring dashboard
-open http://localhost:7070
 ```
 
 ## Services
@@ -34,17 +31,14 @@ open http://localhost:7070
 | Service | Language | Purpose |
 |---------|----------|---------|
 | [Engine](services/engine/) | Go | Web interface, query handling, search results |
-| [Spider](services/spider/) | Go | Web crawler, link discovery |
+| [Spider](services/spider/) | Go | Web crawler, link discovery and frontier management |
 | [Indexer](services/indexer/) | Rust | HTML parsing, word extraction, TF calculation |
 | [Ranking](services/ranking/) | Python | TF-IDF and PageRank scoring |
-| [Monitoring](services/monitoring/) | TypeScript | Service orchestration, health checks, live dashboard |
 
 ## Pipeline
 
 ```
-Web → Spider → Indexer → Ranking → Engine → User
-                              ↑
-                         Monitoring (watches & restarts all)
+Web → Spider (RabbitMQ) → Indexer (RabbitMQ) → Ranking (RabbitMQ) → Engine → User
 ```
 
 ## Requirements
@@ -74,7 +68,7 @@ For a full teardown and clean rebuild:
 - [docs/SPIDER.md](docs/SPIDER.md) — crawling algorithm and database schema
 - [docs/INDEXER.md](docs/INDEXER.md) — TF calculation and word extraction
 - [docs/RANKING.md](docs/RANKING.md) — PageRank math and IDF scoring
-- [docs/MONITORING.md](docs/MONITORING.md) — tick lifecycle, policy engine, metrics API
+
 
 ## Development
 

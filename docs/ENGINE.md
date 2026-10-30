@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Engine is the web server and user-facing interface. It handles HTTP requests, processes search queries, and returns ranked results.
+The Engine is the web server and user-facing interface. It handles HTTP requests, processes search queries, and returns ranked results from Postgres (pages, words, page_word, page_rank).
 
 ## Architecture
 
