@@ -36,6 +36,7 @@ See individual READMEs for:
 ## Detailed Docs
 
 Advanced information in [docs/](../docs/):
+- [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md) - End-to-end pipeline, data model, messaging
 - [docs/ENGINE.md](../docs/ENGINE.md) - Architecture, templates, configuration
 - [docs/SPIDER.md](../docs/SPIDER.md) - Crawling algorithm, database schema
 - [docs/INDEXER.md](../docs/INDEXER.md) - TF calculation, word extraction

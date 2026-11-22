@@ -63,6 +63,7 @@ For a full teardown and clean rebuild:
 
 ## Docs
 
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — end-to-end pipeline, services, data model, messaging
 - [Services Overview](services/README.md) — service responsibilities and data flow
 - [docs/ENGINE.md](docs/ENGINE.md) — search architecture and templates
 - [docs/SPIDER.md](docs/SPIDER.md) — crawling algorithm and database schema
