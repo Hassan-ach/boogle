@@ -64,14 +64,18 @@ func (fakeQueue) DeclareQueue(string) error { return nil }
 func (fakeQueue) Close()                    {}
 
 type fakeChannel struct {
-	mu        sync.Mutex
-	published []string
-	closed    bool
+	mu         sync.Mutex
+	published  []string
+	closed     bool
+	publishErr error
 }
 
-func (c *fakeChannel) Publish(queueName string, body []byte) error {
+func (c *fakeChannel) Publish(_ context.Context, queueName string, body []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.publishErr != nil {
+		return c.publishErr
+	}
 	c.published = append(c.published, queueName+":"+string(body))
 	return nil
 }
@@ -792,7 +796,7 @@ func TestAnEmptyFrontierDoesNothingAtAll(t *testing.T) {
 	}
 }
 
-func TestTheMessagingChannelIsClosedAfterEveryRound(t *testing.T) {
+func TestACrawlerReusesItsMessagingChannelAcrossRounds(t *testing.T) {
 	ch := &fakeChannel{}
 	mq := &queueOpening{channel: ch}
 
@@ -805,11 +809,17 @@ func TestTheMessagingChannelIsClosedAfterEveryRound(t *testing.T) {
 		h.crawl(t)
 	}
 
-	if got := mq.opens(); got != 3 {
-		t.Errorf("opened %d channels for three rounds, want 3", got)
+	// A channel per crawl was ~100 objects/second at the defaults (H-09).
+	if got := mq.opens(); got != 1 {
+		t.Errorf("opened %d channels for three rounds, want 1", got)
 	}
+	if ch.closed {
+		t.Error("the channel was closed between rounds")
+	}
+
+	h.spider.Close()
 	if !ch.closed {
-		t.Error("the channel was not closed at the end of the round")
+		t.Error("Close did not close the crawler's channel")
 	}
 }
 
@@ -873,4 +883,35 @@ func hostOf(raw string) string {
 		}
 	}
 	return strings.ToLower(trimmed)
+}
+
+func TestAFailedPublishParksThePageWithoutRetiringIt(t *testing.T) {
+	clock := &testClock{t: time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)}
+	s := newSite(t)
+	const path = "/publish-fails"
+	s.serve(path, englishPage)
+
+	ch := &fakeChannel{publishErr: errors.New("broker is down")}
+	h := newHarness(t, s, nil, clock)
+	h.spider.mq = &queueOpening{channel: ch}
+	h.enqueue(t, s.pageURL(path))
+
+	h.crawl(t)
+
+	if len(h.store.persisted()) != 1 {
+		t.Fatalf("the page was not persisted before the publish attempt")
+	}
+	if _, parked := h.delayed(t)[s.pageURL(path)]; !parked {
+		t.Errorf("a failed publish dropped the URL instead of retrying it: %v", h.delayed(t))
+	}
+	visited, err := h.state.IsVisited(context.Background(), s.pageURL(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if visited {
+		t.Error("a page whose index job never reached the broker was retired")
+	}
+	if got := ch.messages(); len(got) != 0 {
+		t.Errorf("recorded a publish despite the error: %v", got)
+	}
 }

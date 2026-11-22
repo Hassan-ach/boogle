@@ -48,3 +48,8 @@ DROP INDEX IF EXISTS idx_page_word_word_id;
 
 -- The monitor orchestrator was removed; nothing reads or writes this table.
 DROP TABLE IF EXISTS monitor_state;
+
+-- The reverse unique index dropped any edge whose reverse already existed, so
+-- reciprocal links (a -> b and b -> a) were silently discarded and PageRank saw
+-- an incomplete graph. UNIQUE(from_url, to_url) is the only rule needed (H-15).
+DROP INDEX IF EXISTS idx_graph_edges_unique_revese;

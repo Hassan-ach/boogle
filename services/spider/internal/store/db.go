@@ -76,7 +76,11 @@ func (c *SQLClient) WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error
 	return nil
 }
 
-func (c *SQLClient) InsertPage(ctx context.Context, tx *sql.Tx, page *entity.Page) (uuid.UUID, error) {
+// InsertPage upserts the URL row and the page row and returns both ids.
+//
+// The URL id is returned so the caller can build graph edges from the page to
+// its links without re-deriving it from an unordered list.
+func (c *SQLClient) InsertPage(ctx context.Context, tx *sql.Tx, page *entity.Page) (uuid.UUID, string, error) {
 	var url_id string
 	err := tx.QueryRowContext(ctx,
 		`WITH ins AS (
@@ -91,12 +95,12 @@ func (c *SQLClient) InsertPage(ctx context.Context, tx *sql.Tx, page *entity.Pag
 		LIMIT 1;`,
 		page.URL).Scan(&url_id)
 	if err != nil {
-		return uuid.Nil(), fmt.Errorf("upsert url: %w", err)
+		return uuid.Nil(), "", fmt.Errorf("upsert url: %w", err)
 	}
 
 	metadata, err := json.Marshal(page.MetaData)
 	if err != nil {
-		return uuid.Nil(), fmt.Errorf("marshal metadata: %w", err)
+		return uuid.Nil(), "", fmt.Errorf("marshal metadata: %w", err)
 	}
 
 	var id uuid.UUID
@@ -110,10 +114,10 @@ func (c *SQLClient) InsertPage(ctx context.Context, tx *sql.Tx, page *entity.Pag
 		metadata,
 	).Scan(&id)
 	if err != nil {
-		return uuid.Nil(), fmt.Errorf("insert page : %w", err)
+		return uuid.Nil(), "", fmt.Errorf("insert page : %w", err)
 	}
 
-	return id, nil
+	return id, url_id, nil
 }
 
 func (c *SQLClient) InsertGraphEdges(
@@ -148,9 +152,14 @@ func (c *SQLClient) InsertGraphEdges(
 	return nil
 }
 
-func (c *SQLClient) InsertURLs(ctx context.Context, tx *sql.Tx, urls []string) ([]string, error) {
+// InsertURLs upserts URLs and returns their ids keyed by URL.
+//
+// The previous version returned only ids in whatever order the planner chose and
+// the caller treated ids[0] as the page and ids[1:] as its links, so the link
+// graph was built from an unordered list (H-06).
+func (c *SQLClient) InsertURLs(ctx context.Context, tx *sql.Tx, urls []string) (map[string]string, error) {
 	if len(urls) == 0 {
-		return make([]string, 0), nil
+		return map[string]string{}, nil
 	}
 
 	var values []string
@@ -171,9 +180,12 @@ func (c *SQLClient) InsertURLs(ctx context.Context, tx *sql.Tx, urls []string) (
 			ON CONFLICT (url) DO NOTHING
 		    RETURNING id, url
 		)
-		SELECT u.id
+		SELECT id, url FROM ins
+		UNION ALL
+		SELECT u.id, i.url
 		FROM input i
 		JOIN urls u ON u.url = i.url
+		WHERE NOT EXISTS (SELECT 1 FROM ins WHERE ins.url = i.url)
 		`, strings.Join(values, ","))
 
 	rows, err := tx.QueryContext(ctx, query, args...)
@@ -182,14 +194,14 @@ func (c *SQLClient) InsertURLs(ctx context.Context, tx *sql.Tx, urls []string) (
 	}
 	defer func() { _ = rows.Close() }()
 
-	m := make([]string, 0, len(urls))
+	m := make(map[string]string, len(urls))
 
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var id, url string
+		if err := rows.Scan(&id, &url); err != nil {
 			return nil, fmt.Errorf("scan failed: %w", err)
 		}
-		m = append(m, id)
+		m[url] = id
 	}
 
 	if err := rows.Err(); err != nil {

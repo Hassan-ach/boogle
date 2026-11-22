@@ -48,6 +48,11 @@ type Spider struct {
 
 	fetchpool chan struct{}
 	logger    *utils.Logger
+
+	// One AMQP channel per crawler goroutine, created on first use. Opening a
+	// channel per crawl produced roughly a hundred channel objects per second at
+	// the default settings (H-09).
+	channels sync.Map
 }
 
 func NewSpider(conf *config.Config) *Spider {
@@ -138,8 +143,40 @@ func (s *Spider) Stop() {
 }
 
 func (s *Spider) Close() {
+	s.channels.Range(func(key, value any) bool {
+		value.(messaging.MessagingChannel).Close()
+		s.channels.Delete(key)
+		return true
+	})
 	s.store.Close()
+	s.mq.Close()
 	s.logger.Close()
+}
+
+// channelFor returns the crawler's long-lived AMQP channel, opening one on first
+// use. A channel is not shared between goroutines, so the id is the key.
+func (s *Spider) channelFor(crawlerID int) (messaging.MessagingChannel, error) {
+	if existing, ok := s.channels.Load(crawlerID); ok {
+		return existing.(messaging.MessagingChannel), nil
+	}
+
+	ch, err := s.mq.NewMessagingChannel()
+	if err != nil {
+		return nil, err
+	}
+
+	actual, loaded := s.channels.LoadOrStore(crawlerID, ch)
+	if loaded {
+		ch.Close()
+	}
+	return actual.(messaging.MessagingChannel), nil
+}
+
+// dropChannel discards a broken channel so the next round reopens one.
+func (s *Spider) dropChannel(crawlerID int) {
+	if existing, ok := s.channels.LoadAndDelete(crawlerID); ok {
+		existing.(messaging.MessagingChannel).Close()
+	}
 }
 
 func (s *Spider) crawler(crawler_id int) {
@@ -158,6 +195,8 @@ func (s *Spider) crawler(crawler_id int) {
 	}
 }
 
+const requeueDelay = 30 * time.Second
+
 // bookkeepingContext survives the crawl deadline.
 //
 // The whole crawl runs under one CRAWLER_TIMEOUT context, and the failures that
@@ -166,6 +205,17 @@ func (s *Spider) crawler(crawler_id int) {
 // fails with the same deadline and the popped URL is lost (M-25).
 func bookkeepingContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+}
+
+// deferCrawl parks a URL for a short retry without touching its attempt budget.
+// Used for infrastructure failures that say nothing about the URL itself.
+func (s *Spider) deferCrawl(ctx context.Context, rawURL string, logger *slog.Logger) {
+	rctx, cancel := bookkeepingContext(ctx)
+	defer cancel()
+	if err := s.policy.Park(rctx, rawURL, s.policy.Now().Add(requeueDelay)); err != nil {
+		logger.Error("Could not park a URL after an infrastructure failure",
+			"url", rawURL, "error", err)
+	}
 }
 
 // requeue returns a popped URL to the frontier and spends one attempt from the
@@ -189,12 +239,11 @@ func (s *Spider) crawl(crawler_id int) {
 
 	logger := s.logger.With("component", "crawler", "crawler_id", crawler_id)
 
-	queue, err := s.mq.NewMessagingChannel()
+	queue, err := s.channelFor(crawler_id)
 	if err != nil {
 		logger.Error("Failed to create messaging channel", "error", err)
 		return
 	}
-	defer queue.Close()
 
 	select {
 	case s.fetchpool <- struct{}{}:
@@ -350,6 +399,28 @@ func (s *Spider) crawl(crawler_id int) {
 		return
 	}
 
+	// Publish before retiring. Retiring first meant a confirmed-failed publish
+	// still removed the URL from the crawl path; now the failure leaves it
+	// reclaimable and the page is retried end to end (H-09).
+	pubctx, pcancel := bookkeepingContext(ctx)
+	err = queue.Publish(
+		pubctx,
+		s.config.App.JobQueue,
+		messaging.NewIndexerJobPayload(pageId.String()),
+	)
+	pcancel()
+	if err != nil {
+		logger.Error(
+			"Failed to publish job to indexer queue; returning the URL to the frontier",
+			"url", page.URL, "error", err,
+		)
+		s.dropChannel(crawler_id)
+		// A broker outage is not this URL's fault, so it must not spend the
+		// page's fetch-attempt budget (which would retire it permanently).
+		s.deferCrawl(ctx, rawUrl, logger)
+		return
+	}
+
 	rctx, cancel := bookkeepingContext(ctx)
 	err = s.policy.Retire(rctx, rawUrl)
 	cancel()
@@ -360,14 +431,4 @@ func (s *Spider) crawl(crawler_id int) {
 	dctx, dcancel := bookkeepingContext(ctx)
 	s.policy.Discover(dctx, page.Links)
 	dcancel()
-
-	if err := queue.Publish(
-		s.config.App.JobQueue,
-		messaging.NewIndexerJobPayload(pageId.String()),
-	); err != nil {
-		s.logger.Error(
-			"Failed to publish job to indexer queue",
-			"url", page.URL, "error", err,
-		)
-	}
 }

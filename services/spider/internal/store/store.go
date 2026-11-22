@@ -20,9 +20,9 @@ type Cache interface {
 	Close()
 }
 type DB interface {
-	InsertPage(ctx context.Context, tx *sql.Tx, page *entity.Page) (uuid.UUID, error)
+	InsertPage(ctx context.Context, tx *sql.Tx, page *entity.Page) (uuid.UUID, string, error)
 	InsertGraphEdges(ctx context.Context, tx *sql.Tx, from_url_id string, to_url_ids []string) error
-	InsertURLs(ctx context.Context, tx *sql.Tx, urls []string) ([]string, error)
+	InsertURLs(ctx context.Context, tx *sql.Tx, urls []string) (map[string]string, error)
 	WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error
 	Close()
 }
@@ -61,33 +61,43 @@ func (s *Store) Persist(ctx context.Context, page *entity.Page) (uuid.UUID, erro
 func (s *Store) persistPage(ctx context.Context, page *entity.Page) (pageID uuid.UUID, err error) {
 	s.log.Info("Persisting page data", "url", page.URL)
 
+	var pageURLID string
+
+	// One transaction for the page, its links and its edges. Committing the page
+	// first let a later edge failure leave a "complete" page with no graph, which
+	// is PageRank's only input (H-06).
 	if err = s.db.WithTx(ctx, func(tx *sql.Tx) error {
-		if pageID, err = s.db.InsertPage(ctx, tx, page); err != nil {
+		pageID, pageURLID, err = s.db.InsertPage(ctx, tx, page)
+		if err != nil {
 			s.log.Error("insert page into database", "url", page.URL, "err", err)
 			return fmt.Errorf("insert page: %w", err)
 		}
-		return nil
-	}); err != nil {
-		s.log.Warn("failed to persist page", "url", page.URL, "err", err)
-		return pageID, fmt.Errorf("persist page in database: %w", err)
-	}
 
-	if err = s.db.WithTx(ctx, func(tx *sql.Tx) error {
-		ids, err := s.db.InsertURLs(
-			ctx,
-			tx,
-			append([]string{page.URL}, page.Links...),
-		)
+		linkIDs, err := s.db.InsertURLs(ctx, tx, page.Links)
 		if err != nil {
 			return fmt.Errorf("insert URLs into database: %w", err)
 		}
-		err = s.db.InsertGraphEdges(ctx, tx, ids[0], ids[1:])
-		if err != nil {
+
+		toURLIDs := make([]string, 0, len(page.Links))
+		for _, link := range page.Links {
+			if link == page.URL {
+				// A self-link is not an edge PageRank should see.
+				continue
+			}
+			id, ok := linkIDs[link]
+			if !ok {
+				// Silently skipping would recreate H-06 as an incomplete graph.
+				return fmt.Errorf("no url id for admitted link %q", link)
+			}
+			toURLIDs = append(toURLIDs, id)
+		}
+
+		if err := s.db.InsertGraphEdges(ctx, tx, pageURLID, toURLIDs); err != nil {
 			return fmt.Errorf("insert graph edges into database: %w", err)
 		}
 		return nil
 	}); err != nil {
-		s.log.Warn("failed to persist page edges", "url", page.URL, "err", err)
+		s.log.Warn("failed to persist page and its edges", "url", page.URL, "err", err)
 		return pageID, err
 	}
 	return pageID, nil

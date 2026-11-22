@@ -62,7 +62,6 @@ CREATE UNIQUE INDEX idx_page_word_word_page ON page_word(word_id, page_id);
 CREATE INDEX idx_graph_edges_from_page ON graph_edges(from_url);
 CREATE INDEX idx_graph_edges_to_page ON graph_edges(to_url);
 CREATE UNIQUE INDEX idx_graph_edges_unique ON graph_edges(from_url, to_url);
-CREATE UNIQUE INDEX idx_graph_edges_unique_revese ON graph_edges(to_url, from_url);
 CREATE INDEX idx_page_rank_score ON page_rank(score DESC);
 
 -- CREATE INDEX idx_image_page_image_url ON image_page(image_url);
