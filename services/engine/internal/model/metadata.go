@@ -3,7 +3,9 @@ package model
 import "time"
 
 type MetaData struct {
-	URL         string    `json:"url"`
+	// OgURL is the publisher's claimed canonical URL. It is display metadata
+	// only; Page.URL is the identity the crawler stored.
+	OgURL       string    `json:"ogUrl,omitempty"`
 	Title       string    `json:"title,omitempty"`
 	Description string    `json:"description,omitempty"`
 	Type        string    `json:"type,omitempty"`

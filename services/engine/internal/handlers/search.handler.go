@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"strconv"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/Hassan-ach/boogle/services/engine/internal/service"
 	"github.com/Hassan-ach/boogle/services/engine/internal/store"
@@ -9,6 +11,14 @@ import (
 	"github.com/Hassan-ach/boogle/services/engine/view/page/result"
 
 	"github.com/labstack/echo/v5"
+)
+
+// Query limits. Every token costs up to four cgo calls to aspell, and the query
+// is attacker-controlled, so an unbounded string is a cheap CPU denial of
+// service and a way to fill the logs (M-04).
+const (
+	maxQueryRunes  = 200
+	maxQueryTokens = 10
 )
 
 type SearchingHandler struct {
@@ -32,14 +42,14 @@ func NewSearchHandler(
 // Handle dispatches on the requested tab. The "images" and "graph" tabs render
 // empty placeholders; only "all" queries the store and the ranker.
 func (h SearchingHandler) Handle(c *echo.Context) error {
-	query := c.QueryParam("query")
+	tokens := queryTokens(c.QueryParam("query"))
 	filter := c.QueryParam("tab")
 	if filter == "" {
 		filter = "all"
 	}
 
-	sugs := h.Speller.GetSuggestions(query)
-
+	// The placeholders never use suggestions, so the spell checker is not run
+	// for them.
 	switch filter {
 	case "images":
 		return handleImagesTab(c)
@@ -47,34 +57,69 @@ func (h SearchingHandler) Handle(c *echo.Context) error {
 		return handleGraphTab(c)
 	}
 
-	return h.handleAllTab(c, sugs)
+	return h.handleAllTab(c, tokens)
 }
 
-func (h SearchingHandler) handleAllTab(c *echo.Context, sugs []string) error {
+func (h SearchingHandler) handleAllTab(c *echo.Context, tokens []string) error {
 	ctx := c.Request().Context()
 
 	currentPage := getPageNum(c)
 
-	totalPages, err := h.Store.GetTotalPages(ctx, sugs)
+	sugs := tokens
+	if len(tokens) > 0 {
+		sugs = h.Speller.GetSuggestions(strings.Join(tokens, " "))
+	}
+
+	totalResults, err := h.Store.GetTotalResults(ctx, sugs)
 	if err != nil {
 		return err
 	}
 
-	data, err := h.Store.GetData(ctx, sugs, currentPage-1)
+	data, err := h.Store.GetData(ctx, sugs)
 	if err != nil {
 		return err
 	}
 
-	pages, err := h.Ranker.Rank(data)
+	ranked, err := h.Ranker.Rank(data)
 	if err != nil {
 		return err
 	}
 
-	// htmx sets HX-Request on its partial swaps; the view returns a fragment
-	// instead of a full page when it is set.
+	pageSize := h.Store.PageSize()
+	if pageSize < 1 {
+		pageSize = 20
+	}
+
+	// The ranker returns the candidate window in final order, so slicing it here
+	// is what makes page 1 the best page rather than the best coarse match.
+	// Bound the advertised pages by the results actually in hand, not by a
+	// second query that happens to agree today (review finding 1).
+	reachable := len(ranked)
+	if totalResults < reachable {
+		reachable = totalResults
+	}
+	totalPages := (reachable + pageSize - 1) / pageSize
+	if totalPages < 1 {
+		totalPages = 1
+	}
+	currentPage = clampPage(currentPage, totalPages)
+
+	start := (currentPage - 1) * pageSize
+	if start > len(ranked) {
+		start = len(ranked)
+	}
+	end := start + pageSize
+	if end > len(ranked) {
+		end = len(ranked)
+	}
+
+	// htmx sets HX-Request on its partial swaps; the view returns the inner
+	// content of #results instead of a full page when it is set.
 	isHtmx := c.Request().Header.Get("HX-Request") == "true"
 
-	return render(c, result.ShowAll(pages, totalPages, currentPage, isHtmx))
+	// Advertise the reachable count, not the unbounded DB count: 5,000 matches
+	// with a 100-result window must not read "About 5000 results" (H-14).
+	return render(c, result.ShowAll(ranked[start:end], reachable, totalPages, currentPage, isHtmx))
 }
 
 func handleImagesTab(c *echo.Context) error {
@@ -85,6 +130,26 @@ func handleImagesTab(c *echo.Context) error {
 func handleGraphTab(c *echo.Context) error {
 	isHtmx := c.Request().Header.Get("HX-Request") == "true"
 	return render(c, result.ShowGraph(nil, isHtmx))
+}
+
+// queryTokens normalises a raw query into at most maxQueryTokens lower-case
+// tokens of bounded total length. An empty result means "no searchable input".
+func queryTokens(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	if utf8.RuneCountInString(raw) > maxQueryRunes {
+		runes := []rune(raw)
+		raw = string(runes[:maxQueryRunes])
+	}
+
+	tokens := strings.Fields(strings.ToLower(raw))
+	if len(tokens) > maxQueryTokens {
+		tokens = tokens[:maxQueryTokens]
+	}
+	return tokens
 }
 
 // getPageNum returns a 1-based page number, defaulting to 1. A missing,
@@ -101,4 +166,16 @@ func getPageNum(c *echo.Context) int {
 		}
 	}
 	return pageNum
+}
+
+// clampPage keeps a stale ?page= from dead-ending: it renders the last real
+// page instead of an empty result set with no way back.
+func clampPage(page, totalPages int) int {
+	if page < 1 {
+		return 1
+	}
+	if page > totalPages {
+		return totalPages
+	}
+	return page
 }

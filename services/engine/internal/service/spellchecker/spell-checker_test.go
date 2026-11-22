@@ -3,7 +3,9 @@ package spellchecker
 import (
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 type fakeDict struct {
@@ -267,5 +269,60 @@ func TestAspellIsCaseInsensitive(t *testing.T) {
 
 	if !reflect.DeepEqual(lower, upper) {
 		t.Errorf("GetSuggestions(\"SEARCH\") = %v, want the same as \"search\" = %v", upper, lower)
+	}
+}
+
+// blockingDict records whether two calls are ever inside the dictionary at the
+// same time. aspell's C API keeps per-speller state, so overlap is the bug.
+type blockingDict struct {
+	mu      sync.Mutex
+	active  int
+	overlap bool
+}
+
+func (d *blockingDict) enter() {
+	d.mu.Lock()
+	d.active++
+	if d.active > 1 {
+		d.overlap = true
+	}
+	d.mu.Unlock()
+	time.Sleep(100 * time.Microsecond)
+}
+
+func (d *blockingDict) leave() {
+	d.mu.Lock()
+	d.active--
+	d.mu.Unlock()
+}
+
+func (d *blockingDict) Check(string) bool {
+	d.enter()
+	defer d.leave()
+	return true
+}
+
+func (d *blockingDict) Suggest(string) []string {
+	d.enter()
+	defer d.leave()
+	return nil
+}
+
+func TestConcurrentSearchesNeverEnterTheSpellerAtTheSameTime(t *testing.T) {
+	d := &blockingDict{}
+	speller := AspellSpeller{mu: &sync.Mutex{}, speller: d}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			speller.GetSuggestions("hello world")
+		}()
+	}
+	wg.Wait()
+
+	if d.overlap {
+		t.Fatal("two goroutines called the shared speller concurrently (H-13)")
 	}
 }

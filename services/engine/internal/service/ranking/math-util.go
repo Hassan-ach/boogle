@@ -1,15 +1,26 @@
 package ranking
 
 import (
-	"fmt"
 	"math"
 )
 
-// cosineSimilarity assumes equal-length, non-negative vectors. It can divide by
-// zero when a document or the query has no scored terms at all; normalizeTFIDF
-// absorbs that case downstream.
+// cosineSimilarity assumes equal-length, non-negative vectors.
+//
+// A zero magnitude is normal: a single-term query for a word whose IDF was
+// clamped to 0 has no scored terms. Dividing produced NaN, which propagated
+// through normalizeTFIDF and made the comparator return 0 for every pair, so
+// results came out in map-iteration order (M-02). A neutral 0 keeps the blend
+// finite and lets the deterministic tie-breaks decide.
 func cosineSimilarity(vecA, vecB []float64) float64 {
-	return dotProduct(vecA, vecB) / (magnitude(vecA) * magnitude(vecB))
+	denom := magnitude(vecA) * magnitude(vecB)
+	if denom == 0 || math.IsNaN(denom) || math.IsInf(denom, 0) {
+		return 0
+	}
+	score := dotProduct(vecA, vecB) / denom
+	if math.IsNaN(score) || math.IsInf(score, 0) {
+		return 0
+	}
+	return score
 }
 
 func dotProduct(vecA, vecB []float64) float64 {
@@ -17,11 +28,8 @@ func dotProduct(vecA, vecB []float64) float64 {
 	for i := range vecA {
 		dot += vecA[i] * vecB[i]
 	}
-	// A NaN here means an IDF or term-frequency value was garbage. Refusing to
-	// continue beats returning NaN scores, which sort unpredictably and would
-	// quietly poison the result page instead of failing loudly.
 	if math.IsNaN(dot) {
-		panic(fmt.Sprintf("dot product is NaN for vecA: %v, vecB: %v", vecA, vecB))
+		return 0
 	}
 
 	return dot
@@ -32,8 +40,8 @@ func magnitude(vec []float64) float64 {
 	for _, v := range vec {
 		sum += v * v
 	}
-	if math.IsNaN(sum) {
-		panic(fmt.Sprintf("magnitude sum is NaN for vec: %v", vec))
+	if math.IsNaN(sum) || sum <= 0 {
+		return 0
 	}
 	return math.Sqrt(sum)
 }

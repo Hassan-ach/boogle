@@ -14,6 +14,9 @@ type PsqlConfig struct {
 
 	MaxOpenConns int
 	MaxIdleConns int
+
+	// SSLMode is PG_SSLMODE. Defaults to disable, matching the compose network.
+	SSLMode string
 }
 
 func NewDatabaseConfig() PsqlConfig {
@@ -24,6 +27,7 @@ func NewDatabaseConfig() PsqlConfig {
 	dbname := util.GetWithDefault("PG_DBNAME", "se")
 	maxOpenConns := util.GetIntWithDefault("PG_MAX_OPEN_CONNS", 20)
 	maxIdleConns := util.GetIntWithDefault("PG_MAX_IDLE_CONNS", 20)
+	sslMode := util.GetWithDefault("PG_SSLMODE", "disable")
 
 	return PsqlConfig{
 		Host:     host,
@@ -34,5 +38,6 @@ func NewDatabaseConfig() PsqlConfig {
 
 		MaxOpenConns: maxOpenConns,
 		MaxIdleConns: maxIdleConns,
+		SSLMode:      sslMode,
 	}
 }

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,36 +18,44 @@ import (
 )
 
 type fakeStore struct {
-	totalPages int
-	data       *store.Data
+	totalResults int
+	data         *store.Data
 
 	totalErr error
 	dataErr  error
 
 	gotWords  []string
-	gotPage   int
 	totalCall int
 	dataCall  int
+	pageSize  int
 }
 
-func (f *fakeStore) GetTotalPages(_ context.Context, q []string) (int, error) {
+func (f *fakeStore) GetTotalResults(_ context.Context, q []string) (int, error) {
 	f.totalCall++
 	f.gotWords = q
 	if f.totalErr != nil {
 		return 0, f.totalErr
 	}
-	return f.totalPages, nil
+	return f.totalResults, nil
 }
 
-func (f *fakeStore) GetData(_ context.Context, words []string, pageNum int) (*store.Data, error) {
+func (f *fakeStore) GetData(_ context.Context, words []string) (*store.Data, error) {
 	f.dataCall++
 	f.gotWords = words
-	f.gotPage = pageNum
 	if f.dataErr != nil {
 		return nil, f.dataErr
 	}
 	return f.data, nil
 }
+
+func (f *fakeStore) PageSize() int {
+	if f.pageSize > 0 {
+		return f.pageSize
+	}
+	return 20
+}
+
+func (f *fakeStore) CandidateLimit() int { return 100 }
 
 type fakeRanker struct {
 	pages []*model.Page
@@ -62,7 +71,13 @@ func (f *fakeRanker) Rank(*store.Data) ([]*model.Page, error) {
 
 type fakeSpeller struct{ suggestions []string }
 
-func (f *fakeSpeller) GetSuggestions(string) []string { return f.suggestions }
+func (f *fakeSpeller) GetSuggestions(q string) []string {
+	if f.suggestions != nil {
+		return f.suggestions
+	}
+	// Echo the input so the query caps are observable.
+	return strings.Fields(q)
+}
 
 func newTestHandler(s store.Store, r *fakeRanker, sp *fakeSpeller) *SearchingHandler {
 	return NewSearchHandler(s, r, sp)
@@ -92,7 +107,7 @@ func TestASearchFailureDoesNotLeakTheDatabaseError(t *testing.T) {
 	}{
 		{"counting the results", &fakeStore{totalErr: dbIsDown}},
 		{"fetching the results", &fakeStore{dataErr: dbIsDown}},
-		{"ranking the results", &fakeStore{totalPages: 1, data: &store.Data{}}},
+		{"ranking the results", &fakeStore{totalResults: 1, data: &store.Data{}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &fakeRanker{}
@@ -168,7 +183,6 @@ func samplePage(title string) *model.Page {
 		PRScore: 0.5,
 		Words:   map[string]int{"hello": 2},
 		MetaData: model.MetaData{
-			URL:   "https://example.test/" + title,
 			Title: title,
 		},
 	}
@@ -178,8 +192,8 @@ func TestASuccessfulSearchRendersTheResults(t *testing.T) {
 	page := samplePage("a result")
 
 	s := &fakeStore{
-		totalPages: 1,
-		data:       &store.Data{Idf: map[string]float64{"hello": 2.5}},
+		totalResults: 1,
+		data:         &store.Data{Idf: map[string]float64{"hello": 2.5}},
 	}
 	h := newTestHandler(s, &fakeRanker{pages: []*model.Page{page}}, &fakeSpeller{})
 
@@ -195,7 +209,7 @@ func TestASuccessfulSearchRendersTheResults(t *testing.T) {
 }
 
 func TestTheSearchedQueryIsWhateverTheSpellerProduced(t *testing.T) {
-	s := &fakeStore{totalPages: 1, data: &store.Data{}}
+	s := &fakeStore{totalResults: 1, data: &store.Data{}}
 	h := newTestHandler(s, &fakeRanker{}, &fakeSpeller{
 		suggestions: []string{"hello", "help", "hell"},
 	})
@@ -215,31 +229,78 @@ func TestTheSearchedQueryIsWhateverTheSpellerProduced(t *testing.T) {
 	}
 }
 
-func TestThePageParameterIsTranslatedToAZeroBasedOffset(t *testing.T) {
-	for _, tc := range []struct {
-		query string
-		want  int
-	}{
-		{"/?query=hello", 0},
-		{"/?query=hello&page=1", 0},
-		{"/?query=hello&page=3", 2},
-		{"/?query=hello&page=0", 0},
-		{"/?query=hello&page=-4", 0},
-		{"/?query=hello&page=abc", 0},
-	} {
-		s := &fakeStore{totalPages: 9, data: &store.Data{}}
-		h := newTestHandler(s, &fakeRanker{}, &fakeSpeller{})
+func TestThePageParameterSelectsASliceOfTheRankedWindow(t *testing.T) {
+	pages := make([]*model.Page, 60)
+	for i := range pages {
+		pages[i] = samplePage(fmt.Sprintf("result-%02d", i))
+	}
 
-		call(t, h, tc.query)
+	s := &fakeStore{totalResults: 60, pageSize: 20, data: &store.Data{}}
+	h := newTestHandler(s, &fakeRanker{pages: pages}, &fakeSpeller{})
 
-		if s.gotPage != tc.want {
-			t.Errorf("%s: store got pageNum %d, want %d", tc.query, s.gotPage, tc.want)
-		}
+	rec := call(t, h, "/?query=hello&page=2")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	// The ranked window is fetched once and sliced in Go; the SQL pass no longer
+	// decides which results belong to page 2.
+	if s.dataCall != 1 {
+		t.Errorf("GetData was called %d times, want 1", s.dataCall)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "result-20") {
+		t.Errorf("page 2 does not contain the 21st ranked result: %q", body)
+	}
+	if strings.Contains(body, "result-00") {
+		t.Errorf("page 2 contains a page-1 result: %q", body)
 	}
 }
 
-func TestTheResultSetIsAlwaysPaged(t *testing.T) {
-	s := &fakeStore{totalPages: 3, data: &store.Data{}}
+func TestAnOutOfRangePageRendersTheLastPageInsteadOfADeadEnd(t *testing.T) {
+	pages := make([]*model.Page, 45)
+	for i := range pages {
+		pages[i] = samplePage(fmt.Sprintf("result-%02d", i))
+	}
+
+	s := &fakeStore{totalResults: 45, pageSize: 20, data: &store.Data{}}
+	h := newTestHandler(s, &fakeRanker{pages: pages}, &fakeSpeller{})
+
+	rec := call(t, h, "/?query=hello&page=99")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "3 / 3") {
+		t.Errorf("a stale page parameter was not clamped to the last page: %q", body)
+	}
+	if !strings.Contains(body, "result-44") {
+		t.Errorf("the last page does not contain the last result: %q", body)
+	}
+}
+
+func TestThePageCountIsNotTheResultCount(t *testing.T) {
+	pages := make([]*model.Page, 60)
+	for i := range pages {
+		pages[i] = samplePage(fmt.Sprintf("result-%02d", i))
+	}
+	s := &fakeStore{totalResults: 60, pageSize: 20, data: &store.Data{}}
+	h := newTestHandler(s, &fakeRanker{pages: pages}, &fakeSpeller{})
+
+	rec := call(t, h, "/?query=hello")
+
+	body := rec.Body.String()
+	if strings.Contains(body, "1 / 60") {
+		t.Errorf("pagination advertises one page per match: %q", body)
+	}
+	if !strings.Contains(body, "1 / 3") {
+		t.Errorf("pagination does not show three pages for 60 results at 20 per page: %q", body)
+	}
+}
+
+func TestTheResultWindowIsFetchedOnce(t *testing.T) {
+	s := &fakeStore{totalResults: 3, data: &store.Data{}}
 	h := newTestHandler(s, &fakeRanker{}, &fakeSpeller{})
 
 	call(t, h, "/?query=hello")
@@ -247,6 +308,37 @@ func TestTheResultSetIsAlwaysPaged(t *testing.T) {
 	if s.dataCall != 1 {
 		t.Errorf("GetData was called %d times, want 1", s.dataCall)
 	}
+}
+
+func TestTheQueryIsCappedBeforeItReachesTheSpeller(t *testing.T) {
+	t.Run("runes", func(t *testing.T) {
+		s := &fakeStore{data: &store.Data{}}
+		h := newTestHandler(s, &fakeRanker{}, &fakeSpeller{})
+
+		call(t, h, "/?query="+strings.Repeat("x", 500))
+
+		if len(s.gotWords) != 1 {
+			t.Fatalf("speller received %v", s.gotWords)
+		}
+		if got := len([]rune(s.gotWords[0])); got > maxQueryRunes {
+			t.Errorf("token length = %d, want <= %d", got, maxQueryRunes)
+		}
+	})
+
+	t.Run("tokens", func(t *testing.T) {
+		s := &fakeStore{data: &store.Data{}}
+		h := newTestHandler(s, &fakeRanker{}, &fakeSpeller{})
+
+		tokens := make([]string, 15)
+		for i := range tokens {
+			tokens[i] = fmt.Sprintf("word%d", i)
+		}
+		call(t, h, "/?query="+strings.Join(tokens, "+"))
+
+		if len(s.gotWords) != maxQueryTokens {
+			t.Errorf("speller received %d tokens, want %d", len(s.gotWords), maxQueryTokens)
+		}
+	})
 }
 
 func TestTheOtherTabsDoNotTouchTheStore(t *testing.T) {
@@ -266,7 +358,7 @@ func TestTheOtherTabsDoNotTouchTheStore(t *testing.T) {
 }
 
 func TestAnUnknownTabFallsBackToAllResults(t *testing.T) {
-	s := &fakeStore{totalPages: 1, data: &store.Data{}}
+	s := &fakeStore{totalResults: 1, data: &store.Data{}}
 	h := newTestHandler(s, &fakeRanker{pages: []*model.Page{samplePage("fallback")}}, &fakeSpeller{})
 
 	rec := call(t, h, "/?query=hello&tab=nonsense")

@@ -145,3 +145,35 @@ func TestRankingService_Rank(t *testing.T) {
 		}
 	})
 }
+
+func TestRankUsesTheConfiguredTfWeight(t *testing.T) {
+	pageID := uuid.New()
+	page := &model.Page{
+		ID:      pageID,
+		URL:     "https://example.test/weight",
+		PRScore: 0.7,
+		Words:   map[string]int{"boogle": 3},
+	}
+
+	wordMapper := util.NewWordMapper()
+	wordMapper.MapValue("boogle")
+	pageMapper := util.NewPageMapper()
+	pageMapper.MapValue(pageID)
+
+	data := &store.Data{
+		Pages:      []*model.Page{page},
+		Idf:        map[string]float64{"boogle": 1.5},
+		WordMapper: wordMapper,
+		PageMapper: pageMapper,
+	}
+
+	// With TF weight 0 the blend is exactly PageRank. A hardcoded 0.5 would
+	// produce 0.35 and prove the configured value was ignored (M-05).
+	ranked, err := NewRankingService(ranker.RankingConfig{WeightTF: 0}).Rank(data)
+	if err != nil {
+		t.Fatalf("Rank: %v", err)
+	}
+	if ranked[0].GlobalScore != 0.7 {
+		t.Errorf("GlobalScore = %v, want PageRank 0.7", ranked[0].GlobalScore)
+	}
+}

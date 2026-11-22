@@ -1,20 +1,37 @@
 package spellchecker
 
 import (
-	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/trustmaster/go-aspell"
 )
+
+// fallbackMu guards spellers built as a zero value (tests, future call sites).
+var fallbackMu sync.Mutex
 
 type dictionary interface {
 	Check(word string) bool
 	Suggest(word string) []string
 }
 
+// AspellSpeller serializes calls into one go-aspell speller.
+//
+// go-aspell exposes one AspellSpeller and no locking, and aspell keeps mutable
+// per-speller state. Echo handlers run concurrently, so overlapping searches
+// could corrupt suggestions, leak C allocations or crash the process (H-13).
+// Check/Suggest cost microseconds, so a mutex is cheaper than a speller pool.
 type AspellSpeller struct {
+	mu      *sync.Mutex
 	speller dictionary
+}
+
+func (s AspellSpeller) mutex() *sync.Mutex {
+	if s.mu == nil {
+		return &fallbackMu
+	}
+	return s.mu
 }
 
 func NewAspellSpellingService() (AspellSpeller, error) {
@@ -26,16 +43,17 @@ func NewAspellSpellingService() (AspellSpeller, error) {
 	}
 
 	return AspellSpeller{
+		mu:      &sync.Mutex{},
 		speller: &speller,
 	}, nil
 }
 
 func (s AspellSpeller) GetSuggestions(q string) []string {
-	sug := suggestionsFor(q, s.speller, 3)
-	for i, w := range sug {
-		fmt.Printf("suggestion %d for %s: %s\n", i, q, w)
-	}
-	return sug
+	mu := s.mutex()
+	mu.Lock()
+	defer mu.Unlock()
+
+	return suggestionsFor(q, s.speller, 3)
 }
 
 func suggestionsFor(q string, speller dictionary, maxSuggestions int) []string {

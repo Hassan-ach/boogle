@@ -6,6 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
+	"net/url"
+	"strconv"
+	"time"
 
 	"github.com/Hassan-ach/boogle/services/engine/internal/apperror"
 	"github.com/Hassan-ach/boogle/services/engine/internal/config/store"
@@ -17,8 +21,13 @@ import (
 )
 
 type Store interface {
-	GetData(c context.Context, words []string, pageNum int) (*Data, error)
-	GetTotalPages(c context.Context, query []string) (int, error)
+	// GetData returns the top CandidateLimit matches for the query. Pagination
+	// and final ordering are the ranker's and handler's job: the SQL pass cannot
+	// see the TF-IDF/PageRank blend.
+	GetData(c context.Context, words []string) (*Data, error)
+	// GetTotalResults counts every page matching any query word.
+	GetTotalResults(c context.Context, query []string) (int, error)
+	PageSize() int
 }
 
 // Data is one query's worth of loaded state. The mappers come from the same load
@@ -39,16 +48,17 @@ type PsqlStore struct {
 // nothing without Postgres, and failing at boot surfaces the misconfiguration
 // instead of returning empty result pages to every query.
 func NewStore(conf store.StoreConfig) PsqlStore {
-	urls := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
-		conf.DB.Host, conf.DB.Port, conf.DB.User, conf.DB.Password, conf.DB.DBName)
-
-	conn, err := sql.Open("postgres", urls)
+	// Built with url.URL rather than fmt.Sprintf so a password containing '@',
+	// ':' or '/' is escaped instead of changing the connection target (M-06).
+	conn, err := sql.Open("postgres", connectionString(conf))
 	if err != nil {
 		panic(fmt.Sprintf("Failed to open database connection: %v", err))
 	}
 
-	err = conn.Ping()
-	if err != nil {
+	// A black-holed host must fail boot quickly instead of hanging forever.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err = conn.PingContext(ctx); err != nil {
 		log.Fatalln("Failed to connect to database:", err)
 	}
 
@@ -61,23 +71,21 @@ func NewStore(conf store.StoreConfig) PsqlStore {
 	}
 }
 
-// GetData returns one page of results for the given query words.
+// GetData returns the candidate window for the given query words.
 //
 // Ranking happens in SQL rather than in Go: the CTE groups by page, counts
 // distinct matching words and aggregates each page's tf/idf pairs, then orders by
-// that count. So the candidate set is narrowed to PageSize rows in the database,
-// and the Go side only re-ranks that window with cosine similarity. Ordering
-// here is the coarse pass (coverage, then PageRank); the engine's blend is the
-// fine one.
-//
-// pageNum is zero-based, so callers pass page-1 from the query string.
-func (s PsqlStore) GetData(c context.Context, words []string, pageNum int) (*Data, error) {
+// that count. The result is capped at CandidateLimit, and the Go side re-ranks
+// that whole window with cosine similarity before the handler slices it into
+// pages. Ordering here is the coarse pass (coverage, then PageRank); the engine's
+// blend is the fine one.
+func (s PsqlStore) GetData(c context.Context, words []string) (*Data, error) {
 	sql := `
 		WITH ranked AS (
 		    SELECT
 		        p.id,
 		        u.url,
-		        pr.score AS pr,
+		        COALESCE(pr.score, 0) AS pr,
 		        p.metadata,
 		        COUNT(DISTINCT w.id) AS word_count,
 		        COALESCE(
@@ -93,7 +101,7 @@ func (s PsqlStore) GetData(c context.Context, words []string, pageNum int) (*Dat
 		    FROM words w
 		    INNER JOIN page_word pw ON w.id = pw.word_id
 		    INNER JOIN pages p      ON pw.page_id = p.id
-		    INNER JOIN page_rank pr ON p.url_id = pr.url_id
+		    LEFT JOIN page_rank pr  ON p.url_id = pr.url_id
 		    INNER JOIN urls u       ON p.url_id = u.id
 		    WHERE w.word = ANY($1)
 		    GROUP BY p.id, pr.score, u.url, p.metadata
@@ -103,14 +111,19 @@ func (s PsqlStore) GetData(c context.Context, words []string, pageNum int) (*Dat
 		ORDER BY word_count DESC,
 		         pr DESC,
 		         id ASC
-		LIMIT $2 OFFSET $3`
+		LIMIT $2`
+
+	candidateLimit := s.conf.CandidateLimit
+	if candidateLimit < 1 {
+		// A hand-built config must not turn every search into LIMIT 0.
+		candidateLimit = 100
+	}
 
 	rows, err := s.conn.QueryContext(
 		c,
 		sql,
 		pq.Array(words),
-		s.conf.PageSize,
-		pageNum*s.conf.PageSize,
+		candidateLimit,
 	)
 	if err != nil {
 		return nil, apperror.Internal(fmt.Errorf("failed to execute query: %w", err))
@@ -118,7 +131,7 @@ func (s PsqlStore) GetData(c context.Context, words []string, pageNum int) (*Dat
 	defer func() { _ = rows.Close() }()
 
 	wordIdf := make(map[string]float64, len(words))
-	pgs := make([]*model.Page, 0, s.conf.PageSize)
+	pgs := make([]*model.Page, 0, s.conf.CandidateLimit)
 
 	for rows.Next() {
 		var (
@@ -189,10 +202,10 @@ func (s PsqlStore) GetData(c context.Context, words []string, pageNum int) (*Dat
 	}, nil
 }
 
-// GetTotalPages counts every page matching any query word, not just the window
-// GetData returns. It therefore counts pages the SQL ranking would never surface,
-// so the page count is an upper bound on what a user can page through.
-func (s PsqlStore) GetTotalPages(c context.Context, query []string) (int, error) {
+// GetTotalResults counts every page matching any query word, not just the window
+// GetData returns. The handler divides this by PageSize to get the number of
+// pages, so the UI does not advertise one page per match (H-14).
+func (s PsqlStore) GetTotalResults(c context.Context, query []string) (int, error) {
 	sql := `
 		SELECT COUNT(DISTINCT p.id)
 		FROM words w
@@ -200,10 +213,36 @@ func (s PsqlStore) GetTotalPages(c context.Context, query []string) (int, error)
 		JOIN pages p      ON pw.page_id = p.id
 		WHERE w.word = ANY($1)`
 
+	if len(query) == 0 {
+		return 0, nil
+	}
+
 	var total int
 	err := s.conn.QueryRowContext(c, sql, pq.Array(query)).Scan(&total)
 	if err != nil {
-		return 0, apperror.Internal(fmt.Errorf("failed to get total pages: %w", err))
+		return 0, apperror.Internal(fmt.Errorf("failed to count matching pages: %w", err))
 	}
 	return total, nil
+}
+
+// PageSize is the number of results rendered per page.
+func (s PsqlStore) PageSize() int {
+	return s.conf.PageSize
+}
+
+// connectionString builds a libpq URL without manual escaping.
+func connectionString(conf store.StoreConfig) string {
+	u := url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(conf.DB.User, conf.DB.Password),
+		Host:   net.JoinHostPort(conf.DB.Host, strconv.Itoa(conf.DB.Port)),
+		Path:   conf.DB.DBName,
+	}
+	q := u.Query()
+	q.Set("sslmode", conf.DB.SSLMode)
+	q.Set("connect_timeout", "5")
+	// A search that runs away must not hold a pool connection forever.
+	q.Set("statement_timeout", "30000")
+	u.RawQuery = q.Encode()
+	return u.String()
 }

@@ -27,10 +27,10 @@ func (r RankingService) Rank(data *store.Data) ([]*model.Page, error) {
 
 	normalizeTFIDF(pages)
 
-	// 0.5 weights the two signals equally. TF-IDF is 0..1 after
+	// RANKER_WEIGHT_TF weights the two signals. TF-IDF is 0..1 after
 	// normalizeTFIDF; PageRank is normalised separately, so neither dominates by
-	// scale alone. Moving this changes relevance outright, not just ordering.
-	rankedPages, err := sort(pages, 0.5)
+	// scale alone. The literal 0.5 used to ignore the configured value (M-05).
+	rankedPages, err := sort(pages, r.conf.WeightTF)
 	if err != nil {
 		return nil, apperror.Internal(fmt.Errorf("failed to rank nodes: %w", err))
 	}

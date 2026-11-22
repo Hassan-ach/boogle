@@ -27,7 +27,8 @@ func main() {
 
 	conf, err := config.LoadConfig()
 	if err != nil {
-		panic("failed to load config: " + err.Error())
+		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
+		os.Exit(1)
 	}
 	store := store.NewStore(conf.Store)
 
@@ -40,9 +41,10 @@ func main() {
 	c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	data, err := store.GetData(c, query, 0)
+	data, err := store.GetData(c, query)
 	if err != nil {
-		fmt.Printf("err: %v", err)
+		fmt.Fprintf(os.Stderr, "query failed: %v\n", err)
+		os.Exit(1)
 	}
 	s := time.Now()
 	pages, err := ranker.Rank(data)

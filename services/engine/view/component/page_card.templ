@@ -1,17 +1,17 @@
 package component
 import "github.com/Hassan-ach/boogle/services/engine/internal/model"
 import "strings"
-import "fmt"
 import "net/url"
 
 templ PageCard(page *model.Page) {
     <article class="card-article" x-data="{ expanded: false }">
         <div class="flex items-center gap-2 mb-1">
         <div class="card-favicon">
-        if len(page.MetaData.Icons) > 0 {
-            <img src={getIcon(page)} alt="favicon" class="w-4 h-4 object-contain" />
-        }else{
-             {string(page.URL[0])}
+        {{ icon := getIcon(page) }}
+        if icon != "" {
+            <img src={ templ.URL(icon) } alt="favicon" class="w-4 h-4 object-contain" />
+        } else {
+            { initial(page.URL) }
         }
         </div>
             <span class="text-sm text-gray-700">{ getDomain(page.URL) }</span>
@@ -53,8 +53,8 @@ func getDescription(page *model.Page) string {
     if page.MetaData.Description == "" {
         return "No description available for this page."
     }
-    if len(page.MetaData.Description) > 200 {
-        return page.MetaData.Description[:200] + "..."
+    if runes := []rune(page.MetaData.Description); len(runes) > 200 {
+        return string(runes[:200]) + "..."
     }
     return page.MetaData.Description
 }
@@ -66,17 +66,47 @@ func getKeywords(page *model.Page) string {
     return strings.Join(page.MetaData.Keywords, ", ")
 }
 
-func getIcon(page *model.Page) string {
-    iconURL := page.MetaData.Icons[0]
+// initial is the fallback favicon. A byte index would panic on an empty URL.
+func initial(u string) string {
+    for _, r := range u {
+        return strings.ToUpper(string(r))
+    }
+    return "?"
+}
 
-    if strings.HasPrefix(iconURL, "http") {
-        return iconURL
+// getIcon returns a safe, absolute favicon URL, or "" when the page did not
+// provide a usable HTTPS/HTTP icon.
+//
+// Icon links come from crawled metadata. Only absolute http(s) URLs and
+// same-origin relative paths are accepted; a javascript: or data: URL must never
+// reach an <img src>, and an empty value must not index Icons[0].
+func getIcon(page *model.Page) string {
+    if len(page.MetaData.Icons) == 0 {
+        return ""
     }
+    iconURL := strings.TrimSpace(page.MetaData.Icons[0])
+    if iconURL == "" {
+        return ""
+    }
+
+    if parsed, err := url.Parse(iconURL); err == nil && parsed.IsAbs() {
+        if parsed.Scheme == "https" || parsed.Scheme == "http" {
+            return parsed.String()
+        }
+        return ""
+    }
+
     domain := getDomain(page.URL)
-    if strings.HasPrefix(iconURL,domain ) {
-        return fmt.Sprintf("http://%s", iconURL)
+    if domain == "" {
+        return ""
     }
-    return fmt.Sprintf("https://%s%s",domain, iconURL)
+    if strings.HasPrefix(iconURL, "//") {
+        return "https:" + iconURL
+    }
+    if !strings.HasPrefix(iconURL, "/") {
+        iconURL = "/" + iconURL
+    }
+    return "https://" + domain + iconURL
 }
 
 func getDomain(u string) string {

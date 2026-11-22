@@ -68,7 +68,8 @@ func storeConfig(t *testing.T) store.StoreConfig {
 			MaxOpenConns: 4,
 			MaxIdleConns: 4,
 		},
-		PageSize: 20,
+		PageSize:       20,
+		CandidateLimit: 100,
 	}
 }
 
@@ -152,7 +153,7 @@ func TestGetDataReturnsTheMatchingPageWithItsWords(t *testing.T) {
 	p := seed(t, conn, "match", 0.5)
 	indexWords(t, conn, p, map[string]int{"pagerank": 4, "postgres": 2})
 
-	data, err := s.GetData(context.Background(), []string{"pagerank", "postgres"}, 0)
+	data, err := s.GetData(context.Background(), []string{"pagerank", "postgres"})
 	if err != nil {
 		t.Fatalf("GetData: %v", err)
 	}
@@ -199,7 +200,7 @@ func TestGetDataExcludesPagesThatMatchNoQueryWord(t *testing.T) {
 	miss := seed(t, conn, "miss", 0.9)
 	indexWords(t, conn, miss, map[string]int{"haystack": 1})
 
-	data, err := s.GetData(context.Background(), []string{"needle"}, 0)
+	data, err := s.GetData(context.Background(), []string{"needle"})
 	if err != nil {
 		t.Fatalf("GetData: %v", err)
 	}
@@ -227,7 +228,7 @@ func TestGetDataOrdersByWordCountThenByPageRank(t *testing.T) {
 	oneLow := seed(t, conn, "one-low", 0.20)
 	indexWords(t, conn, oneLow, map[string]int{"beta": 1})
 
-	data, err := s.GetData(context.Background(), []string{"alpha", "beta"}, 0)
+	data, err := s.GetData(context.Background(), []string{"alpha", "beta"})
 	if err != nil {
 		t.Fatalf("GetData: %v", err)
 	}
@@ -269,7 +270,7 @@ func TestGetDataCollectsTheIdfOfEveryWordItReturns(t *testing.T) {
 		t.Fatalf("set idf: %v", err)
 	}
 
-	data, err := s.GetData(context.Background(), []string{"weighted", "unweighted"}, 0)
+	data, err := s.GetData(context.Background(), []string{"weighted", "unweighted"})
 	if err != nil {
 		t.Fatalf("GetData: %v", err)
 	}
@@ -287,7 +288,7 @@ func TestGetDataWithNoWordsReturnsNothing(t *testing.T) {
 	s := newStore(t)
 	seed(t, conn, "emptyquery", 0.5)
 
-	data, err := s.GetData(context.Background(), nil, 0)
+	data, err := s.GetData(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("GetData: %v", err)
 	}
@@ -296,53 +297,38 @@ func TestGetDataWithNoWordsReturnsNothing(t *testing.T) {
 	}
 }
 
-func TestGetDataPagesThroughTheResultSet(t *testing.T) {
+func TestGetDataReturnsTheWholeCandidateWindow(t *testing.T) {
 	conn := connect(t)
 
 	conf := storeConfig(t)
 	conf.PageSize = 2
-	paged := NewStore(conf)
+	conf.CandidateLimit = 10
+	window := NewStore(conf)
 
 	for i := 0; i < 5; i++ {
 		p := seed(t, conn, fmt.Sprintf("paged%d", i), 0.5)
 		indexWords(t, conn, p, map[string]int{"pageme": 1})
 	}
 
-	var seen []string
-	for pageNum := 0; pageNum < 3; pageNum++ {
-		data, err := paged.GetData(context.Background(), []string{"pageme"}, pageNum)
-		if err != nil {
-			t.Fatalf("GetData page %d: %v", pageNum, err)
-		}
-		if len(data.Pages) > conf.PageSize {
-			t.Errorf("page %d returned %d rows, more than PageSize=%d",
-				pageNum, len(data.Pages), conf.PageSize)
-		}
-		for _, p := range data.Pages {
-			seen = append(seen, p.ID.String())
-		}
+	// Pagination is the handler's job now: the SQL pass has to hand the ranker
+	// every candidate in the window, not one already-sliced page (M-03).
+	data, err := window.GetData(context.Background(), []string{"pageme"})
+	if err != nil {
+		t.Fatalf("GetData: %v", err)
 	}
-
-	unique := map[string]bool{}
-	for _, id := range seen {
-		if unique[id] {
-			t.Errorf("page %v appeared on two pages: %v", id, seen)
-		}
-		unique[id] = true
-	}
-	if len(seen) == 0 {
-		t.Error("paging through the result set returned nothing at all")
+	if len(data.Pages) != 5 {
+		t.Errorf("GetData returned %d candidates, want all 5 in the window", len(data.Pages))
 	}
 }
 
-func TestGetTotalPagesCountsEveryMatchNotJustOnePage(t *testing.T) {
+func TestGetTotalResultsCountsEveryMatchNotJustOnePage(t *testing.T) {
 	conn := connect(t)
 	s := newStore(t)
 
 	p := seed(t, conn, "counted", 0.5)
 	indexWords(t, conn, p, map[string]int{"countme": 1})
 
-	total, err := s.GetTotalPages(context.Background(), []string{"countme"})
+	total, err := s.GetTotalResults(context.Background(), []string{"countme"})
 	if err != nil {
 		t.Fatalf("GetTotalPages: %v", err)
 	}
@@ -351,10 +337,10 @@ func TestGetTotalPagesCountsEveryMatchNotJustOnePage(t *testing.T) {
 	}
 }
 
-func TestGetTotalPagesIsZeroWhenNothingMatches(t *testing.T) {
+func TestGetTotalResultsIsZeroWhenNothingMatches(t *testing.T) {
 	s := newStore(t)
 
-	total, err := s.GetTotalPages(context.Background(), []string{"nothingmatchesthisword"})
+	total, err := s.GetTotalResults(context.Background(), []string{"nothingmatchesthisword"})
 	if err != nil {
 		t.Fatalf("GetTotalPages: %v", err)
 	}
@@ -363,10 +349,10 @@ func TestGetTotalPagesIsZeroWhenNothingMatches(t *testing.T) {
 	}
 }
 
-func TestGetTotalPagesWithNoWordsIsZero(t *testing.T) {
+func TestGetTotalResultsWithNoWordsIsZero(t *testing.T) {
 	s := newStore(t)
 
-	total, err := s.GetTotalPages(context.Background(), nil)
+	total, err := s.GetTotalResults(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("GetTotalPages: %v", err)
 	}
@@ -383,7 +369,7 @@ func TestGetDataReportsQueryFailuresAsAnAppError(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	_, err := s.GetData(context.Background(), []string{"anything"}, 0)
+	_, err := s.GetData(context.Background(), []string{"anything"})
 	if err == nil {
 		t.Fatal("GetData succeeded against a closed pool")
 	}
@@ -411,7 +397,7 @@ func TestGetDataReportsQueryFailuresAsAnAppError(t *testing.T) {
 	}
 }
 
-func TestGetTotalPagesReportsQueryFailuresAsAnAppError(t *testing.T) {
+func TestGetTotalResultsReportsQueryFailuresAsAnAppError(t *testing.T) {
 	connect(t)
 	s := newStore(t)
 
@@ -419,7 +405,7 @@ func TestGetTotalPagesReportsQueryFailuresAsAnAppError(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	_, err := s.GetTotalPages(context.Background(), []string{"anything"})
+	_, err := s.GetTotalResults(context.Background(), []string{"anything"})
 	if err == nil {
 		t.Fatal("GetTotalPages succeeded against a closed pool")
 	}
