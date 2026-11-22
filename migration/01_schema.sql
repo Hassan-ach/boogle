@@ -1,12 +1,14 @@
+-- Every statement is idempotent: Postgres runs this directory on first boot
+-- (empty PGDATA) and scripts/migrate.sh applies it again on every deploy.
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
-CREATE TABLE urls (
+CREATE TABLE IF NOT EXISTS urls (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     url TEXT UNIQUE NOT NULL
     -- status TEXT NOT NULL CHECK (status IN ('pending', 'crawled', 'failed')),
 );
 
-CREATE TABLE pages (
+CREATE TABLE IF NOT EXISTS pages (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     url_id UUID UNIQUE NOT NULL REFERENCES urls(id) ON DELETE CASCADE,
     html TEXT NOT NULL,
@@ -19,28 +21,28 @@ CREATE TABLE pages (
     index_attempts INT NOT NULL DEFAULT 0
 );
 
-CREATE TABLE words (
+CREATE TABLE IF NOT EXISTS words (
     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
     word VARCHAR(25) UNIQUE NOT NULL,
     idf DOUBLE PRECISION NOT NULL DEFAULT 1,  
     doc_frequency INTEGER DEFAULT 0
 );
 
-CREATE TABLE page_word (
+CREATE TABLE IF NOT EXISTS page_word (
     page_id UUID NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
     word_id UUID NOT NULL REFERENCES words(id) ON DELETE CASCADE,
     tf INTEGER NOT NULL CHECK (tf > 0),
     PRIMARY KEY (page_id, word_id)
 );
 
-CREATE TABLE graph_edges (
+CREATE TABLE IF NOT EXISTS graph_edges (
     id BIGSERIAL PRIMARY KEY,
     from_url UUID NOT NULL REFERENCES urls(id) ON DELETE CASCADE,
     to_url   UUID NOT NULL REFERENCES urls(id) ON DELETE CASCADE,
     UNIQUE (from_url, to_url)
 );
 
-CREATE TABLE page_rank (
+CREATE TABLE IF NOT EXISTS page_rank (
     url_id UUID PRIMARY KEY REFERENCES urls(id) ON DELETE CASCADE,
     score   DOUBLE PRECISION NOT NULL,
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
@@ -55,14 +57,14 @@ CREATE TABLE page_rank (
 
 
 -- Indexes
-CREATE UNIQUE INDEX idx_words_word ON words(word);
-CREATE UNIQUE INDEX idx_pages_url_id ON pages(url_id);
-CREATE INDEX idx_page_word_page_id ON page_word(page_id);
-CREATE UNIQUE INDEX idx_page_word_word_page ON page_word(word_id, page_id);
-CREATE INDEX idx_graph_edges_from_page ON graph_edges(from_url);
-CREATE INDEX idx_graph_edges_to_page ON graph_edges(to_url);
-CREATE UNIQUE INDEX idx_graph_edges_unique ON graph_edges(from_url, to_url);
-CREATE INDEX idx_page_rank_score ON page_rank(score DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_words_word ON words(word);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_url_id ON pages(url_id);
+CREATE INDEX IF NOT EXISTS idx_page_word_page_id ON page_word(page_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_page_word_word_page ON page_word(word_id, page_id);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_from_page ON graph_edges(from_url);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_to_page ON graph_edges(to_url);
+-- The table's UNIQUE(from_url, to_url) already provides this index.
+CREATE INDEX IF NOT EXISTS idx_page_rank_score ON page_rank(score DESC);
 
 -- CREATE INDEX idx_image_page_image_url ON image_page(image_url);
 --

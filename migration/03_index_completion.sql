@@ -53,3 +53,7 @@ DROP TABLE IF EXISTS monitor_state;
 -- reciprocal links (a -> b and b -> a) were silently discarded and PageRank saw
 -- an incomplete graph. UNIQUE(from_url, to_url) is the only rule needed (H-15).
 DROP INDEX IF EXISTS idx_graph_edges_unique_revese;
+
+-- UNIQUE(from_url, to_url) on graph_edges already creates an index; the explicit
+-- duplicate only added write cost on every edge insert.
+DROP INDEX IF EXISTS idx_graph_edges_unique;
