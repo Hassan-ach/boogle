@@ -43,6 +43,7 @@ env:
     @for svc in engine spider indexer ranking; do \
         [ -f services/$svc/.env ] || cp services/$svc/.env.example services/$svc/.env; \
     done
+    @./scripts/docker-env.sh
     @echo "env files ready (edit the change-me-* values before a real deployment)"
 
 # Bring up Postgres/Redis/RabbitMQ.
@@ -54,6 +55,19 @@ infra-up:
     @until docker compose exec -T rabbitmq rabbitmq-diagnostics -q ping >/dev/null 2>&1; do sleep 1; done
     @echo "infra ready"
 
+# Fail early when a local engine (air/go run) already owns the only host port the
+# stack publishes. Without this, `up` builds the image and only then fails with
+# "address already in use", leaving a Created container behind.
+#
+# Check that the published engine port is free.
+preflight:
+    @if command -v ss >/dev/null 2>&1 \
+        && ss -ltn 2>/dev/null | grep -q ':1323 ' \
+        && ! docker ps -q -f 'name=^engine$' | grep -q .; then \
+        echo "port 1323 is already in use; stop the local engine/air process first" >&2; \
+        exit 1; \
+    fi
+
 # One-stop dev stack: bootstrap env files, start the datastores, apply
 # migrations, then build and start all four services detached.
 #
@@ -62,7 +76,7 @@ infra-up:
 # the pgdata volume.
 #
 # Start datastores, migrate, then build and run all four services.
-run: env infra-up migrate
+run: env preflight infra-up migrate
     @for svc in engine spider indexer ranking; do \
         echo "==> building and starting services/$svc"; \
         docker compose -f services/$svc/docker-compose.yml up -d --build || exit 1; \

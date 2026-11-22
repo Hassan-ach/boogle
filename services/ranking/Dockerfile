@@ -39,6 +39,6 @@ COPY --chown=app:app --chmod=0555 entrypoint.sh /entrypoint.sh
 USER 10001:10001
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD pgrep -x main > /dev/null || exit 1
+  CMD pidof main > /dev/null || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]

@@ -7,6 +7,8 @@ data/
 .scannerwork/
 *.log
 .env
+.env.docker
+services/*/.env.docker
 # === Rust ===
 target/
 **/*.rs.bk

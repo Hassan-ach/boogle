@@ -3,7 +3,6 @@ package utils
 import (
 	"context"
 	"fmt"
-	"log"
 	"log/slog"
 	"os"
 	"strings"
@@ -80,7 +79,14 @@ func NewMultiLogger(fileName string) *Logger {
 
 	file, err := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		log.Fatalf("failed to open log file: %v", err)
+		// stdout already carries every record, and a path that is missing or
+		// read-only must not crash the crawler. The shipped image runs as uid
+		// 10001 with a root-owned /app, so a relative LOGS_PATH is exactly this
+		// case (same failure class as the ranking file logger).
+		fmt.Fprintf(os.Stderr,
+			"spider: cannot open log file %q (%v); logging to stdout only\n",
+			fileName, err)
+		return &Logger{Logger: slog.New(txtHandler)}
 	}
 	jsonHandler := slog.NewJSONHandler(file, nil)
 

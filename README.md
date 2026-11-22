@@ -18,11 +18,9 @@ A 2000s-style search engine built for educational purposes.
 ```bash
 # 1. Configure every service. Replace all "change-me-*" values with real
 #    secrets; the database, Redis and RabbitMQ examples must agree.
-cp .env.example .env
-cp services/engine/.env.example services/engine/.env
-cp services/spider/.env.example services/spider/.env
-cp services/indexer/.env.example services/indexer/.env
-cp services/ranking/.env.example services/ranking/.env
+# Copies each missing .env from its example, then generates the
+# services/*/.env.docker overlays (container hostnames + credentials from .env).
+just env
 
 # 2. Start the shared infrastructure (creates the search_net network and the
 #    pgdata volume). Datastores publish on 127.0.0.1 only.
