@@ -42,6 +42,11 @@ docker compose -f services/engine/docker-compose.yml  up -d --build
 open http://localhost:1323
 ```
 
+`just run` does steps 1-4 in one go (bootstrap env files, start the
+datastores, apply migrations, then build and start all four services).
+`just run-logs` follows their output and `just stop` shuts the stack down
+without deleting the `pgdata` volume.
+
 ## Services
 
 | Service | Language | Purpose |

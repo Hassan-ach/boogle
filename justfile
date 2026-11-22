@@ -34,12 +34,62 @@ test-cov:
     @cd services/ranking && venv/bin/python -m pytest tests -m "not integration" \
         --cov=src --cov-report=term-missing
 
+# Copy every .env.example to .env when the file is missing. Existing files are
+# never overwritten: they hold the credentials an operator set.
+#
+# Bootstrap missing .env files from the examples.
+env:
+    @[ -f .env ] || cp .env.example .env
+    @for svc in engine spider indexer ranking; do \
+        [ -f services/$svc/.env ] || cp services/$svc/.env.example services/$svc/.env; \
+    done
+    @echo "env files ready (edit the change-me-* values before a real deployment)"
+
 # Bring up Postgres/Redis/RabbitMQ.
 infra-up:
-    docker compose up -d psql redis rabbitmq
+    docker compose up -d psql redis rabbitmq adminer
     @echo "waiting for postgres..."
     @until docker compose exec -T psql pg_isready -U "${PG_USER:-admin}" >/dev/null 2>&1; do sleep 1; done
+    @echo "waiting for rabbitmq..."
+    @until docker compose exec -T rabbitmq rabbitmq-diagnostics -q ping >/dev/null 2>&1; do sleep 1; done
     @echo "infra ready"
+
+# One-stop dev stack: bootstrap env files, start the datastores, apply
+# migrations, then build and start all four services detached.
+#
+# Ctrl-C is not needed: the services run in the background. `just run-logs`
+# follows their output and `just stop` tears everything down without deleting
+# the pgdata volume.
+#
+# Start datastores, migrate, then build and run all four services.
+run: env infra-up migrate
+    @for svc in engine spider indexer ranking; do \
+        echo "==> building and starting services/$svc"; \
+        docker compose -f services/$svc/docker-compose.yml up -d --build || exit 1; \
+    done
+    @echo ""
+    @echo "boogle is up:"
+    @echo "  engine  http://localhost:1323"
+    @echo "  adminer http://127.0.0.1:8080"
+    @echo "  broker  http://127.0.0.1:15672"
+    @echo ""
+    @echo "follow logs with: just run-logs"
+    @echo "stop with:        just stop"
+
+# Follow all four services in one terminal. Ctrl-C stops only the log streams.
+run-logs:
+    @docker logs -f --tail=100 engine & \
+     docker logs -f --tail=100 spider & \
+     docker logs -f --tail=100 indexer & \
+     docker logs -f --tail=100 ranking & \
+     wait
+
+# Stop the services and the datastores. The pgdata volume is kept.
+stop:
+    @for svc in engine spider indexer ranking; do \
+        docker compose -f services/$svc/docker-compose.yml down; \
+    done
+    docker compose down
 
 infra-down:
     docker compose down
