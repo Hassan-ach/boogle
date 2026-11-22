@@ -7,7 +7,9 @@ WORKDIR /app
 COPY . .
 
 ENV SQLX_OFFLINE=true
-ENV RUSTFLAGS="-C target-cpu=native"
+# Baseline x86-64-v2 instead of -C target-cpu=native: the image is built in CI
+# and may run on an older host, where native instructions abort with SIGILL (M-23).
+ENV RUSTFLAGS="-C target-cpu=x86-64-v2"
 
 RUN rustup target add x86_64-unknown-linux-musl
 RUN cargo build --release --target x86_64-unknown-linux-musl

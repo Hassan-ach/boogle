@@ -45,3 +45,6 @@ CREATE INDEX IF NOT EXISTS idx_pages_unindexed_updated
 -- (word_id, page_id) already serves every lookup and uniqueness check the
 -- single-column index served, so it is pure write cost.
 DROP INDEX IF EXISTS idx_page_word_word_id;
+
+-- The monitor orchestrator was removed; nothing reads or writes this table.
+DROP TABLE IF EXISTS monitor_state;

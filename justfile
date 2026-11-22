@@ -51,6 +51,10 @@ infra-down:
 test-db:
     bash scripts/setup-test-db.sh
 
+# Apply migration/*.sql to the running compose database. Idempotent.
+migrate:
+    ./scripts/migrate.sh
+
 # Run the integration suites. Resets the test database first so the schema
 # matches the migrations rather than drifting with whatever was left behind.
 #

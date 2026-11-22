@@ -7,8 +7,6 @@ data/
 .scannerwork/
 *.log
 .env
-*.svg
-*.txt
 # === Rust ===
 target/
 **/*.rs.bk

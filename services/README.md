@@ -19,9 +19,12 @@ Web → Spider (RabbitMQ) → Indexer (RabbitMQ) → Ranking (RabbitMQ) → Engi
 
 ## Quick Start
 
-From root:
+From root, see the top-level README for the full sequence:
 ```bash
-docker-compose up
+docker compose up -d --build      # infrastructure
+./scripts/migrate.sh
+docker compose -f services/spider/docker-compose.yml up -d --build
+# ...indexer, ranking, engine
 open http://localhost:1323
 ```
 
@@ -58,6 +61,6 @@ Spider → pages, urls, graph_edges tables
 
 1. Copy root `.env.example` to `.env`
 2. Customize if needed
-3. Run `docker-compose up`
+3. Follow the Quick Start in the top-level README (`docker compose`, Compose V2)
 
 See [root README](../README.md) for details.

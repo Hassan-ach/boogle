@@ -16,13 +16,29 @@ A 2000s-style search engine built for educational purposes.
 ## Quick Start
 
 ```bash
-# Copy and configure environment
+# 1. Configure every service. Replace all "change-me-*" values with real
+#    secrets; the database, Redis and RabbitMQ examples must agree.
 cp .env.example .env
+cp services/engine/.env.example services/engine/.env
+cp services/spider/.env.example services/spider/.env
+cp services/indexer/.env.example services/indexer/.env
+cp services/ranking/.env.example services/ranking/.env
 
-# Deploy everything (creates network, builds images, starts all services)
-./deploy.sh
+# 2. Start the shared infrastructure (creates the search_net network and the
+#    pgdata volume). Datastores publish on 127.0.0.1 only.
+docker compose up -d --build
 
-# Open browser
+# 3. Apply migrations. Safe to re-run; required for an existing database
+#    because Postgres only runs init scripts on an empty PGDATA.
+./scripts/migrate.sh
+
+# 4. Start the four services.
+docker compose -f services/spider/docker-compose.yml  up -d --build
+docker compose -f services/indexer/docker-compose.yml up -d --build
+docker compose -f services/ranking/docker-compose.yml up -d --build
+docker compose -f services/engine/docker-compose.yml  up -d --build
+
+# 5. Open the engine
 open http://localhost:1323
 ```
 
@@ -51,15 +67,22 @@ All other dependencies (PostgreSQL, Redis, language runtimes) run inside contain
 ## Setup
 
 1. Clone the repo and `cd` into it
-2. Copy `.env.example` to `.env` and fill in real secrets
-3. Copy each `services/<svc>/.env.example` to `services/<svc>/.env`
-4. Run `./deploy.sh`
+2. Copy `.env.example` to `.env` and replace every placeholder secret
+3. Copy each `services/<svc>/.env.example` to `services/<svc>/.env` and keep the
+   shared values identical (database, Redis and broker credentials)
+4. Follow the Quick Start above
 
-For a full teardown and clean rebuild:
+To rebuild after changing code:
 
 ```bash
-./deploy.sh --pull --build --restart
+docker compose -f services/<svc>/docker-compose.yml up -d --build
 ```
+
+### Data and teardown
+
+The corpus lives in the `pgdata` Docker volume. `docker compose down` keeps it;
+`docker compose down -v` deletes Postgres data permanently. Redis holds only
+crawl frontier state, so losing it costs a re-crawl, not the index.
 
 ## Docs
 

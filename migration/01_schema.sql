@@ -46,13 +46,6 @@ CREATE TABLE page_rank (
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
--- Monitor orchestrator state
-CREATE TABLE IF NOT EXISTS monitor_state (
-  key TEXT PRIMARY KEY,
-  value BIGINT NOT NULL,
-  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
-
 -- CREATE TABLE image_page (
 --     image_url TEXT NOT NULL,
 --     page_id  UUID NOT NULL,
