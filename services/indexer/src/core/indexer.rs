@@ -85,9 +85,26 @@ where
     }
     pub async fn handler(&self, body: Vec<u8>) -> Result<(), AppError> {
         let job: Job = serde_json::from_slice(&body)?;
-        let page = self.db.get_page_by_id(job.page_id).await?;
+        let page = self
+            .db
+            .get_page_by_id(job.page_id, self.conf.max_index_attempts)
+            .await?;
         self.index_page(page).await?;
         Ok(())
+    }
+
+    /// Releases a claim without hiding the failure that triggered it.
+    ///
+    /// A failed undo must not replace the original error: `should_requeue`
+    /// classifies by error kind, and turning a parse failure into a database
+    /// error would change whether the message is retried.
+    async fn release_claim(&self, page_id: Uuid) {
+        if let Err(undo_err) = self.db.undo_indexing(page_id).await {
+            error!(self.log, "failed to release the page claim";
+                   "page_id" => page_id.to_string(),
+                   "error" => undo_err.to_string()
+            );
+        }
     }
 
     pub async fn index_loop(self: Arc<Self>, tk: CancellationToken) -> Result<Consumer, AppError> {
@@ -204,7 +221,7 @@ where
                        "url_id" => page.url_id.to_string(),
                        "error" => err.to_string()
                 );
-                self.db.undo_indexing(page.id).await?;
+                self.release_claim(page.id).await;
                 return Err(AppError::ParseError(format!(
                     "Failed to parse page: {}",
                     err
@@ -216,7 +233,7 @@ where
                        "url_id" => page.url_id.to_string(),
                        "error" => err.to_string()
                 );
-                self.db.undo_indexing(page.id).await?;
+                self.release_claim(page.id).await;
                 return Err(AppError::Other(format!(
                     "Failed to spawn blocking task: {}",
                     err
@@ -224,13 +241,13 @@ where
             }
         };
 
-        match retry_async(MAX_ATTEMPTS, || async {
+        match retry_async(self.conf.max_retries.max(1), || async {
             self.db.batch_words(&words, page.id).await
         })
         .await
         {
             Ok(_) => {
-                info!(self.log, "successfully indexed page";
+                info!(self.log, "wrote the word index for page";
                      "page_id" => page.id.to_string(),
                      "url_id" => page.url_id.to_string(),
                      "word_count" => words.len()
@@ -242,16 +259,28 @@ where
                        "url_id" => page.url_id.to_string(),
                        "error" => err.to_string()
                 );
-                self.db.undo_indexing(page.id).await?;
+                self.release_claim(page.id).await;
                 return Err(err);
             }
         }
 
-        match retry_sync(MAX_ATTEMPTS, || {
+        // Publish the confirmation before recording completion. The two writes
+        // cannot share a transaction with the broker, so the order decides which
+        // failure is recoverable:
+        //
+        //   publish then mark  -> a mark failure leaves the page unmarked, the
+        //                         sweep reclaims it, and ranking sees the
+        //                         confirmation twice. Duplicate confirmations are
+        //                         harmless; a missing one starves ranking.
+        //   mark then publish  -> a publish failure acks an already-complete
+        //                         page, and nothing revisits it (H-10).
+        //
+        // A publish failure releases the claim, so the job is nacked and retried.
+        match retry_sync(self.conf.max_retries.max(1), || {
             serde_json::to_vec(&IndexConfirmation { page_id: page.id })
         }) {
             Ok(payload) => {
-                if let Err(err) = retry_async(MAX_ATTEMPTS, || async {
+                if let Err(err) = retry_async(self.conf.max_retries.max(1), || async {
                     self.mq
                         .publish_with_confirm(&self.conf.confirmation_queue_name, payload.clone())
                         .await
@@ -263,6 +292,8 @@ where
                            "url_id" => page.url_id.to_string(),
                            "error" => err.to_string()
                     );
+                    self.release_claim(page.id).await;
+                    return Err(err);
                 }
             }
             Err(err) => {
@@ -271,10 +302,30 @@ where
                        "url_id" => page.url_id.to_string(),
                        "error" => err.to_string()
                 );
+                self.release_claim(page.id).await;
+                return Err(AppError::SerdeError(err));
             }
         }
 
-        return Ok(());
+        // No retry here: NotFound is permanent, and a transient failure is
+        // recoverable because releasing the claim lets the sweep redeliver it.
+        if let Err(err) = self.db.mark_indexed(page.id).await {
+            error!(self.log, "failed to mark page as indexed";
+                   "page_id" => page.id.to_string(),
+                   "url_id" => page.url_id.to_string(),
+                   "error" => err.to_string()
+            );
+            self.release_claim(page.id).await;
+            return Err(err);
+        }
+
+        info!(self.log, "successfully indexed page";
+             "page_id" => page.id.to_string(),
+             "url_id" => page.url_id.to_string(),
+             "word_count" => words.len()
+        );
+
+        Ok(())
     }
 }
 
@@ -312,7 +363,11 @@ where
 
             match self
                 .db
-                .get_stale_unindexed(self.conf.sweep_grace, 500)
+                .get_stale_unindexed(
+                    self.conf.sweep_grace,
+                    self.conf.sweep_batch_size,
+                    self.conf.max_index_attempts,
+                )
                 .await
             {
                 Ok(ids) if ids.is_empty() => {}
@@ -364,6 +419,9 @@ mod tests {
             max_concurrent_tasks: 4,
             sweep_interval: Duration::from_secs(300),
             sweep_grace: Duration::from_secs(600),
+            sweep_batch_size: 500,
+            max_index_attempts: 3,
+            max_retries: 3,
             confirmation_queue_name: "indexer.confirmations".into(),
         }
     }
@@ -373,6 +431,7 @@ mod tests {
         page: Mutex<Option<Page>>,
         batch_failures_remaining: AtomicUsize,
         undo_calls: AtomicUsize,
+        marked_indexed: AtomicUsize,
         closed: AtomicUsize,
         batched_words: Mutex<Vec<HashMap<String, u32>>>,
         stale: Mutex<Vec<Uuid>>,
@@ -410,7 +469,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl DB for MockDB {
-        async fn get_page_by_id(&self, _page_id: Uuid) -> Result<Page, AppError> {
+        async fn get_page_by_id(
+            &self,
+            _page_id: Uuid,
+            _max_attempts: i32,
+        ) -> Result<Page, AppError> {
             Ok(self.page.lock().unwrap().clone().unwrap())
         }
 
@@ -440,10 +503,16 @@ mod tests {
             self.closed.fetch_add(1, Ordering::SeqCst);
         }
 
+        async fn mark_indexed(&self, _page_id: Uuid) -> Result<(), AppError> {
+            self.marked_indexed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
         async fn get_stale_unindexed(
             &self,
             _older_than: Duration,
             _limit: i64,
+            _max_attempts: i32,
         ) -> Result<Vec<Uuid>, AppError> {
             self.sweep_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.stale.lock().unwrap().clone())
@@ -608,7 +677,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn index_page_keeps_the_page_indexed_when_confirmation_publish_fails() {
+    async fn index_page_releases_the_claim_when_confirmation_publish_fails() {
         let db = MockDB::with_page("<body>alpha</body>");
         let mq = MockMQ {
             publish_failures_remaining: AtomicUsize::new(99),
@@ -619,9 +688,42 @@ mod tests {
 
         let result = indexer.index_page(page).await;
 
-        assert!(result.is_ok(), "publish failure must not fail indexing");
-        assert_eq!(indexer.db.undo_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(indexer.db.batched_words.lock().unwrap().len(), 1);
+        let err = result.expect_err("a lost confirmation must be retryable");
+        assert!(
+            matches!(err, AppError::Messaging(_)),
+            "unexpected error kind: {err:?}"
+        );
+        assert!(
+            should_requeue(&err),
+            "the job must go back on the queue so ranking is not starved"
+        );
+        assert_eq!(
+            indexer.db.undo_calls.load(Ordering::SeqCst),
+            1,
+            "the claim must be released while the page is unconfirmed"
+        );
+        assert_eq!(
+            indexer.db.marked_indexed.load(Ordering::SeqCst),
+            0,
+            "a page must never be marked indexed before its confirmation lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_page_marks_the_page_complete_only_after_the_confirmation() {
+        let db = MockDB::with_page("<body>alpha</body>");
+        let mq = MockMQ::default();
+        let indexer = Indexer::new(db, mq, app_config(), discard_logger());
+        let page = indexer.db.page.lock().unwrap().clone().unwrap();
+
+        indexer.index_page(page).await.expect("index");
+
+        assert_eq!(indexer.mq.confirmed.lock().unwrap().len(), 1);
+        assert_eq!(
+            indexer.db.marked_indexed.load(Ordering::SeqCst),
+            1,
+            "the success marker is what stops the sweep rebuilding the page"
+        );
     }
 
     #[tokio::test]

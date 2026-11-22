@@ -15,6 +15,7 @@ CREATE TABLE pages (
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
     last_index_attempt_at TIMESTAMP,
+    indexed_at TIMESTAMP,
     index_attempts INT NOT NULL DEFAULT 0
 );
 
@@ -64,7 +65,6 @@ CREATE TABLE IF NOT EXISTS monitor_state (
 CREATE UNIQUE INDEX idx_words_word ON words(word);
 CREATE UNIQUE INDEX idx_pages_url_id ON pages(url_id);
 CREATE INDEX idx_page_word_page_id ON page_word(page_id);
-CREATE INDEX idx_page_word_word_id ON page_word(word_id);
 CREATE UNIQUE INDEX idx_page_word_word_page ON page_word(word_id, page_id);
 CREATE INDEX idx_graph_edges_from_page ON graph_edges(from_url);
 CREATE INDEX idx_graph_edges_to_page ON graph_edges(to_url);
