@@ -2,6 +2,7 @@ services:
   ranking:
     build: .
     container_name: ranking
+    restart: unless-stopped
     env_file:
       - .env
     networks:
@@ -9,3 +10,4 @@ services:
 networks:
   search_net:
     external: true
+    name: search_net

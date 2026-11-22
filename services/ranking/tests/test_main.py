@@ -18,8 +18,18 @@ PG_VARS = ["PG_HOST", "PG_PORT", "PG_DBNAME", "PG_USER", "PG_PASSWORD"]
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for key in PG_VARS + ["DATABASE_URL", "BROKER_URL", "RABBITMQ_URL"]:
+    for key in PG_VARS + [
+        "DATABASE_URL",
+        "BROKER_URL",
+        "RABBITMQ_URL",
+        "LOG_PATH",
+        "RANKING_CONFIRMATION_THRESHOLD",
+        "RANKING_RUN_ON_STARTUP",
+    ]:
         monkeypatch.delenv(key, raising=False)
+    # RankingService constructs its consumer eagerly, and messaging fails closed
+    # without a broker URL. Individual tests remove this when they exercise that.
+    monkeypatch.setenv("BROKER_URL", "amqp://admin:admin@rabbit:5672")
 
 
 def set_pg_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
@@ -68,8 +78,9 @@ def test_database_url_satisfies_every_pg_requirement(monkeypatch: pytest.MonkeyP
 
 def test_missing_broker_url_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     set_pg_env(monkeypatch)
+    monkeypatch.delenv("BROKER_URL", raising=False)
 
-    with pytest.raises(ValueError, match="BROKER_URL or RABBITMQ_URL"):
+    with pytest.raises(ValueError, match="BROKER_URL/RABBITMQ_URL"):
         RankingService.validate_environment()
 
 
@@ -178,19 +189,10 @@ def test_formatter_round_trips_braces_quotes_and_percent_signs() -> None:
     assert payload["message"] == message
 
 
-def test_configure_logging_attaches_json_to_both_handlers(
+def test_configure_logging_defaults_to_stdout_only(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Any,
 ) -> None:
-    files: list[logging.FileHandler] = []
     basic_configs: list[dict[str, Any]] = []
-
-    class RecordingFileHandler(logging.FileHandler):
-        def __init__(self, filename: str) -> None:
-            super().__init__(str(tmp_path / "ranking.log"))
-            files.append(self)
-
-    monkeypatch.setattr(logging, "FileHandler", RecordingFileHandler)
     monkeypatch.setattr(
         logging, "basicConfig", lambda **kwargs: basic_configs.append(kwargs)
     )
@@ -203,16 +205,61 @@ def test_configure_logging_attaches_json_to_both_handlers(
     finally:
         root.handlers = original
 
-    assert len(files) == 1, "the log file must not be the only sink"
     assert len(basic_configs) == 1
     handlers = basic_configs[0]["handlers"]
+    assert len(handlers) == 1, "a container log sink must be stdout"
+    assert isinstance(handlers[0], logging.StreamHandler)
+    assert isinstance(handlers[0].formatter, JsonFormatter)
+    assert basic_configs[0]["level"] == logging.INFO
+
+
+def test_configure_logging_adds_an_opt_in_file_sink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    log_path = tmp_path / "ranking.jsonl"
+    monkeypatch.setenv("LOG_PATH", str(log_path))
+    basic_configs: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        logging, "basicConfig", lambda **kwargs: basic_configs.append(kwargs)
+    )
+
+    root = logging.getLogger()
+    original = list(root.handlers)
+    root.handlers = []
+    try:
+        RankingService.configure_logging()
+    finally:
+        root.handlers = original
+
+    handlers = basic_configs[0]["handlers"]
     assert len(handlers) == 2
-    assert isinstance(handlers[0], RecordingFileHandler)
-    assert isinstance(handlers[1], logging.StreamHandler)
+    assert isinstance(handlers[0], logging.StreamHandler)
+    assert isinstance(handlers[1], logging.FileHandler)
     for handler in handlers:
         assert isinstance(handler.formatter, JsonFormatter)
 
-    assert basic_configs[0]["level"] == logging.INFO
+
+def test_an_unwritable_log_path_does_not_stop_the_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LOG_PATH", "/proc/definitely-not-writable.log")
+    basic_configs: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        logging, "basicConfig", lambda **kwargs: basic_configs.append(kwargs)
+    )
+
+    root = logging.getLogger()
+    original = list(root.handlers)
+    root.handlers = []
+    try:
+        RankingService.configure_logging()
+    finally:
+        root.handlers = original
+
+    handlers = basic_configs[0]["handlers"]
+    assert len(handlers) == 1
+    assert isinstance(handlers[0], logging.StreamHandler)
 
 
 def test_configure_logging_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -234,60 +281,64 @@ def test_configure_logging_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> Non
         root.handlers = original
 
 
-def test_shutdown_closes_the_database_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stop_asks_faststream_to_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     service = RankingService()
-    closed = 0
+    exited: list[bool] = []
 
-    async def fake_close() -> None:
-        nonlocal closed
-        closed += 1
+    monkeypatch.setattr(service.messaging.app, "exit", lambda: exited.append(True))
 
-    monkeypatch.setattr(service.db_manager, "close", fake_close)
+    asyncio.run(service.messaging.stop())
 
-    asyncio.run(service.shutdown("SIGTERM"))
-
-    assert closed == 1
+    assert exited == [True], "stop() must release FastStream's run loop"
+    assert service.messaging._stopping
 
 
-def test_signal_handlers_are_registered_for_int_and_term(
+def test_drain_cancels_and_awaits_inflight_pipeline_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = RankingService()
-    registered: list[signal.Signals] = []
+    cancelled: list[bool] = []
 
-    class FakeLoop:
-        def add_signal_handler(self, signum: Any, handler: Any) -> None:
-            registered.append(signum)
+    async def slow_pipeline() -> None:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
 
-    service.setup_signal_handlers(FakeLoop())
-
-    assert set(registered) == {signal.SIGINT, signal.SIGTERM}
-
-
-def test_signal_handlers_trigger_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
-    service = RankingService()
-    shutdowns: list[str] = []
-
-    async def fake_shutdown(name: str) -> None:
-        shutdowns.append(name)
-
-    monkeypatch.setattr(service, "shutdown", fake_shutdown)
-
-    handlers: list[Any] = []
-
-    class FakeLoop:
-        def add_signal_handler(self, signum: Any, handler: Any) -> None:
-            handlers.append((signum, handler))
+    service.messaging.register_pipeline_handler(slow_pipeline)
 
     async def drive() -> None:
-        service.setup_signal_handlers(FakeLoop())
-        for _, handler in handlers:
-            handler()
+        service.messaging.trigger_pipeline(force=True)
         await asyncio.sleep(0)
+        await service.messaging.drain()
 
     asyncio.run(drive())
 
-    assert sorted(shutdowns) == ["SIGINT", "SIGTERM"]
+    assert cancelled == [True], "in-flight pipeline work was not torn down"
+    assert not service.messaging._tasks
+
+
+def test_startup_pipeline_runs_even_below_the_confirmation_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = RankingService()
+    calls = 0
+
+    async def pipeline() -> None:
+        nonlocal calls
+        calls += 1
+
+    service.messaging.register_pipeline_handler(pipeline)
+    service.messaging.max_indexer_pages = 1000
+
+    async def drive() -> None:
+        service.messaging.trigger_pipeline(force=True)
+        await asyncio.gather(*list(service.messaging._tasks))
+
+    asyncio.run(drive())
+
+    assert calls == 1
 
 
 def test_start_registers_the_calculator_as_the_pipeline_handler(
@@ -300,7 +351,7 @@ def test_start_registers_the_calculator_as_the_pipeline_handler(
     monkeypatch.setattr(service.messaging, "run", _async_noop)
     monkeypatch.setattr(RankingService, "configure_logging", staticmethod(lambda: None))
     monkeypatch.setattr(main_module, "load_dotenv", lambda *a, **k: None)
-    monkeypatch.setattr(RankingService, "setup_signal_handlers", lambda self, loop: None)
+    monkeypatch.setenv("RANKING_RUN_ON_STARTUP", "false")
     set_pg_env(monkeypatch)
     monkeypatch.setenv("BROKER_URL", "amqp://admin:admin@rabbit:5672")
 
@@ -337,7 +388,6 @@ def test_start_closes_the_database_when_the_consumer_stops(
     monkeypatch.setattr(service.messaging, "run", fake_run)
     monkeypatch.setattr(RankingService, "configure_logging", staticmethod(lambda: None))
     monkeypatch.setattr(main_module, "load_dotenv", lambda *a, **k: None)
-    monkeypatch.setattr(RankingService, "setup_signal_handlers", lambda self, loop: None)
     monkeypatch.setattr(service.db_manager, "initialize", fake_initialize)
     monkeypatch.setattr(service.db_manager, "close", fake_close)
     set_pg_env(monkeypatch)
@@ -347,6 +397,42 @@ def test_start_closes_the_database_when_the_consumer_stops(
         asyncio.run(service.start())
 
     assert closed == 1
+
+
+def test_start_retries_a_database_that_is_still_starting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = RankingService()
+    attempts: list[int] = []
+
+    async def flaky_initialize() -> None:
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise ConnectionError("database is starting")
+
+    async def fake_run() -> None:
+        return None
+
+    async def fake_close() -> None:
+        return None
+
+    monkeypatch.setattr(service.db_manager, "initialize", flaky_initialize)
+    monkeypatch.setattr(service.db_manager, "close", fake_close)
+    monkeypatch.setattr(service.messaging, "run", fake_run)
+    monkeypatch.setattr(RankingService, "configure_logging", staticmethod(lambda: None))
+    monkeypatch.setattr(main_module, "load_dotenv", lambda *a, **k: None)
+    monkeypatch.setenv("RANKING_RUN_ON_STARTUP", "false")
+    set_pg_env(monkeypatch)
+    monkeypatch.setenv("BROKER_URL", "amqp://admin:admin@rabbit:5672")
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(main_module.asyncio, "sleep", no_sleep)
+
+    asyncio.run(service.start())
+
+    assert len(attempts) == 3, "the pool was opened without retrying"
 
 
 def test_start_refuses_to_run_with_an_invalid_environment(monkeypatch: pytest.MonkeyPatch) -> None:

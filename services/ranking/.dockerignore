@@ -1,0 +1,15 @@
+# Repo-wide build-context exclusions. Every service builds with its own
+# directory as context, and .env files must never enter an image layer.
+**/.env
+**/.git
+**/node_modules
+**/venv
+**/__pycache__
+**/target
+**/dist
+**/coverage.out
+**/*.log
+**/logs
+**/.coverage
+**/tmp
+project-review-*.md

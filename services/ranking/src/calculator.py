@@ -110,15 +110,17 @@ class RankingCalculator:
     ) -> None:
         """Run both jobs concurrently on separate pooled connections.
 
-        gather runs them at the same time but does not make them atomic: a
-        failure in one leaves the other's work committed. Each job is a full
-        table rewrite, so a partial run is still internally consistent.
+        A TaskGroup, not gather: on failure it cancels the sibling instead of
+        leaving it to finish and commit alone, and it surfaces the first error
+        after both children are done (M-08). The two jobs are still independent
+        table rewrites, so a cancelled pair leaves the previous scores intact.
         """
         logger.info("Executing full ranking pipeline (IDF + PageRank)...")
-        await asyncio.gather(
-            self.compute_idf(),
-            self.update_pagerank(
-                iterations=iterations, damping_factor=damping_factor
-            ),
-        )
+        async with asyncio.TaskGroup() as group:
+            group.create_task(self.compute_idf())
+            group.create_task(
+                self.update_pagerank(
+                    iterations=iterations, damping_factor=damping_factor
+                )
+            )
         logger.info("Ranking pipeline execution completed.")

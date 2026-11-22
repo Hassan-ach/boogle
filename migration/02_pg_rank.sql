@@ -18,6 +18,10 @@ BEGIN
     WHERE indexed = TRUE;
 
     IF node_num = 0 THEN
+        -- Every page is unindexed, so every stored score is stale. The main
+        -- cleanup at the end of this function is skipped by an early RETURN,
+        -- which used to leave the old ranks in place forever (M-12).
+        DELETE FROM page_rank;
         RETURN;
     END IF;
 
