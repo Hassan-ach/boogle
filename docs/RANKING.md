@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Ranking service is event-driven via RabbitMQ (indexer confirmations). It counts indexed pages and triggers IDF and PageRank computation once a threshold is reached, writing scores to Postgres for fast search result ordering.
+The Ranking service is event-driven via RabbitMQ (indexer confirmations). It counts indexed pages and triggers IDF and PageRank computation once a threshold is reached (`RANKING_CONFIRMATION_THRESHOLD`, default 100), writing scores to Postgres for fast search result ordering. It also runs once at startup (`RANKING_RUN_ON_STARTUP=true`) so a corpus smaller than the threshold is searchable immediately. Logs go to stdout; set `LOG_PATH` to add a file sink.
 
 ## Architecture
 
@@ -161,9 +161,9 @@ def calculate_idf():
 ```
 
 **Update Frequency:**
-- Run once initially
-- Update whenever new pages indexed
-- Usually via scheduled job
+- Once at startup
+- Whenever the confirmation threshold is reached
+- There is no wall-clock scheduler; recomputation is driven by the pipeline
 
 ## PageRank Calculation
 
@@ -217,21 +217,14 @@ RANKING_SCHEDULE_INTERVAL=3600   # Update every hour (seconds)
 | Iterations | Higher = more accurate | 20 usually enough |
 | Schedule | More often = fresher data | Every hour is reasonable |
 
-## Scheduling
+## Triggering
 
-Uses APScheduler:
-
-```python
-scheduler.add_job(
-    update_all_rankings,
-    'interval',
-    seconds=3600,  # Run hourly
-    id='ranking_job'
-)
-scheduler.start()
-```
-
-Runs in background, doesn't block other services.
+The consumer counts `IndexConfirmation` messages. At
+`RANKING_CONFIRMATION_THRESHOLD` (default 100) it starts one pipeline run under a
+lock, using a TaskGroup so a failure in IDF cancels PageRank. Only the batch the
+run covered is consumed; confirmations that arrived meanwhile stay counted, and
+a failed batch stays pending so it is retried instead of lost. The same lock
+guards the startup run.
 
 ## Performance
 
