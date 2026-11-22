@@ -239,7 +239,13 @@ func connectionString(conf store.StoreConfig) string {
 		Path:   conf.DB.DBName,
 	}
 	q := u.Query()
-	q.Set("sslmode", conf.DB.SSLMode)
+	sslMode := conf.DB.SSLMode
+	if sslMode == "" {
+		// lib/pq treats an empty sslmode as "require"; a hand-built config or an
+		// old env file must not silently start negotiating TLS.
+		sslMode = "disable"
+	}
+	q.Set("sslmode", sslMode)
 	q.Set("connect_timeout", "5")
 	// A search that runs away must not hold a pool connection forever.
 	q.Set("statement_timeout", "30000")

@@ -43,3 +43,15 @@ func TestConnectionStringEscapesCredentialsAndKeepsEveryField(t *testing.T) {
 		t.Errorf("statement_timeout = %q, want 30000", timeout)
 	}
 }
+
+func TestAnUnsetSSLModeDefaultsToDisable(t *testing.T) {
+	parsed, err := url.Parse(connectionString(storeconfig.StoreConfig{
+		DB: storeconfig.PsqlConfig{Host: "db", Port: 5432, User: "u", DBName: "boogle"},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := parsed.Query().Get("sslmode"); mode != "disable" {
+		t.Errorf("sslmode = %q, want disable", mode)
+	}
+}
