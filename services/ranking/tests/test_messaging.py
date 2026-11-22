@@ -58,13 +58,14 @@ def test_explicit_arguments_win_over_the_environment(monkeypatch: pytest.MonkeyP
     assert service.queue_name == "indexer.confirmations"
 
 
-def test_queue_name_falls_back_to_the_environment() -> None:
-    os.environ["RABBITMQ_CONFIRMATION_QUEUE"] = "custom.confirmations"
-    try:
-        service = MessagingService(broker_url="amqp://guest:guest@localhost:5672")
-        assert service.queue_name == "custom.confirmations"
-    finally:
-        del os.environ["RABBITMQ_CONFIRMATION_QUEUE"]
+def test_queue_name_falls_back_to_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RABBITMQ_CONFIRMATION_QUEUE", "custom.confirmations")
+
+    service = MessagingService(broker_url="amqp://guest:guest@localhost:5672")
+
+    assert service.queue_name == "custom.confirmations"
 
 
 def test_broker_credentials_are_built_from_the_individual_variables(

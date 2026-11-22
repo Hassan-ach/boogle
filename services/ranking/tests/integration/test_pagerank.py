@@ -316,3 +316,19 @@ def test_pagerankScoresAreNeverNegative(graph: GraphBuilder) -> None:
 
     for name, score in scores.items():
         assert score >= 0.0, f"{name} has a negative score: {score}"
+
+
+def test_pagerankStoresReciprocalEdgesInBothDirections(graph: GraphBuilder) -> None:
+    graph.page("a")
+    graph.page("b")
+    graph.edge("a", "b")
+    graph.edge("b", "a")
+
+    # The old reverse unique index dropped the second insert, so the graph lost
+    # half of every mutual link (H-15).
+    expected = {(graph.url("a"), graph.url("b")), (graph.url("b"), graph.url("a"))}
+    if not expected.issubset(set(graph.edge_rows())):
+        raise AssertionError(f"reciprocal edge missing: {graph.edge_rows()}")
+
+    scores = graph.run_pagerank_scores(iterations=30, damping=0.85)
+    assert math.isclose(scores["a"], scores["b"], rel_tol=1e-6), scores

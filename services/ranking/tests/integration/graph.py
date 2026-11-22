@@ -57,6 +57,10 @@ class GraphBuilder:
             (self.url(source), self.url(target)),
         )
 
+    def edge_rows(self) -> list[tuple[str, str]]:
+        self._cursor.execute("SELECT from_url::text, to_url::text FROM graph_edges")
+        return [(str(f), str(t)) for f, t in self._cursor.fetchall()]
+
     def chain(self, names: Sequence[str]) -> None:
         for name in names:
             self.page(name)
