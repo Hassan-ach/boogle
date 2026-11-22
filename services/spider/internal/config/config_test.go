@@ -350,3 +350,30 @@ func TestPolicyConfigDefaultsAreSelfConsistent(t *testing.T) {
 		t.Error("HostColdPeriod is not positive; the page budget could never roll over")
 	}
 }
+
+func TestTheJobQueueDefaultsToTheIndexerQueue(t *testing.T) {
+	t.Setenv("RABBITMQ_QUEUE", "")
+	t.Setenv("RABBITMQ_JOB_QUEUE", "")
+
+	if got := jobQueueName(); got != "indexer.jobs" {
+		t.Fatalf("spider publishes to %q, indexer consumes indexer.jobs", got)
+	}
+}
+
+func TestRabbitmqQueueWinsOverTheLegacyJobQueueName(t *testing.T) {
+	t.Setenv("RABBITMQ_QUEUE", "contract.queue")
+	t.Setenv("RABBITMQ_JOB_QUEUE", "legacy.queue")
+
+	if got := jobQueueName(); got != "contract.queue" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestTheLegacyJobQueueNameIsStillRead(t *testing.T) {
+	t.Setenv("RABBITMQ_QUEUE", "")
+	t.Setenv("RABBITMQ_JOB_QUEUE", "legacy.queue")
+
+	if got := jobQueueName(); got != "legacy.queue" {
+		t.Fatalf("got %q", got)
+	}
+}

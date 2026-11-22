@@ -6,7 +6,7 @@ RUN apk add --no-cache \
     build-base \
     just
 
-RUN go install github.com/a-h/templ/cmd/templ@latest
+RUN go install github.com/a-h/templ/cmd/templ@v0.3.943
 
 COPY go.mod go.sum ./
 RUN go mod download

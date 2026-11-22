@@ -57,6 +57,9 @@ func (p *Parser) ParseHTML(r io.Reader, baseURL string) (*entity.Page, error) {
 	)
 
 	return &entity.Page{
+		// Identity is the URL the spider fetched. Everything the document claims
+		// about its own address stays in metadata.
+		URL:      baseURL,
 		MetaData: c.Meta,
 		Links: utils.NewSetFromSlice(
 			utils.CanonicalizeUrls(c.Links, u.Host)).GetAll(),

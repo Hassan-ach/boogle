@@ -73,3 +73,41 @@ func TestAPageThatListsTheSameURLTwiceCrawlsItOnce(t *testing.T) {
 		}
 	}
 }
+
+func TestA_FetchedPagesIdentityIsTheFetchedURLNotOgURL(t *testing.T) {
+	html := `<!doctype html><html lang="en"><head>` +
+		`<meta property="og:url" content="https://victim.example/trusted">` +
+		`<title>attacker</title></head><body>hello</body></html>`
+
+	p := NewParser(nil, newTestLogger())
+	page, err := p.ParseHTML(strings.NewReader(html), "https://evil.example/page")
+	if err != nil {
+		t.Fatalf("ParseHTML failed: %v", err)
+	}
+
+	if page.URL != "https://evil.example/page" {
+		t.Fatalf("identity followed og:url to %q", page.URL)
+	}
+	if page.MetaData.OgURL != "" {
+		t.Errorf("a cross-host og:url was kept as metadata: %q", page.MetaData.OgURL)
+	}
+}
+
+func TestOgURLOnTheSameHostIsKeptAsDisplayMetadata(t *testing.T) {
+	html := `<!doctype html><html lang="en"><head>` +
+		`<meta property="og:url" content="https://example.com/canonical">` +
+		`<title>t</title></head><body>hello</body></html>`
+
+	p := NewParser(nil, newTestLogger())
+	page, err := p.ParseHTML(strings.NewReader(html), "https://example.com/page")
+	if err != nil {
+		t.Fatalf("ParseHTML failed: %v", err)
+	}
+
+	if page.URL != "https://example.com/page" {
+		t.Fatalf("identity changed to %q", page.URL)
+	}
+	if page.MetaData.OgURL != "https://example.com/canonical" {
+		t.Errorf("same-host og:url was dropped: %q", page.MetaData.OgURL)
+	}
+}

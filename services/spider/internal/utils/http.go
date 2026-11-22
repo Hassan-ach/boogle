@@ -10,6 +10,14 @@ import (
 
 const MaxResponseBytes = 10 << 20
 
+// Redirects followed when the caller does not set a limit. Bounded so a
+// redirect chain cannot keep one worker busy indefinitely.
+const defaultMaxRedirects = 10
+
+// ErrRedirectScheme marks a redirect the crawler refuses to follow, so the
+// policy layer can retire the URL instead of retrying it.
+var ErrRedirectScheme = errors.New("redirect to an unsupported scheme")
+
 const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.5993.118 Safari/537.36"
 
 type Response struct {
@@ -57,11 +65,25 @@ func GetReq(ctx context.Context, client *http.Client, rawURL string, opts GetOpt
 	followed := 0
 
 	sender := *client
-	if opts.MaxRedirects > 0 {
-		sender.CheckRedirect = func(_ *http.Request, via []*http.Request) error {
+	// A caller that installed its own redirect policy without asking for a limit
+	// keeps it. Otherwise install a bounded policy: the transport dialer blocks
+	// private destinations, and this stops a page from bouncing the crawler
+	// through unlimited hops or into a non-HTTP scheme.
+	if opts.MaxRedirects > 0 || sender.CheckRedirect == nil {
+		maxRedirects := opts.MaxRedirects
+		if maxRedirects <= 0 {
+			maxRedirects = defaultMaxRedirects
+		}
+		sender.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			followed = len(via)
-			if followed > opts.MaxRedirects {
+			if followed > maxRedirects {
 				return http.ErrUseLastResponse
+			}
+			if req.URL == nil {
+				return errors.New("redirect without a target URL")
+			}
+			if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+				return fmt.Errorf("%w: %q", ErrRedirectScheme, req.URL.Scheme)
 			}
 			return nil
 		}

@@ -6,12 +6,15 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"net"
+	"net/http"
 	"strconv"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
+	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
 
 type timeoutErr struct{ msg string }
@@ -1130,3 +1133,29 @@ func TestHostOfURLReportsNothingForSomethingUnparseable(t *testing.T) {
 }
 
 var _ net.Error = timeoutError{}
+
+func TestATruncatedTwoHundredBacksOffInsteadOfIndexingHalfAPage(t *testing.T) {
+	cfg := DefaultConfig()
+	out := Outcome{
+		StatusCode:  http.StatusOK,
+		ContentType: "text/html",
+		Err:         errors.New("unexpected EOF"),
+	}
+
+	kind, reason := categorize(out, &cfg)
+
+	if kind != ActBackoff || reason != ReasonTruncatedBody {
+		t.Fatalf("categorize = (%v, %v), want (backoff, %v)", kind, reason, ReasonTruncatedBody)
+	}
+}
+
+func TestARedirectToAnotherSchemeIsPermanent(t *testing.T) {
+	cfg := DefaultConfig()
+	out := Outcome{Err: fmt.Errorf("%w: ftp", utils.ErrRedirectScheme)}
+
+	kind, _ := categorize(out, &cfg)
+
+	if kind != ActPermanent {
+		t.Fatalf("categorize = %v, want permanent", kind)
+	}
+}

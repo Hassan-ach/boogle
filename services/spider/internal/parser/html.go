@@ -66,8 +66,8 @@ func (c *htmlCollector) Visit(n *html.Node) {
 }
 
 func (c *htmlCollector) mergeMeta(other entity.MetaData) entity.MetaData {
-	if other.URL != "" {
-		c.Meta.URL = other.URL
+	if other.OgURL != "" && sameHost(c.BaseURL, other.OgURL) {
+		c.Meta.OgURL = other.OgURL
 	}
 	if other.Title != "" {
 		c.Meta.Title = other.Title

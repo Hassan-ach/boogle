@@ -121,6 +121,7 @@ const (
 	ReasonTimeout             Reason = "timeout"
 	ReasonRedirectLoop        Reason = "redirect_loop"
 	ReasonBodyTooLarge        Reason = "body_too_large"
+	ReasonTruncatedBody       Reason = "truncated_body"
 	ReasonContentTypeRejected Reason = "content_type_unsupported"
 	ReasonAttemptsExhausted   Reason = "attempts_exhausted"
 	ReasonBodyUnparseable     Reason = "body_unparseable"

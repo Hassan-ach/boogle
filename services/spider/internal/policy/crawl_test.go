@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 )
 
 func TestTakeNextPromotesDueRetriesBeforePopping(t *testing.T) {
@@ -307,5 +309,32 @@ func TestParkAndRetireAreTheTwoHalvesOfAVerdict(t *testing.T) {
 	}
 	if next.URL == "https://example.com/skipped" {
 		t.Error("a retired url was handed out; Skip is not terminal")
+	}
+}
+
+func TestRequeueSpendsTheAttemptBudget(t *testing.T) {
+	st := state.NewMemoryState()
+	cfg := DefaultConfig()
+	cfg.URLMaxAttempts = 2
+	m := New(cfg, st, testLogger())
+	ctx := context.Background()
+	const target = "https://example.com/requeue"
+
+	if err := m.Requeue(ctx, target); err != nil {
+		t.Fatalf("first requeue: %v", err)
+	}
+	if _, ok := st.Delayed()[target]; !ok {
+		t.Fatal("the first requeue did not park the URL")
+	}
+
+	if err := m.Requeue(ctx, target); err != nil {
+		t.Fatalf("second requeue: %v", err)
+	}
+	visited, err := st.IsVisited(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !visited {
+		t.Error("a URL that exhausted its requeue budget was not retired")
 	}
 }

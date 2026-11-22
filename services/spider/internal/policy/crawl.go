@@ -91,6 +91,22 @@ func (m *PolicyManager) Retire(ctx context.Context, url string) error {
 	return m.st.MarkVisited(ctx, url)
 }
 
+// Requeue returns a URL to the frontier after an internal failure that the
+// classification path never saw. It spends the same attempt budget and uses the
+// same backoff as a failed fetch, so a URL that keeps breaking the crawler is
+// eventually retired instead of being refetched every requeue delay forever.
+func (m *PolicyManager) Requeue(ctx context.Context, url string) error {
+	attempts, err := m.st.BumpAttempts(ctx, url)
+	if err != nil {
+		return err
+	}
+	if attempts >= m.cfg.URLMaxAttempts {
+		return m.Retire(ctx, url)
+	}
+	due := m.now().Add(m.cfg.URLBackoff(attempts))
+	return m.Park(ctx, url, due)
+}
+
 var errNoFetcher = errors.New("no fetcher configured")
 
 type Fetcher func(ctx context.Context, url string) ([]byte, Outcome)

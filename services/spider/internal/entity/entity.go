@@ -5,7 +5,11 @@ import (
 )
 
 type MetaData struct {
-	URL         string    `json:"url"`
+	// OgURL is the publisher's claimed canonical URL (`<meta property="og:url">`).
+	// It is display metadata only. Page identity is Page.URL, which is always the
+	// URL the spider fetched, because a page must not be able to choose which
+	// row of the index it overwrites.
+	OgURL       string    `json:"ogUrl,omitempty"`
 	Title       string    `json:"title,omitempty"`
 	Description string    `json:"description,omitempty"`
 	Type        string    `json:"type,omitempty"`
@@ -18,6 +22,9 @@ type MetaData struct {
 }
 
 type Page struct {
+	// URL is storage identity: the URL that was fetched, not anything the page
+	// asserts about itself.
+	URL string `json:"url"`
 	MetaData
 	StatusCode int
 	HTML       []byte

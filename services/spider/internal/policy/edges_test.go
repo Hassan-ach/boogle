@@ -211,6 +211,7 @@ func TestReasonStringsAreDistinct(t *testing.T) {
 		ReasonTimeout,
 		ReasonRedirectLoop,
 		ReasonBodyTooLarge,
+		ReasonTruncatedBody,
 		ReasonContentTypeRejected,
 		ReasonAttemptsExhausted,
 		ReasonBodyUnparseable,

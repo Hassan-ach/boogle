@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Hassan-ach/boogle/services/spider/internal/state"
+	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
 
 var ErrRedirectLoop = errors.New("redirect limit exceeded")
@@ -35,8 +36,21 @@ func categorize(out Outcome, cfg *Config) (ActionKind, Reason) {
 	if errors.Is(out.Err, ErrRedirectLoop) {
 		return ActPermanent, ReasonRedirectLoop
 	}
+	if errors.Is(out.Err, utils.ErrRedirectScheme) {
+		// A redirect to ftp:// or file:// fails identically on every attempt;
+		// retrying it costs the full URL budget for no chance of success.
+		return ActPermanent, ReasonNonHTTPScheme
+	}
 	if cfg.MaxRedirects > 0 && out.Redirects > cfg.MaxRedirects {
 		return ActPermanent, ReasonRedirectLoop
+	}
+
+	// A body that fails mid-stream still carries the response's status line, so
+	// checking the status first would classify a truncated 200 as a successful
+	// fetch and index half a page (M-17). The status gates still apply when the
+	// transfer completed.
+	if out.Err != nil && out.StatusCode >= 200 && out.StatusCode < 300 {
+		return ActBackoff, ReasonTruncatedBody
 	}
 
 	if out.StatusCode != 0 {

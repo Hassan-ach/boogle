@@ -198,7 +198,7 @@ func loadRabbitMqConfig() RabbitMqConfig {
 	password := Secret(getWithDefault("RABBITMQ_PASSWORD", "guest"))
 	host := getWithDefault("RABBITMQ_HOST", "localhost")
 	port := getIntWithDefault("RABBITMQ_PORT", 5672)
-	jobQueue := getWithDefault("RABBITMQ_JOB_QUEUE", "indexer.job")
+	jobQueue := jobQueueName()
 
 	return RabbitMqConfig{
 		protocol,
@@ -262,7 +262,7 @@ func loadAppConfig() AppConfig {
 	maxConcurrentFetch := getIntWithDefault("MAX_CONCURRENT_FETCH", 200)
 	logsPath := getWithDefault("LOGS_PATH", "./logs.json")
 	clawlerDelay := getIntWithDefault("CRAWLER_DELAY", 200)
-	jobQueue := getWithDefault("RABBITMQ_JOB_QUEUE", "indexer.job")
+	jobQueue := jobQueueName()
 	return AppConfig{
 		MaxCrawlers:        maxCrawlers,
 		CrawlerTimeout:     crawlerTimeout,
@@ -272,6 +272,23 @@ func loadAppConfig() AppConfig {
 		ClawlerDelay:       clawlerDelay,
 		JobQueue:           jobQueue,
 	}
+}
+
+// jobQueueName is the queue the indexer consumes.
+//
+// Both sides must agree on one name. Spider used to default to "indexer.job"
+// while the indexer consumed "indexer.jobs", so every job landed in a queue
+// nobody read and only the indexer's sweep recovered the page, minutes later
+// (H-01). RABBITMQ_JOB_QUEUE is still read for deployments that set the old
+// name, but RABBITMQ_QUEUE wins and the default matches the indexer.
+func jobQueueName() string {
+	if queue := os.Getenv("RABBITMQ_QUEUE"); queue != "" {
+		return queue
+	}
+	if queue := os.Getenv("RABBITMQ_JOB_QUEUE"); queue != "" {
+		return queue
+	}
+	return "indexer.jobs"
 }
 
 func getWithDefault(key, defaultValue string) string {

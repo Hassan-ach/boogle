@@ -27,7 +27,8 @@ type fakeStore struct {
 	mu    sync.Mutex
 	pages []*entity.Page
 
-	pageID uuid.UUID
+	pageID     uuid.UUID
+	persistErr error
 }
 
 func newFakeStore() *fakeStore {
@@ -38,11 +39,14 @@ func (s *fakeStore) Init([]string) error { return nil }
 
 func (s *fakeStore) Close() {}
 
-func (s *fakeStore) Persist(_ context.Context, page *entity.Page) uuid.UUID {
+func (s *fakeStore) Persist(_ context.Context, page *entity.Page) (uuid.UUID, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.persistErr != nil {
+		return s.pageID, s.persistErr
+	}
 	s.pages = append(s.pages, page)
-	return s.pageID
+	return s.pageID, nil
 }
 
 func (s *fakeStore) persisted() []*entity.Page {
@@ -532,6 +536,59 @@ func TestAnOutcomeThatCouldNotBeRecordedIsNotPersisted(t *testing.T) {
 	}
 }
 
+func TestAPersistenceErrorRequeuesThePage(t *testing.T) {
+	clock := &testClock{t: time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)}
+	s := newSite(t)
+	const path = "/edge-failure"
+	s.serve(path, englishPage)
+
+	h := newHarness(t, s, nil, clock)
+	// A non-nil id with an error is what a failed second transaction looks like.
+	h.spider.store = &fakeStore{
+		pageID:     uuid.New(),
+		persistErr: errors.New("insert graph edges failed"),
+	}
+
+	h.enqueue(t, s.pageURL(path))
+	h.crawl(t)
+
+	if _, parked := h.delayed(t)[s.pageURL(path)]; !parked {
+		t.Errorf("a page whose edges failed to commit was not requeued: %v",
+			h.delayed(t))
+	}
+}
+
+func TestASkipWithAFutureUntilIsParkedNotRetired(t *testing.T) {
+	clock := &testClock{t: time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)}
+	s := newSite(t)
+
+	// One page per host: the second URL hits the budget gate, which returns Skip
+	// with Until set to the host cold period.
+	h := newHarnessWithConfig(t, s, nil, clock, func(c *policy.Config) {
+		c.MaxPagesPerHost = 1
+	})
+	s.serve("/first", englishPage)
+	s.serve("/second", englishPage)
+
+	h.enqueue(t, s.pageURL("/first"))
+	h.crawl(t)
+
+	h.enqueue(t, s.pageURL("/second"))
+	h.crawl(t)
+
+	if _, parked := h.delayed(t)[s.pageURL("/second")]; !parked {
+		t.Errorf("a Skip carrying a future Until was retired instead of parked: %v",
+			h.delayed(t))
+	}
+	visited, err := h.state.IsVisited(context.Background(), s.pageURL("/second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if visited {
+		t.Error("a temporary refusal permanently blacklisted the URL")
+	}
+}
+
 func TestAPageThatFailsToPersistStaysCrawlable(t *testing.T) {
 	clock := &testClock{t: time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)}
 	s := newSite(t)
@@ -565,6 +622,13 @@ func TestAPageThatFailsToPersistStaysCrawlable(t *testing.T) {
 	if got := h.frontierLen(t); got != 0 {
 		t.Errorf("frontier holds %d urls after a page that failed to persist was "+
 			"expanded; its links are discovered only once the page itself is stored", got)
+	}
+
+	// PopFrontier is destructive, so the failed URL must come back on the
+	// delayed frontier or the work is silently gone (M-25).
+	if _, parked := h.delayed(t)[s.pageURL(path)]; !parked {
+		t.Errorf("a page that failed to persist was dropped from the frontier: %v",
+			h.delayed(t))
 	}
 }
 

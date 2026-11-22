@@ -45,14 +45,17 @@ func NewStore(conf config.StoreConfig, log *utils.Logger, cache Cache, st state.
 	}
 }
 
-func (s *Store) Persist(ctx context.Context, page *entity.Page) uuid.UUID {
+// Persist writes a page and its edges. The error is part of the contract: a
+// non-nil page id is not proof of a commit, because it is assigned before the
+// transaction commits.
+func (s *Store) Persist(ctx context.Context, page *entity.Page) (uuid.UUID, error) {
 	s.log.Info("Persisting page data", "url", page.URL)
 	pageID, err := s.persistPage(ctx, page)
 	if err != nil {
 		s.log.Error("persist page data", "url", page.URL, "error", err)
-		return pageID
+		return pageID, err
 	}
-	return pageID
+	return pageID, nil
 }
 
 func (s *Store) persistPage(ctx context.Context, page *entity.Page) (pageID uuid.UUID, err error) {
@@ -84,7 +87,7 @@ func (s *Store) persistPage(ctx context.Context, page *entity.Page) (pageID uuid
 		}
 		return nil
 	}); err != nil {
-		s.log.Warn("", "url", page.URL, "err", err)
+		s.log.Warn("failed to persist page edges", "url", page.URL, "err", err)
 		return pageID, err
 	}
 	return pageID, nil
