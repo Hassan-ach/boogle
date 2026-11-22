@@ -21,12 +21,17 @@ pub struct IndexConfirmation {
     pub page_id: uuid::Uuid,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RabbitMQ {
-    conn: Arc<Connection>,
+    conf: RabbitConfig,
+    state: Arc<tokio::sync::RwLock<BrokerState>>,
+    log: Arc<Logger>,
+}
+
+struct BrokerState {
+    conn: Connection,
     ch: Channel,
     confirm_ch: Channel,
-    log: Arc<Logger>,
 }
 
 #[cfg(test)]
@@ -112,36 +117,42 @@ pub trait MessagingQueue: Send + Sync {
 
 impl RabbitMQ {
     pub async fn new(conf: RabbitConfig, log: Logger) -> Result<RabbitMQ, AppError> {
+        let state = Self::connect(&conf, &log).await?;
+        Ok(RabbitMQ {
+            conf,
+            state: Arc::new(tokio::sync::RwLock::new(state)),
+            log: Arc::new(log),
+        })
+    }
+
+    /// Dial the broker and prepare both channels, including the queue
+    /// declarations. Used at startup and again after the connection dies.
+    async fn connect(conf: &RabbitConfig, log: &Logger) -> Result<BrokerState, AppError> {
         let props = ConnectionProperties::default().enable_auto_recover();
-        let conn = match Connection::connect(&conf.url, props).await {
-            Ok(conn) => conn,
-            Err(err) => {
-                error!(log, "Failed to connect to RabbitMQ"; "err" => %err);
-                return Err(AppError::Messaging(MessagingError::ConnectionError(
-                    format!("Failed to connect to RabbitMQ: {}", err.to_string()),
-                )));
-            }
-        };
-        let ch = match conn.create_channel().await {
-            Ok(ch) => ch,
-            Err(err) => {
-                error!(log, "Failed to create channel"; "err" => %err);
-                return Err(AppError::Messaging(MessagingError::ChannelError(format!(
-                    "Failed to create channel: {}",
-                    err.to_string()
-                ))));
-            }
-        };
-        let confirm_ch = match conn.create_channel().await {
-            Ok(ch) => ch,
-            Err(err) => {
-                error!(log, "Failed to create channel"; "err" => %err);
-                return Err(AppError::Messaging(MessagingError::ChannelError(format!(
-                    "Failed to create channel: {}",
-                    err.to_string()
-                ))));
-            }
-        };
+        let conn = Connection::connect(&conf.url, props).await.map_err(|err| {
+            error!(log, "Failed to connect to RabbitMQ"; "err" => %err);
+            AppError::Messaging(MessagingError::ConnectionError(format!(
+                "Failed to connect to RabbitMQ: {}",
+                err.to_string()
+            )))
+        })?;
+
+        let ch = conn.create_channel().await.map_err(|err| {
+            error!(log, "Failed to create channel"; "err" => %err);
+            AppError::Messaging(MessagingError::ChannelError(format!(
+                "Failed to create channel: {}",
+                err.to_string()
+            )))
+        })?;
+
+        let confirm_ch = conn.create_channel().await.map_err(|err| {
+            error!(log, "Failed to create channel"; "err" => %err);
+            AppError::Messaging(MessagingError::ChannelError(format!(
+                "Failed to create channel: {}",
+                err.to_string()
+            )))
+        })?;
+
         confirm_ch
             .confirm_select(lapin::options::ConfirmSelectOptions::default())
             .await
@@ -153,88 +164,93 @@ impl RabbitMQ {
                 )))
             })?;
 
-        let mq = RabbitMQ {
-            conn: Arc::new(conn),
-            ch: ch,
-            log: Arc::new(log.clone()),
-            confirm_ch: confirm_ch,
-        };
-
-        mq.queue_declare(&conf.queue).await?;
-        mq.queue_declare(&conf.confirmation_queue_name).await?;
-
-        info!(log, "Connected to RabbitMQ successfully"; "queue" => &conf.queue);
-
-        Ok(mq)
-    }
-
-    async fn get_channel(&self) -> Channel {
-        let ch = match self.conn.create_channel().await {
-            Ok(ch) => ch,
-            Err(err) => {
-                error!(self.log.as_ref(), "Failed to create channel"; "err" => %err);
-                return self.ch.clone();
-            }
-        };
-
-        return ch;
-    }
-    async fn queue_declare(&self, queue: &str) -> Result<(), AppError> {
-        let ch = self.get_channel().await;
-        let _ = match ch
-            .queue_declare(
-                ShortString::from(queue),
+        for queue in [&conf.queue, &conf.confirmation_queue_name] {
+            ch.queue_declare(
+                ShortString::from(queue.as_str()),
                 QueueDeclareOptions::durable(),
                 FieldTable::default(),
             )
             .await
+            .map_err(|err| {
+                error!(log, "Failed to declare queue"; "queue" => queue, "err" => %err);
+                AppError::Messaging(MessagingError::DeclareQueueError(format!(
+                    "Failed to declare queue {}: {}",
+                    queue,
+                    err.to_string()
+                )))
+            })?;
+            info!(log, "Queue declared successfully"; "queue" => queue);
+        }
+
+        info!(log, "Connected to RabbitMQ successfully"; "queue" => &conf.queue);
+        Ok(BrokerState {
+            conn,
+            ch,
+            confirm_ch,
+        })
+    }
+
+    /// Return live channels, reconnecting first if the connection has died.
+    ///
+    /// lapin does not re-dial by itself. Without this, a broker restart left
+    /// every future `consume` call failing against a closed connection while the
+    /// process stayed up and logged "reconnecting" forever (H-11).
+    async fn channels(&self) -> Result<(Channel, Channel), AppError> {
         {
-            Ok(_) => {
-                info!(self.log.as_ref(), "Queue declared successfully"; "queue" => queue);
+            let state = self.state.read().await;
+            if state.conn.status().connected() {
+                return Ok((state.ch.clone(), state.confirm_ch.clone()));
             }
-            Err(err) => {
-                error!(self.log.as_ref(), "Failed to declare queue"; "queue" => queue, "err" => %err);
-                return Err(AppError::Messaging(MessagingError::DeclareQueueError(
-                    format!("Failed to declare queue {}: {}", queue, err.to_string()),
-                )));
-            }
-        };
-        Ok(())
+        }
+
+        let mut state = self.state.write().await;
+        if state.conn.status().connected() {
+            return Ok((state.ch.clone(), state.confirm_ch.clone()));
+        }
+
+        info!(self.log.as_ref(), "RabbitMQ connection lost; reconnecting");
+        *state = Self::connect(&self.conf, self.log.as_ref()).await?;
+        Ok((state.ch.clone(), state.confirm_ch.clone()))
+    }
+
+    /// Force a fresh connection after a channel-level failure even if the
+    /// connection status still reports connected.
+    async fn force_reconnect(&self) {
+        let mut state = self.state.write().await;
+        if let Ok(fresh) = Self::connect(&self.conf, self.log.as_ref()).await {
+            *state = fresh;
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl MessagingQueue for RabbitMQ {
     async fn publish(&self, queue: &str, payload: Vec<u8>) -> Result<(), AppError> {
-        let ch = self.ch.clone();
-        match ch
-            .basic_publish(
-                ShortString::from(""),
-                ShortString::from(queue),
-                BasicPublishOptions::default(),
-                &payload,
-                BasicProperties::default()
-                    .with_delivery_mode(2)
-                    .with_content_type("application/json".into()),
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(err) => {
-                error!(self.log.as_ref(), "Failed to publish message"; "err" => %err);
-                return Err(AppError::Messaging(MessagingError::PublishError(format!(
-                    "Failed to publish message: {}",
-                    err.to_string()
-                ))));
-            }
-        };
+        let (ch, _) = self.channels().await?;
+        ch.basic_publish(
+            ShortString::from(""),
+            ShortString::from(queue),
+            BasicPublishOptions::default(),
+            &payload,
+            BasicProperties::default()
+                .with_delivery_mode(2)
+                .with_content_type("application/json".into()),
+        )
+        .await
+        .map_err(|err| {
+            error!(self.log.as_ref(), "Failed to publish message"; "err" => %err);
+            AppError::Messaging(MessagingError::PublishError(format!(
+                "Failed to publish message: {}",
+                err.to_string()
+            )))
+        })?;
 
         Ok(())
     }
 
     async fn publish_with_confirm(&self, queue: &str, payload: Vec<u8>) -> Result<(), AppError> {
-        let ch = self.confirm_ch.clone();
-        let conf = match ch
+        let (_, ch) = self.channels().await?;
+        let conf = ch
             .basic_publish(
                 ShortString::from(""),
                 ShortString::from(queue),
@@ -248,16 +264,13 @@ impl MessagingQueue for RabbitMQ {
                     .with_content_type("application/json".into()),
             )
             .await
-        {
-            Ok(c) => c,
-            Err(err) => {
+            .map_err(|err| {
                 error!(self.log.as_ref(), "Failed to publish message"; "err" => %err);
-                return Err(AppError::Messaging(MessagingError::PublishError(format!(
+                AppError::Messaging(MessagingError::PublishError(format!(
                     "Failed to publish message: {}",
                     err.to_string()
-                ))));
-            }
-        };
+                )))
+            })?;
 
         match conf.await? {
             Confirmation::Ack(None) => {}
@@ -276,18 +289,21 @@ impl MessagingQueue for RabbitMQ {
         }
         Ok(())
     }
+
     async fn consume(&self, queue: &str, prefetch: usize) -> Result<Consumer, AppError> {
-        let ch = self.get_channel().await;
+        let (ch, _) = self.channels().await?;
 
-        ch.basic_qos(prefetch as u16, BasicQosOptions::default())
+        if let Err(err) = ch
+            .basic_qos(prefetch as u16, BasicQosOptions::default())
             .await
-            .map_err(|err| {
-                AppError::Messaging(MessagingError::ConsumeError(format!(
-                    "failed to set prefetch {prefetch} on queue {queue}: {err}"
-                )))
-            })?;
+        {
+            self.force_reconnect().await;
+            return Err(AppError::Messaging(MessagingError::ConsumeError(format!(
+                "failed to set prefetch {prefetch} on queue {queue}: {err}"
+            ))));
+        }
 
-        let consumer = match ch
+        match ch
             .basic_consume(
                 ShortString::from(queue),
                 ShortString::from(""),
@@ -296,21 +312,21 @@ impl MessagingQueue for RabbitMQ {
             )
             .await
         {
-            Ok(consumer) => consumer,
+            Ok(consumer) => Ok(consumer),
             Err(err) => {
                 error!(self.log.as_ref(), "Failed to consume messages"; "err" => %err);
-                return Err(AppError::Messaging(MessagingError::ConsumeError(format!(
+                self.force_reconnect().await;
+                Err(AppError::Messaging(MessagingError::ConsumeError(format!(
                     "Failed to consume messages: {}",
                     err.to_string()
-                ))));
+                ))))
             }
-        };
-
-        return Ok(consumer);
+        }
     }
 
     async fn close(&self) {
-        if let Err(err) = self.conn.close(0, "Closing connection".into()).await {
+        let state = self.state.read().await;
+        if let Err(err) = state.conn.close(0, "Closing connection".into()).await {
             error!(self.log.as_ref(), "Failed to close RabbitMQ connection"; "err" => %err);
         }
         info!(self.log.as_ref(), "RabbitMQ connection closed successfully");

@@ -1,4 +1,3 @@
-use lapin::Consumer;
 use lapin::options::BasicAckOptions;
 use lapin::options::BasicNackOptions;
 use tokio::sync::Mutex;
@@ -45,7 +44,7 @@ pub struct Indexer<DBImpl: DB, MQImpl: MessagingQueue> {
 
 #[async_trait::async_trait]
 pub trait Indexe {
-    async fn start(self: Arc<Self>, tk: CancellationToken) -> Result<Consumer, AppError>;
+    async fn start(self: Arc<Self>, tk: CancellationToken) -> Result<(), AppError>;
     async fn close(&self);
     async fn sweep_loop(self: Arc<Self>, tk: CancellationToken);
 }
@@ -107,101 +106,125 @@ where
         }
     }
 
-    pub async fn index_loop(self: Arc<Self>, tk: CancellationToken) -> Result<Consumer, AppError> {
+    /// Consume until shutdown, reconnecting with backoff across broker blips.
+    ///
+    /// A consumer-stream error used to propagate out of the loop and abort the
+    /// process, which permanently stopped indexing (H-11). Now only startup
+    /// failure is fatal; a broken stream is retried, and the caller keeps the
+    /// drain path for shutdown.
+    pub async fn index_loop(self: Arc<Self>, tk: CancellationToken) -> Result<(), AppError> {
         if tk.is_cancelled() {
             info!(
                 self.log,
                 "indexing task received shutdown signal, stopping..."
             );
-            return Err(AppError::Other(
-                "indexing task received shutdown signal before consuming".to_string(),
-            ));
+            return Ok(());
         }
-        match retry_async(MAX_ATTEMPTS, || async {
+
+        let mut backoff = std::time::Duration::from_secs(1);
+        loop {
+            match self.consume_until_closed(tk.clone()).await {
+                Ok(()) => backoff = std::time::Duration::from_secs(1),
+                Err(err) => {
+                    error!(self.log, "consumer stopped; reconnecting";
+                           "queue" => self.conf.queue_name.to_string(),
+                           "error" => err.to_string(),
+                           "backoff_seconds" => backoff.as_secs()
+                    );
+                }
+            }
+
+            if tk.is_cancelled() {
+                return Ok(());
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = tk.cancelled() => return Ok(()),
+            }
+            backoff = std::cmp::min(backoff * 2, std::time::Duration::from_secs(30));
+        }
+    }
+
+    async fn consume_until_closed(self: &Arc<Self>, tk: CancellationToken) -> Result<(), AppError> {
+        let mut consumer = retry_async(MAX_ATTEMPTS, || async {
             self.mq
                 .consume(&self.conf.queue_name, self.conf.max_concurrent_tasks)
                 .await
         })
-        .await
-        {
-            Ok(mut consumer) => loop {
-                // select! on cancellation and the consumer stream: whichever
-                // fires first wins, so a shutdown does not wait for the next
-                // message to arrive.
-                tokio::select! {
-                    _ = tk.cancelled() => {
-                        info!(self.log, "Received shutdown signal, stopping consumer for queue"; "queue" => self.conf.queue_name.to_string());
-                        return Ok(consumer);
-                    }
-                    result = consumer.next() => {
-                        let Some(result) = result else {
-                            info!(self.log, "Consumer stream ended for queue"; "queue" => self.conf.queue_name.to_string());
-                            return Ok(consumer);
-                        };
+        .await?;
 
-                        let delivery = result?;
-                        let indx = Arc::clone(&self);
-                        let log = indx.log.clone();
-                        let queue_name = indx.conf.queue_name.clone();
+        loop {
+            // select! on cancellation and the consumer stream: whichever fires
+            // first wins, so a shutdown does not wait for the next message.
+            tokio::select! {
+                _ = tk.cancelled() => {
+                    info!(self.log, "Received shutdown signal, stopping consumer for queue"; "queue" => self.conf.queue_name.to_string());
+                    return Ok(());
+                }
+                result = consumer.next() => {
+                    let Some(result) = result else {
+                        info!(self.log, "Consumer stream ended for queue"; "queue" => self.conf.queue_name.to_string());
+                        return Ok(());
+                    };
 
-                        info!(log, "Received message from queue"; "queue" => &queue_name, "payload_size" => delivery.data.len());
+                    let delivery = result?;
+                    let indx = Arc::clone(self);
+                    let log = indx.log.clone();
+                    let queue_name = indx.conf.queue_name.clone();
 
-                                                // The semaphore caps concurrent indexing. Cancellation
-                        // is raced against acquiring it, otherwise shutdown would
-                        // block until an in-flight task released its permit.
-                        let permit = tokio::select! {
-                            Ok(p) = Arc::clone(&indx.limit).acquire_owned() => p,
-                            _ = tk.cancelled() => {
-                                info!(log, "Received shutdown signal while waiting for permit, stopping"; "queue" => queue_name.clone());
-                                return Ok(consumer);
-                            }
-                        };
+                    info!(log, "Received message from queue"; "queue" => &queue_name, "payload_size" => delivery.data.len());
 
-                        let mut tasks = self.tasks.lock().await;
-                        tasks.spawn(async move {
-                            // Held for the task's lifetime, which is what keeps
-                            // in-flight work within max_concurrent_tasks.
-                            let _permit = permit;
+                    // The semaphore caps concurrent indexing. Cancellation is
+                    // raced against acquiring it, otherwise shutdown would block
+                    // until an in-flight task released its permit.
+                    let permit = tokio::select! {
+                        Ok(p) = Arc::clone(&indx.limit).acquire_owned() => p,
+                        _ = tk.cancelled() => {
+                            info!(log, "Received shutdown signal while waiting for permit, stopping"; "queue" => queue_name.clone());
+                            return Ok(());
+                        }
+                    };
 
-                            // Ack only after indexing succeeded, so a crash
-                            // mid-index leaves the message unacked and it returns
-                            // to the queue.
-                            match indx.handler(delivery.data.clone()).await {
-                                Ok(()) => {
-                                    if let Err(err) = delivery.ack(BasicAckOptions::default()).await {
-                                        error!(log.clone(), "ACK error"; "err" => %err, "queue" => queue_name.clone());
-                                    }
-                                }
-                                Err(err) => {
-                                    let requeue = should_requeue(&err);
-                                    match &err {
-                                        AppError::Database(db_err) => error!(log.clone(), "Database error"; "err" => %db_err, "queue" => queue_name.clone()),
-                                        AppError::Messaging(msg_err) => error!(log.clone(), "Messaging error"; "err" => %msg_err, "queue" => queue_name.clone()),
-                                        AppError::SerdeError(serde_err) => error!(log.clone(), "Serde error"; "err" => %serde_err, "queue" => queue_name.clone()),
-                                        AppError::Other(msg) => error!(log.clone(), "Other error"; "err" => msg, "queue" => queue_name.clone()),
-                                        AppError::ParseError(msg) => error!(log.clone(), "Parse error"; "err" => msg, "queue" => queue_name.clone()),
-                                    }
-                                    if let Err(nack_err) = delivery.nack(BasicNackOptions { requeue, ..Default::default() }).await {
-                                        error!(log.clone(), "NACK error"; "err" => %nack_err, "queue" => queue_name.clone());
-                                    }
+                    let mut tasks = self.tasks.lock().await;
+                    tasks.spawn(async move {
+                        // Held for the task's lifetime, which is what keeps
+                        // in-flight work within max_concurrent_tasks.
+                        let _permit = permit;
+
+                        // Ack only after indexing succeeded, so a crash
+                        // mid-index leaves the message unacked and it returns
+                        // to the queue.
+                        match indx.handler(delivery.data.clone()).await {
+                            Ok(()) => {
+                                if let Err(err) = delivery.ack(BasicAckOptions::default()).await {
+                                    error!(log.clone(), "ACK error"; "err" => %err, "queue" => queue_name.clone());
                                 }
                             }
-                        });
-                    }
+                            Err(err) => {
+                                let requeue = should_requeue(&err);
+                                match &err {
+                                    AppError::Database(db_err) => error!(log.clone(), "Database error"; "err" => %db_err, "queue" => queue_name.clone()),
+                                    AppError::Messaging(msg_err) => error!(log.clone(), "Messaging error"; "err" => %msg_err, "queue" => queue_name.clone()),
+                                    AppError::SerdeError(serde_err) => error!(log.clone(), "Serde error"; "err" => %serde_err, "queue" => queue_name.clone()),
+                                    AppError::Other(msg) => error!(log.clone(), "Other error"; "err" => msg, "queue" => queue_name.clone()),
+                                    AppError::ParseError(msg) => error!(log.clone(), "Parse error"; "err" => msg, "queue" => queue_name.clone()),
+                                }
+                                if let Err(nack_err) = delivery.nack(BasicNackOptions { requeue, ..Default::default() }).await {
+                                    error!(log.clone(), "NACK error"; "err" => %nack_err, "queue" => queue_name.clone());
+                                }
+                            }
+                        }
+                    });
                 }
+            }
 
-                let mut tasks = self.tasks.lock().await;
+            let mut tasks = self.tasks.lock().await;
 
-                while let Some(result) = tasks.try_join_next() {
-                    if let Err(err) = result {
-                        error!(self.log.clone(), "Indexer worker task failed"; "error" => %err);
-                    }
+            while let Some(result) = tasks.try_join_next() {
+                if let Err(err) = result {
+                    error!(self.log.clone(), "Indexer worker task failed"; "error" => %err);
                 }
-            },
-
-            Err(err) => {
-                error!(self.log, "failed to consume messages from queue"; "error" => err.to_string());
-                return Err(err);
             }
         }
     }
@@ -335,7 +358,7 @@ where
     DBImpl: DB + Sync + Send + 'static,
     MQImpl: MessagingQueue + Send + Sync + 'static,
 {
-    async fn start(self: Arc<Self>, tk: CancellationToken) -> Result<Consumer, AppError> {
+    async fn start(self: Arc<Self>, tk: CancellationToken) -> Result<(), AppError> {
         let tk_clone = tk.clone();
         let res = Arc::clone(&self).index_loop(tk_clone).await;
         tk.cancel();
@@ -557,7 +580,11 @@ mod tests {
             Ok(())
         }
 
-        async fn consume(&self, _queue: &str, _prefetch: usize) -> Result<Consumer, AppError> {
+        async fn consume(
+            &self,
+            _queue: &str,
+            _prefetch: usize,
+        ) -> Result<lapin::Consumer, AppError> {
             Err(AppError::Other("not supported in tests".into()))
         }
 
@@ -908,7 +935,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_loop_refuses_to_consume_after_cancellation() {
+    async fn index_loop_stops_cleanly_when_already_cancelled() {
         let db = MockDB::with_page("<body>alpha</body>");
         let mq = MockMQ::default();
         let indexer = Arc::new(Indexer::new(db, mq, app_config(), discard_logger()));
@@ -916,11 +943,11 @@ mod tests {
         let tk = CancellationToken::new();
         tk.cancel();
 
-        let err = indexer.index_loop(tk).await.unwrap_err();
-
-        assert!(
-            matches!(err, AppError::Other(ref m) if m.contains("shutdown signal")),
-            "unexpected error: {err:?}"
-        );
+        // A shutdown before consuming is a normal stop, not a startup failure:
+        // returning an error here skipped the drain path (H-11).
+        indexer
+            .index_loop(tk)
+            .await
+            .expect("a cancelled loop must stop cleanly");
     }
 }
