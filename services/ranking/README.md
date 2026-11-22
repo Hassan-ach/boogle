@@ -2,8 +2,9 @@
 
 Calculates page importance & relevance scores.
 
-**Language**: Python  
-**Algorithms**: TF-IDF, PageRank
+**Language**: Python 3.9+  
+**Algorithms**: TF-IDF, PageRank  
+**Messaging**: FastStream + RabbitMQ
 
 ## Quick Start
 
@@ -16,26 +17,44 @@ python src/main.py
 
 Press CTRL+C to stop.
 
-## Files
+## Features
 
-- `src/main.py` - Entry point, scheduling
-- `src/idf.py` - Inverse document frequency calculation
-- `src/page_rank.py` - PageRank algorithm
-- `src/psql.py` - Database operations
+- Event-driven: consumes indexer confirmations from RabbitMQ
+- Triggers IDF and PageRank computation once a threshold of indexed pages is reached (default 100)
+- Computes IDF via SQL over full corpus, PageRank via PL/pgSQL function
+- Runs IDF and PageRank concurrently
+- Resilient to failures, handles catch-up on bursts
+
+## Project Structure
+
+- `src/main.py` - Entry point, logging, env validation, lifecycle
+- `src/calculator.py` - IDF and PageRank computation logic
+- `src/messaging.py` - RabbitMQ consumption and trigger management
+- `src/psql.py` - Database connection pool and retries
 
 ## Configuration
 
 ```env
-RANKING_DAMPING_FACTOR=0.85      # 85% follow links, 15% random
-RANKING_ITERATIONS=20            # Convergence iterations
-RANKING_SCHEDULE_INTERVAL=3600   # Update every hour
+# Database
+DATABASE_URL=postgresql://...
+# or PG_HOST/PORT/DBNAME/USER/PASSWORD
+
+# Broker
+BROKER_URL=amqp://...
+# or RABBITMQ_URL / RABBITMQ_USER/PASSWORD/HOST/PORT
+
+# Behavior (defaults)
+RABBITMQ_CONFIRMATION_QUEUE=indexer.confirmations
+# RANKING_DAMPING_FACTOR=0.85
+# RANKING_ITERATIONS=20
 ```
 
 ## Input/Output
 
 **Reads from**:
+- `pages` table (corpus size)
 - `words`, `page_word` tables (for TF-IDF)
-- `graph_edges` table (for PageRank)
+- `graph_edges` table (for PageRank via DB function)
 
 **Writes to**:
 - `words` table (IDF values)
@@ -43,8 +62,8 @@ RANKING_SCHEDULE_INTERVAL=3600   # Update every hour
 
 ## Details
 
-See [docs/RANKING.md](../../docs/RANKING.md) for algorithm details, math formulas, performance tuning, and examples.
+See [docs/RANKING.md](../../docs/RANKING.md) for algorithm details, math formulas, and examples.
 
 ## Notes
 
-⚠️ Learning project - no optimization, simple iteration-based PageRank.
+⚠️ Learning project - recomputes over full corpus/graph each run.

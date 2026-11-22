@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Spider crawls the web, discovers new URLs, and stores raw HTML content and link relationships for later processing.
+The Spider crawls the web, discovers new URLs, and stores raw HTML content and link relationships for later processing. It publishes indexing jobs to RabbitMQ after persisting pages.
 
 ## Architecture
 

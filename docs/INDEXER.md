@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Indexer processes crawled HTML pages and converts them into a searchable word index with term frequencies.
+The Indexer consumes page jobs from RabbitMQ, processes crawled HTML pages and converts them into a searchable word index with term frequencies. It publishes indexing confirmations back to RabbitMQ.
 
 ## Architecture
 
