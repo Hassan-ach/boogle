@@ -45,8 +45,7 @@ func main() {
 	e.HTTPErrorHandler = handlers.HandleError
 	e.Use(echoMiddleware.Recover())
 	e.Use(echoMiddleware.RequestID())
-	// Path only: the stock RequestLogger logs the full URI, which puts every
-	// search term in the access log (M-04).
+	// Log path only: the stock RequestLogger logs the full URI, including search terms.
 	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c *echo.Context) error {
 			started := time.Now()

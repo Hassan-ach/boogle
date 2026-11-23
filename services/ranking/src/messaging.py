@@ -13,12 +13,7 @@ DEFAULT_CONFIRMATION_THRESHOLD = 100
 
 
 def broker_url_from_env() -> str:
-    """Build the broker URL from the environment, failing closed.
-
-    The old fallback was ``admin:admin@localhost``. With no environment at all
-    that silently connected to whatever happened to be listening on localhost
-    with the most common credentials in the project (M-11).
-    """
+    """Build the broker URL from the environment, failing closed."""
     configured = os.getenv("BROKER_URL") or os.getenv("RABBITMQ_URL")
     if configured:
         return configured
@@ -178,10 +173,8 @@ class MessagingService:
                     and (force or self._indexer_pages >= self.max_indexer_pages)
                 ):
                     force = False
-                    # Take a snapshot before the run. Confirmations that arrive
-                    # during it must survive for the next threshold; zeroing the
-                    # counter before the work discarded them on any failure
-                    # (M-08).
+                    # Snapshot the batch so confirmations arriving during the run
+                    # stay counted for the next threshold.
                     batch = self._indexer_pages
                     try:
                         await self._pipeline_handler()

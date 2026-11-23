@@ -6,10 +6,8 @@ type StoreConfig struct {
 	DB       PsqlConfig
 	PageSize int
 	// CandidateLimit is how many matches the SQL pass hands to the ranker. The
-	// blend has to happen before the page is sliced, otherwise page 1 is chosen
-	// by the coarse SQL order (word count) and a globally better result can
-	// never surface (M-03). RANKER_MAX_RESULTS is the upper bound a user can page
-	// through.
+	// blend must happen before slicing the page so the best results surface first;
+	// RANKER_MAX_RESULTS is the upper bound a user can page through.
 	CandidateLimit int
 }
 

@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
-# Generate services/<svc>/.env.docker: the container-network view of the root
-# .env.
-#
-# A service .env is written for whichever environment the operator runs it in.
-# A laptop run needs localhost; a container run needs the compose service names.
-# Rather than making `just dev` and `just run` fight over one file, the compose
-# files read .env first and this generated overlay second, so the overlay wins
-# for addresses and keeps the credentials in sync with the root .env.
+# Generate services/<svc>/.env.docker: the container-network view of the root .env.
+# Compose reads .env first, then this overlay, so container addresses win while
+# credentials stay in sync with the root .env.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

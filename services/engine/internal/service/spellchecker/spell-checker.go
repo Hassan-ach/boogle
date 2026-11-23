@@ -16,12 +16,9 @@ type dictionary interface {
 	Suggest(word string) []string
 }
 
-// AspellSpeller serializes calls into one go-aspell speller.
-//
-// go-aspell exposes one AspellSpeller and no locking, and aspell keeps mutable
-// per-speller state. Echo handlers run concurrently, so overlapping searches
-// could corrupt suggestions, leak C allocations or crash the process (H-13).
-// Check/Suggest cost microseconds, so a mutex is cheaper than a speller pool.
+// AspellSpeller serializes calls into one go-aspell speller. aspell keeps mutable
+// per-speller state and go-aspell adds no locking, so concurrent handlers must
+// not overlap calls; a mutex is cheaper than a speller pool.
 type AspellSpeller struct {
 	mu      *sync.Mutex
 	speller dictionary

@@ -152,11 +152,8 @@ func (c *SQLClient) InsertGraphEdges(
 	return nil
 }
 
-// InsertURLs upserts URLs and returns their ids keyed by URL.
-//
-// The previous version returned only ids in whatever order the planner chose and
-// the caller treated ids[0] as the page and ids[1:] as its links, so the link
-// graph was built from an unordered list (H-06).
+// InsertURLs upserts URLs and returns their ids keyed by URL, so callers never
+// depend on row order.
 func (c *SQLClient) InsertURLs(ctx context.Context, tx *sql.Tx, urls []string) (map[string]string, error) {
 	if len(urls) == 0 {
 		return map[string]string{}, nil

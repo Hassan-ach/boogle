@@ -44,9 +44,7 @@ func NewRabbitMQ(conf *config.RabbitMqConfig, log *utils.Logger) (*RabbitMQ, err
 	return mq, nil
 }
 
-// ensureConn returns a live connection, dialing a replacement when the previous
-// one has died. A broker restart used to make every later crawl fail forever
-// because the connection was dialed exactly once at startup.
+// ensureConn returns a live connection, redialing when the cached one is closed.
 func (m *RabbitMQ) ensureConn() (*amqp.Connection, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -87,13 +85,9 @@ func (m *RabbitMQ) Close() {
 	}
 }
 
-// Publish sends one indexer job as a persistent message and waits for the
-// broker's publisher confirm.
-//
-// A plain Publish returning nil only means the bytes reached the socket. The
-// spider retires the URL after this call, so a job lost to a broker restart was
-// never retried and the page silently stayed out of the index (H-09). Persistent
-// delivery survives a broker restart; the confirm is what makes success real.
+// Publish sends one indexer job as a persistent message and waits for the broker's
+// confirm. Callers retire the URL only after this returns nil: a plain publish
+// returning nil only means the bytes reached the socket.
 func (m *RabbitMQChannel) Publish(ctx context.Context, queueName string, body []byte) error {
 	if err := m.enableConfirms(); err != nil {
 		return err

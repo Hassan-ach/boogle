@@ -167,8 +167,8 @@ func TestRankUsesTheConfiguredTfWeight(t *testing.T) {
 		PageMapper: pageMapper,
 	}
 
-	// With TF weight 0 the blend is exactly PageRank. A hardcoded 0.5 would
-	// produce 0.35 and prove the configured value was ignored (M-05).
+	// With TF weight 0 the blend must be exactly PageRank, proving the configured
+	// weight is used.
 	ranked, err := NewRankingService(ranker.RankingConfig{WeightTF: 0}).Rank(data)
 	if err != nil {
 		t.Fatalf("Rank: %v", err)

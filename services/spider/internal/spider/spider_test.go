@@ -629,7 +629,7 @@ func TestAPageThatFailsToPersistStaysCrawlable(t *testing.T) {
 	}
 
 	// PopFrontier is destructive, so the failed URL must come back on the
-	// delayed frontier or the work is silently gone (M-25).
+	// delayed frontier or the work is silently gone.
 	if _, parked := h.delayed(t)[s.pageURL(path)]; !parked {
 		t.Errorf("a page that failed to persist was dropped from the frontier: %v",
 			h.delayed(t))
@@ -809,7 +809,7 @@ func TestACrawlerReusesItsMessagingChannelAcrossRounds(t *testing.T) {
 		h.crawl(t)
 	}
 
-	// A channel per crawl was ~100 objects/second at the defaults (H-09).
+	// The channel is opened once and reused across crawls.
 	if got := mq.opens(); got != 1 {
 		t.Errorf("opened %d channels for three rounds, want 1", got)
 	}

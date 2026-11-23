@@ -192,9 +192,8 @@ impl RabbitMQ {
 
     /// Return live channels, reconnecting first if the connection has died.
     ///
-    /// lapin does not re-dial by itself. Without this, a broker restart left
-    /// every future `consume` call failing against a closed connection while the
-    /// process stayed up and logged "reconnecting" forever (H-11).
+    /// lapin does not re-dial by itself, so a dead connection must be replaced
+    /// before it is reused.
     async fn channels(&self) -> Result<(Channel, Channel), AppError> {
         {
             let state = self.state.read().await;

@@ -13,9 +13,8 @@ import (
 	"github.com/labstack/echo/v5"
 )
 
-// Query limits. Every token costs up to four cgo calls to aspell, and the query
-// is attacker-controlled, so an unbounded string is a cheap CPU denial of
-// service and a way to fill the logs (M-04).
+// Query limits. Every token costs up to four cgo calls to aspell and the query
+// is attacker-controlled, so the input must be bounded.
 const (
 	maxQueryRunes  = 200
 	maxQueryTokens = 10
@@ -90,10 +89,8 @@ func (h SearchingHandler) handleAllTab(c *echo.Context, tokens []string) error {
 		pageSize = 20
 	}
 
-	// The ranker returns the candidate window in final order, so slicing it here
-	// is what makes page 1 the best page rather than the best coarse match.
-	// Bound the advertised pages by the results actually in hand, not by a
-	// second query that happens to agree today (review finding 1).
+	// The ranker returns the candidate window in final order, so slicing here makes
+	// page 1 the best page. Bound advertised pages by the results in hand.
 	reachable := len(ranked)
 	if totalResults < reachable {
 		reachable = totalResults
@@ -117,8 +114,8 @@ func (h SearchingHandler) handleAllTab(c *echo.Context, tokens []string) error {
 	// content of #results instead of a full page when it is set.
 	isHtmx := c.Request().Header.Get("HX-Request") == "true"
 
-	// Advertise the reachable count, not the unbounded DB count: 5,000 matches
-	// with a 100-result window must not read "About 5000 results" (H-14).
+	// Advertise the reachable count, not the unbounded DB count, so a large match
+	// set with a small window does not overstate the available pages.
 	return render(c, result.ShowAll(ranked[start:end], reachable, totalPages, currentPage, isHtmx))
 }
 

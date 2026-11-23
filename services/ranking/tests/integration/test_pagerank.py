@@ -324,8 +324,7 @@ def test_pagerankStoresReciprocalEdgesInBothDirections(graph: GraphBuilder) -> N
     graph.edge("a", "b")
     graph.edge("b", "a")
 
-    # The old reverse unique index dropped the second insert, so the graph lost
-    # half of every mutual link (H-15).
+    # Each direction is a separate row; a reverse edge must not be deduplicated.
     expected = {(graph.url("a"), graph.url("b")), (graph.url("b"), graph.url("a"))}
     if not expected.issubset(set(graph.edge_rows())):
         raise AssertionError(f"reciprocal edge missing: {graph.edge_rows()}")

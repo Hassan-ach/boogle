@@ -310,8 +310,8 @@ func TestGetDataReturnsTheWholeCandidateWindow(t *testing.T) {
 		indexWords(t, conn, p, map[string]int{"pageme": 1})
 	}
 
-	// Pagination is the handler's job now: the SQL pass has to hand the ranker
-	// every candidate in the window, not one already-sliced page (M-03).
+	// The SQL pass must hand the ranker every candidate in the window, not an
+	// already-sliced page; pagination happens in the handler.
 	data, err := window.GetData(context.Background(), []string{"pageme"})
 	if err != nil {
 		t.Fatalf("GetData: %v", err)

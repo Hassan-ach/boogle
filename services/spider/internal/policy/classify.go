@@ -45,10 +45,8 @@ func categorize(out Outcome, cfg *Config) (ActionKind, Reason) {
 		return ActPermanent, ReasonRedirectLoop
 	}
 
-	// A body that fails mid-stream still carries the response's status line, so
-	// checking the status first would classify a truncated 200 as a successful
-	// fetch and index half a page (M-17). The status gates still apply when the
-	// transfer completed.
+	// A body that fails mid-stream still carries a 2xx status line, so check the
+	// transfer error first; otherwise a truncated body indexes half a page.
 	if out.Err != nil && out.StatusCode >= 200 && out.StatusCode < 300 {
 		return ActBackoff, ReasonTruncatedBody
 	}

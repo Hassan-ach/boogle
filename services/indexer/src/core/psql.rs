@@ -21,9 +21,8 @@ pub trait DB: Send + Sync {
     async fn close(&self);
     /// Records that this page's word index is complete.
     ///
-    /// Success has to be distinguishable from a worker that claimed the page and
-    /// died: both leave `indexed = TRUE`, but only a dead claim keeps
-    /// `indexed_at` NULL, which is what the sweep reclaims. See C-01.
+    /// A completed page sets `indexed_at`; a worker that claimed the page and
+    /// died leaves it NULL, which is what the sweep reclaims.
     async fn mark_indexed(&self, page_id: Uuid) -> Result<(), AppError>;
     async fn get_stale_unindexed(
         &self,
@@ -91,10 +90,8 @@ impl DB for Psql {
         limit: i64,
         max_attempts: i32,
     ) -> Result<Vec<Uuid>, AppError> {
-        // Reclaim only claims that never completed. A finished page has
-        // `indexed_at` set, so it is untouched no matter how old its claim is.
-        // Matching every `indexed = TRUE` row here is what made the sweep delete
-        // and rebuild the whole corpus (C-01).
+        // Reclaim only claims that never completed: a finished page has
+        // `indexed_at` set and is untouched no matter how old its claim is.
         sqlx::query!(
             r#"WITH released AS (
                     UPDATE pages
@@ -141,10 +138,9 @@ impl DB for Psql {
     /// claim and the `indexed = TRUE` update share one statement so no row can be
     /// handed out without being marked.
     ///
-    /// `index_attempts` is incremented here, not on failure: every delivery of a
-    /// page counts, including one that aborts the worker before it can run its
-    /// failure path (panic = "abort"). Counting only the undo path let a page that
-    /// reliably crashes the process retry forever (H-12).
+    /// `index_attempts` is incremented here, not on failure: every delivery
+    /// counts, including one that aborts before the failure path can run
+    /// (`panic = "abort"`).
     async fn get_page_by_id(&self, page_id: Uuid, max_attempts: i32) -> Result<Page, AppError> {
         let mut tx = self.pool.begin().await?;
         let query = sqlx::query_as::<_, Page>(
@@ -180,12 +176,9 @@ impl DB for Psql {
         Ok(page)
     }
 
-    /// Writes one page's word counts in a single transaction.
-    ///
-    /// The word upserts and every `page_word` chunk commit together, so a process
-    /// that dies mid-page leaves the previous index untouched instead of a
-    /// half-written page (M-13). Retrying is the caller's job: a failed statement
-    /// aborts the transaction, and `index_page` retries the whole write.
+    /// Writes one page's word counts atomically; a failure leaves the previous
+    /// index intact. Retrying is the caller's job: a failed statement aborts the
+    /// transaction and `index_page` retries the whole write.
     async fn batch_words(
         &self,
         words: &HashMap<String, u32>,
@@ -230,9 +223,8 @@ impl DB for Psql {
 
         let mut tx = self.pool.begin().await?;
 
-        // A re-index replaces the page's term set. Upserting without this leaves
-        // words that are no longer on the page, so TF-IDF keeps scoring stale
-        // terms (M-13 follow-up).
+        // A re-index replaces the page's term set; without this delete, stale
+        // words would still be scored by TF-IDF.
         sqlx::query!("DELETE FROM page_word WHERE page_id = $1", page_id)
             .execute(&mut *tx)
             .await?;

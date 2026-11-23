@@ -323,6 +323,6 @@ func TestConcurrentSearchesNeverEnterTheSpellerAtTheSameTime(t *testing.T) {
 	wg.Wait()
 
 	if d.overlap {
-		t.Fatal("two goroutines called the shared speller concurrently (H-13)")
+		t.Fatal("two goroutines called the shared speller concurrently")
 	}
 }

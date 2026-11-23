@@ -846,10 +846,8 @@ func TestWithRobotsClientSharesTheConnectionPool(t *testing.T) {
 }
 
 // EnsureHost must match robots.txt agent groups against the string it actually
-// put on the wire, not the bare configured token. A site that echoes back the
-// exact agent it was addressed as -- "BoogleBot/1.0 (+https://...)" -- names a
-// group that the bare token is not a substring of, so those rules used to be
-// dropped entirely.
+// put on the wire, not the bare configured token: a site echoing the exact agent
+// it was addressed as names a group the bare token is not a substring of.
 func TestEnsureHostMatchesTheAgentItSentOnTheWire(t *testing.T) {
 	// robotsURLFor forces https, so this has to be a TLS server.
 	var mu sync.Mutex

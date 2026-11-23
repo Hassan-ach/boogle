@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
 # Apply every migration/*.sql to the running database, in filename order.
-#
-# The files are written to be idempotent, so this is safe to run on every
-# deploy and against an existing database. Postgres only runs
-# /docker-entrypoint-initdb.d when PGDATA is empty, so this script is the path
-# for schema changes after the first boot (M-19).
+# Migrations are idempotent, so this is safe on every deploy. Postgres only runs
+# /docker-entrypoint-initdb.d on an empty PGDATA, so this handles later schema changes.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

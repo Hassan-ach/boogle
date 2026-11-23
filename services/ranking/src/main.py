@@ -47,12 +47,8 @@ class RankingService:
         if logging.getLogger().handlers:
             return
 
-        # stdout is the container's log stream and the only sink guaranteed to
-        # be writable by the runtime user. A file sink is opt-in via LOG_PATH and
-        # a failure to open it must not stop the service: the shipped image runs
-        # as uid 10001 with a root-owned /app, so an unconditional
-        # FileHandler("ranking.log") raised PermissionError before the consumer
-        # ever started (H-03).
+        # stdout is the container log stream and the only sink guaranteed writable;
+        # LOG_PATH opts into a file sink, and failure to open it is non-fatal.
         handlers: list[logging.Handler] = [logging.StreamHandler()]
         log_path = os.getenv("LOG_PATH")
         if log_path:
@@ -109,11 +105,8 @@ class RankingService:
     async def _initialize_db_with_retry(self, attempts: int = 5) -> None:
         """Open the pool, retrying a database that is still starting.
 
-        `wait=True` is what makes a bad DSN fatal at boot instead of on the first
-        query, but under `restart: unless-stopped` a Postgres that comes up a few
-        seconds later used to produce an instant crash loop. Five bounded
-        attempts bridge a normal compose startup without hiding a real
-        misconfiguration.
+        Bounded attempts bridge a slow startup while `wait=True` keeps a bad DSN
+        fatal at boot instead of on the first query.
         """
         delay = 1.0
         for attempt in range(1, attempts + 1):
@@ -148,14 +141,9 @@ class RankingService:
 
         self.messaging.register_pipeline_handler(self.calculator.run_pipeline)
 
-        # A fresh deployment has no page_rank rows, and the engine only surfaces
-        # ranked pages. Waiting for the first N confirmations leaves a small
-        # corpus unsearchable, so score what exists once at startup (H-17).
-        # It goes through the same lock as a threshold-triggered run: otherwise
-        # the first batch of confirmations starts a second full pipeline
-        # concurrently. FastStream installs its own SIGINT/SIGTERM handlers in
-        # run(), so shutdown is FastStream's exit plus the after_shutdown hook
-        # (MessagingService.drain); the pool is closed after run() returns.
+        # The startup run goes through the same lock as a threshold-triggered
+        # run, so the first confirmations cannot start a second pipeline
+        # concurrently.
         if run_on_startup_enabled():
             logger.info("Scheduling an initial ranking run")
             self.messaging.trigger_pipeline(force=True)
@@ -178,8 +166,7 @@ def main():
     except KeyboardInterrupt:
         logger.info("Service stopped by user")
     except Exception as e:
-        # Exiting 0 here told every supervisor this was a clean shutdown, so no
-        # orchestrator restarted a service that never consumed a message (L-04).
+        # A failed startup must exit nonzero so the supervisor restarts it.
         logger.error(f"Service failed with error: {e}", exc_info=True)
         sys.exit(1)
 

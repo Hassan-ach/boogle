@@ -178,7 +178,7 @@ def test_conninfo_escapes_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     conninfo = DatabaseManager()._build_conninfo()
 
     # make_conninfo emits keyword=value form, so credentials round-trip without
-    # being reparsed as URL structure (M-11).
+    # being reparsed as URL structure.
     from psycopg.conninfo import conninfo_to_dict
 
     parsed = conninfo_to_dict(conninfo)

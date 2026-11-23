@@ -274,13 +274,8 @@ func loadAppConfig() AppConfig {
 	}
 }
 
-// jobQueueName is the queue the indexer consumes.
-//
-// Both sides must agree on one name. Spider used to default to "indexer.job"
-// while the indexer consumed "indexer.jobs", so every job landed in a queue
-// nobody read and only the indexer's sweep recovered the page, minutes later
-// (H-01). RABBITMQ_JOB_QUEUE is still read for deployments that set the old
-// name, but RABBITMQ_QUEUE wins and the default matches the indexer.
+// jobQueueName returns the queue the indexer consumes; RABBITMQ_QUEUE wins over
+// RABBITMQ_JOB_QUEUE, and the default matches the indexer.
 func jobQueueName() string {
 	if queue := os.Getenv("RABBITMQ_QUEUE"); queue != "" {
 		return queue

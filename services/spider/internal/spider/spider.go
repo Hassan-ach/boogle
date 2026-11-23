@@ -49,9 +49,7 @@ type Spider struct {
 	fetchpool chan struct{}
 	logger    *utils.Logger
 
-	// One AMQP channel per crawler goroutine, created on first use. Opening a
-	// channel per crawl produced roughly a hundred channel objects per second at
-	// the default settings (H-09).
+	// One AMQP channel per crawler goroutine, created on first use and reused.
 	channels sync.Map
 }
 
@@ -59,7 +57,7 @@ func NewSpider(conf *config.Config) *Spider {
 	// The crawler dials addresses supplied by arbitrary pages, so the transport
 	// refuses non-public destinations (loopback, RFC 1918, link-local, metadata
 	// service, container network names) instead of relying on the policy layer,
-	// which only sees the URL string (H-07). Proxy support is deliberately off:
+	// which only sees the URL string. Proxy support is deliberately off:
 	// a proxy would be dialed through the same guard and an operator-configured
 	// proxy is not part of this deployment.
 	httpClient := &http.Client{
@@ -197,12 +195,8 @@ func (s *Spider) crawler(crawler_id int) {
 
 const requeueDelay = 30 * time.Second
 
-// bookkeepingContext survives the crawl deadline.
-//
-// The whole crawl runs under one CRAWLER_TIMEOUT context, and the failures that
-// most need recording -- a timed-out fetch, a slow persist -- are exactly the
-// ones where that context is already done. Without this, the bookkeeping write
-// fails with the same deadline and the popped URL is lost (M-25).
+// bookkeepingContext survives the crawl deadline so bookkeeping writes still land
+// after a timed-out fetch or a slow persist has spent the crawl's context.
 func bookkeepingContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 }
@@ -219,11 +213,8 @@ func (s *Spider) deferCrawl(ctx context.Context, rawURL string, logger *slog.Log
 }
 
 // requeue returns a popped URL to the frontier and spends one attempt from the
-// same budget a failed fetch uses.
-//
-// PopFrontier removes an entry unconditionally. Every failure before the page is
-// persisted therefore has to put the URL back, or the frontier silently loses
-// work (M-25).
+// same budget a failed fetch uses. PopFrontier removes an entry unconditionally,
+// so any failure before the page is persisted must put the URL back.
 func (s *Spider) requeue(ctx context.Context, rawURL string, logger *slog.Logger) {
 	rctx, cancel := bookkeepingContext(ctx)
 	defer cancel()
@@ -296,10 +287,8 @@ func (s *Spider) crawl(crawler_id int) {
 		logger.Debug("URL deferred", "url", rawUrl, "reason", verdict.Reason, "until", verdict.Until)
 		return
 	case policy.Skip:
-		// PopFrontier is destructive. A Skip that carries a future Until means
-		// "not now", not "never": retiring it would blacklist every URL of a host
-		// that was transiently cold or over budget for the deployment's lifetime
-		// (H-08).
+		// PopFrontier is destructive. A future Until means "not now", not "never":
+		// retiring it would blacklist a host that was transiently cold or over budget.
 		if !verdict.Until.IsZero() && verdict.Until.After(s.policy.Now()) {
 			pctx, cancel := bookkeepingContext(ctx)
 			err := s.policy.Park(pctx, rawUrl, verdict.Until)
@@ -351,9 +340,8 @@ func (s *Spider) crawl(crawler_id int) {
 		}
 		return
 	}
-	// Storage identity is always the URL that was fetched. The parser may have
-	// captured an `og:url` as display metadata, but a document does not get to
-	// decide which `urls`/`pages` row it is written to (C-03).
+	// Storage identity stays the fetched URL: an `og:url` is display metadata,
+	// not a say in which `urls`/`pages` row the document lands in.
 	page.URL = rawUrl
 	page.StatusCode = out.StatusCode
 	page.HTML = body
@@ -399,9 +387,8 @@ func (s *Spider) crawl(crawler_id int) {
 		return
 	}
 
-	// Publish before retiring. Retiring first meant a confirmed-failed publish
-	// still removed the URL from the crawl path; now the failure leaves it
-	// reclaimable and the page is retried end to end (H-09).
+	// Publish before retiring so a failed publish leaves the URL reclaimable
+	// for a full retry.
 	pubctx, pcancel := bookkeepingContext(ctx)
 	err = queue.Publish(
 		pubctx,

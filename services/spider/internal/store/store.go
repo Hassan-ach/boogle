@@ -63,9 +63,8 @@ func (s *Store) persistPage(ctx context.Context, page *entity.Page) (pageID uuid
 
 	var pageURLID string
 
-	// One transaction for the page, its links and its edges. Committing the page
-	// first let a later edge failure leave a "complete" page with no graph, which
-	// is PageRank's only input (H-06).
+	// One transaction for the page, links and edges: a page without its graph
+	// edges is incomplete for PageRank.
 	if err = s.db.WithTx(ctx, func(tx *sql.Tx) error {
 		pageID, pageURLID, err = s.db.InsertPage(ctx, tx, page)
 		if err != nil {
@@ -86,7 +85,7 @@ func (s *Store) persistPage(ctx context.Context, page *entity.Page) (pageID uuid
 			}
 			id, ok := linkIDs[link]
 			if !ok {
-				// Silently skipping would recreate H-06 as an incomplete graph.
+				// A missing id would leave the link graph incomplete, so fail here.
 				return fmt.Errorf("no url id for admitted link %q", link)
 			}
 			toURLIDs = append(toURLIDs, id)

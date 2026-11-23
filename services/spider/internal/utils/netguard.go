@@ -7,17 +7,9 @@ import (
 	"time"
 )
 
-// PublicOnlyDialContext returns a dial function that refuses to connect to any
-// address that is not publicly routable.
-//
-// The crawler follows links from arbitrary pages, so without this a page can
-// point it at `https://psql:5432`, `https://redis:6379`, the broker's admin port,
-// or the cloud metadata endpoint and pull the response into the index (H-07).
-//
-// The dialer resolves the host itself and connects to the concrete IP it
-// checked. That matters: resolving once for a check and letting the transport
-// resolve again leaves a rebinding window in which the second answer is a
-// private address.
+// PublicOnlyDialContext returns a dial function that refuses non-public addresses,
+// including internal services and cloud metadata endpoints. It resolves and dials
+// the same IP to avoid a DNS rebinding gap.
 func PublicOnlyDialContext(dialer *net.Dialer) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	if dialer == nil {
 		dialer = &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}

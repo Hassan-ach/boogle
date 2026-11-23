@@ -48,8 +48,8 @@ type PsqlStore struct {
 // nothing without Postgres, and failing at boot surfaces the misconfiguration
 // instead of returning empty result pages to every query.
 func NewStore(conf store.StoreConfig) PsqlStore {
-	// Built with url.URL rather than fmt.Sprintf so a password containing '@',
-	// ':' or '/' is escaped instead of changing the connection target (M-06).
+	// Built with url.URL so a password containing '@', ':' or '/' is escaped
+	// instead of changing the connection target.
 	conn, err := sql.Open("postgres", connectionString(conf))
 	if err != nil {
 		panic(fmt.Sprintf("Failed to open database connection: %v", err))
@@ -203,8 +203,8 @@ func (s PsqlStore) GetData(c context.Context, words []string) (*Data, error) {
 }
 
 // GetTotalResults counts every page matching any query word, not just the window
-// GetData returns. The handler divides this by PageSize to get the number of
-// pages, so the UI does not advertise one page per match (H-14).
+// GetData returns. The handler divides this by PageSize so the UI reports the
+// number of pages, not one page per match.
 func (s PsqlStore) GetTotalResults(c context.Context, query []string) (int, error) {
 	sql := `
 		SELECT COUNT(DISTINCT p.id)

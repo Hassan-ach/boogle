@@ -49,13 +49,9 @@ pub trait Indexe {
     async fn sweep_loop(self: Arc<Self>, tk: CancellationToken);
 }
 
-/// Decides whether a failed message goes back on the queue.
-///
-/// This is the poison-message line: requeueing a permanent failure loops forever,
-/// and dropping a transient one loses work that would have succeeded. A parse or
-/// serde error will fail identically on every retry, so it is dropped; a database
-/// or messaging error may succeed later. `NotFoundError` is excluded from requeue
-/// because the referenced row is gone for good.
+/// Requeue only errors that may succeed later: database and messaging ones.
+/// Parse/serde errors and `NotFoundError` are permanent and must be dropped
+/// rather than looping on a message that will always fail.
 pub fn should_requeue(err: &AppError) -> bool {
     match err {
         AppError::Database(db_err) => !matches!(db_err, DatabaseError::NotFoundError(_)),
@@ -107,11 +103,8 @@ where
     }
 
     /// Consume until shutdown, reconnecting with backoff across broker blips.
-    ///
-    /// A consumer-stream error used to propagate out of the loop and abort the
-    /// process, which permanently stopped indexing (H-11). Now only startup
-    /// failure is fatal; a broken stream is retried, and the caller keeps the
-    /// drain path for shutdown.
+    /// Only startup failure is fatal: stream errors are retried and shutdown
+    /// drains in-flight work.
     pub async fn index_loop(self: Arc<Self>, tk: CancellationToken) -> Result<(), AppError> {
         if tk.is_cancelled() {
             info!(
@@ -287,18 +280,9 @@ where
             }
         }
 
-        // Publish the confirmation before recording completion. The two writes
-        // cannot share a transaction with the broker, so the order decides which
-        // failure is recoverable:
-        //
-        //   publish then mark  -> a mark failure leaves the page unmarked, the
-        //                         sweep reclaims it, and ranking sees the
-        //                         confirmation twice. Duplicate confirmations are
-        //                         harmless; a missing one starves ranking.
-        //   mark then publish  -> a publish failure acks an already-complete
-        //                         page, and nothing revisits it (H-10).
-        //
-        // A publish failure releases the claim, so the job is nacked and retried.
+        // Publish before marking completion: the two writes cannot share a
+        // transaction, and a missing confirmation starves ranking while a
+        // duplicate is harmless. A publish failure releases the claim for retry.
         match retry_sync(self.conf.max_retries.max(1), || {
             serde_json::to_vec(&IndexConfirmation { page_id: page.id })
         }) {
@@ -943,8 +927,7 @@ mod tests {
         let tk = CancellationToken::new();
         tk.cancel();
 
-        // A shutdown before consuming is a normal stop, not a startup failure:
-        // returning an error here skipped the drain path (H-11).
+        // Shutdown before consuming is a normal stop, not a startup failure.
         indexer
             .index_loop(tk)
             .await

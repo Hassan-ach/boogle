@@ -55,9 +55,8 @@ async fn main() -> Result<(), AppError> {
 
     token.cancel();
 
-    // A loop error is logged but no longer skips the drain: exiting before the
-    // in-flight tasks were awaited lost their writes (H-11). The final exit code
-    // still reports the failure so an orchestrator restarts the container.
+    // Always drain both loops before exiting; the exit code still reports any
+    // loop failure so an orchestrator restarts the container.
     let mut had_error = false;
     match indexer_handle.await {
         Ok(Ok(())) => info!(log, "Indexer loop stopped"),

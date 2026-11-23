@@ -243,8 +243,8 @@ func TestThePageParameterSelectsASliceOfTheRankedWindow(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	// The ranked window is fetched once and sliced in Go; the SQL pass no longer
-	// decides which results belong to page 2.
+	// The ranked window is fetched once and sliced in Go; the handler, not the
+	// SQL pass, decides which results belong to page 2.
 	if s.dataCall != 1 {
 		t.Errorf("GetData was called %d times, want 1", s.dataCall)
 	}

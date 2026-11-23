@@ -1,9 +1,7 @@
 #!/bin/sh
 set -eu
 
-# Database: DATABASE_URL wins, otherwise every PG_* variable is required. The
-# application accepts either form; requiring both used to reject a valid
-# DATABASE_URL-only deployment (M-10).
+# Database: DATABASE_URL wins; otherwise every PG_* variable is required.
 if [ -z "${DATABASE_URL:-}" ]; then
   : "${PG_HOST:?DATABASE_URL or PG_HOST must be set}"
   : "${PG_PORT:?DATABASE_URL or PG_PORT must be set}"
