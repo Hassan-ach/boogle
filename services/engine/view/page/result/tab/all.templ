@@ -3,22 +3,27 @@ import "github.com/Hassan-ach/boogle/services/engine/internal/model"
 import "github.com/Hassan-ach/boogle/services/engine/view/component"
 import "fmt"
 
-templ All(pages []*model.Page) {
-    <div class="content-container py-6" id="results">
-        <main class="max-w-3xl">
-            <div class="mb-4 text-sm text-gray-600">
-                About <span class="font-medium">{ fmt.Sprintf("%d", len(pages)) }</span> results
-            </div>
+// All renders the inner content of #results. It is used for both the full page
+// and the htmx swap, because #results is the swap target and the response must
+// not contain a second element with that id.
+templ All(pages []*model.Page, totalResults int, totalPages int, currentPage int) {
+    <main class="max-w-3xl">
+        <div class="mb-4 text-sm text-gray-600">
+            About <span class="font-medium">{ fmt.Sprintf("%d", totalResults) }</span> results
+        </div>
 
-            <div class="space-y-8">
-                if len(pages) == 0 {
-                    @component.NoResults()
-                } else {
-                    for _, p := range pages {
-                        @component.PageCard(p)
-                    }
+        <div class="space-y-8">
+            if len(pages) == 0 {
+                @component.NoResults()
+            } else {
+                for _, p := range pages {
+                    @component.PageCard(p)
                 }
-            </div>
-        </main>
-    </div>
+            }
+        </div>
+
+        if totalPages > 1 {
+            @component.Pagination(totalPages, currentPage)
+        }
+    </main>
 }

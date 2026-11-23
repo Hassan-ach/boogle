@@ -1,7 +1,6 @@
 package utils
 
 import (
-	"fmt"
 	"sort"
 )
 
@@ -50,14 +49,6 @@ func (s *Set[T]) GetAll() []T {
 
 func (s Set[T]) Contains(t T) bool {
 	return s.elements[t]
-}
-
-func (s Set[T]) Print() {
-	for url, ok := range s.elements {
-		if ok {
-			fmt.Println(url)
-		}
-	}
 }
 
 func (s Set[T]) Len() int {

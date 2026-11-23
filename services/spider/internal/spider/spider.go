@@ -3,9 +3,9 @@ package spider
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sync"
@@ -17,13 +17,14 @@ import (
 	"github.com/Hassan-ach/boogle/services/spider/internal/messaging"
 	"github.com/Hassan-ach/boogle/services/spider/internal/parser"
 	"github.com/Hassan-ach/boogle/services/spider/internal/policy"
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"github.com/Hassan-ach/boogle/services/spider/internal/store"
 	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
 
 type pageStore interface {
 	Init(startUrls []string) error
-	Persist(ctx context.Context, page *entity.Page, host *entity.Host) uuid.UUID
+	Persist(ctx context.Context, page *entity.Page) (uuid.UUID, error)
 	Close()
 }
 
@@ -47,10 +48,29 @@ type Spider struct {
 
 	fetchpool chan struct{}
 	logger    *utils.Logger
+
+	// One AMQP channel per crawler goroutine, created on first use and reused.
+	channels sync.Map
 }
 
 func NewSpider(conf *config.Config) *Spider {
-	httpClient := &http.Client{Timeout: time.Duration(conf.App.HttpTimeout) * time.Second}
+	// The crawler dials addresses supplied by arbitrary pages, so the transport
+	// refuses non-public destinations (loopback, RFC 1918, link-local, metadata
+	// service, container network names) instead of relying on the policy layer,
+	// which only sees the URL string. Proxy support is deliberately off:
+	// a proxy would be dialed through the same guard and an operator-configured
+	// proxy is not part of this deployment.
+	httpClient := &http.Client{
+		Timeout: time.Duration(conf.App.HttpTimeout) * time.Second,
+		Transport: &http.Transport{
+			DialContext:         utils.PublicOnlyDialContext(nil),
+			TLSHandshakeTimeout: 10 * time.Second,
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+			ForceAttemptHTTP2:   true,
+		},
+	}
 	logger := utils.NewMultiLogger(conf.App.LogsPath)
 
 	mq, err := messaging.NewRabbitMQ(&conf.RabbitMq, logger)
@@ -60,13 +80,13 @@ func NewSpider(conf *config.Config) *Spider {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	cache := store.NewRedisClient(conf.Store.Cache)
-	policyState := policy.NewRedisState(
+	crawlState := state.NewRedisState(
 		cache.Conn(),
 		conf.Policy.RedisPrefix,
 		conf.Policy.URLStateTTL,
 	)
 
-	policyManager := policy.New(conf.Policy, policyState, logger.Logger).
+	policyManager := policy.New(conf.Policy, crawlState, logger.Logger).
 		WithFetchClient(httpClient).
 		WithRobotsClient(httpClient).
 		WithSiteMapResolver(func(ctx context.Context, base *url.URL, sitemaps []string) []string {
@@ -78,7 +98,7 @@ func NewSpider(conf *config.Config) *Spider {
 		httpClient:     httpClient,
 		mq:             mq,
 		parser:         parser.NewParser(httpClient, logger),
-		store:          store.NewStore(conf.Store, logger, cache, policyState),
+		store:          store.NewStore(conf.Store, logger, cache, crawlState),
 		policy:         policyManager,
 		wg:             sync.WaitGroup{},
 		ctx:            ctx,
@@ -89,7 +109,10 @@ func NewSpider(conf *config.Config) *Spider {
 		logger:         logger,
 	}
 
-	fmt.Printf("Spider initialized: %+v\n", s)
+	// config is a *config.Config, whose String redacts, so this cannot print a
+	// password even though it dumps the whole struct.
+	logger.Info("Spider initialized", "config", conf.Redacted())
+
 	return s
 }
 
@@ -118,8 +141,40 @@ func (s *Spider) Stop() {
 }
 
 func (s *Spider) Close() {
+	s.channels.Range(func(key, value any) bool {
+		value.(messaging.MessagingChannel).Close()
+		s.channels.Delete(key)
+		return true
+	})
 	s.store.Close()
+	s.mq.Close()
 	s.logger.Close()
+}
+
+// channelFor returns the crawler's long-lived AMQP channel, opening one on first
+// use. A channel is not shared between goroutines, so the id is the key.
+func (s *Spider) channelFor(crawlerID int) (messaging.MessagingChannel, error) {
+	if existing, ok := s.channels.Load(crawlerID); ok {
+		return existing.(messaging.MessagingChannel), nil
+	}
+
+	ch, err := s.mq.NewMessagingChannel()
+	if err != nil {
+		return nil, err
+	}
+
+	actual, loaded := s.channels.LoadOrStore(crawlerID, ch)
+	if loaded {
+		ch.Close()
+	}
+	return actual.(messaging.MessagingChannel), nil
+}
+
+// dropChannel discards a broken channel so the next round reopens one.
+func (s *Spider) dropChannel(crawlerID int) {
+	if existing, ok := s.channels.LoadAndDelete(crawlerID); ok {
+		existing.(messaging.MessagingChannel).Close()
+	}
 }
 
 func (s *Spider) crawler(crawler_id int) {
@@ -138,23 +193,53 @@ func (s *Spider) crawler(crawler_id int) {
 	}
 }
 
+const requeueDelay = 30 * time.Second
+
+// bookkeepingContext survives the crawl deadline so bookkeeping writes still land
+// after a timed-out fetch or a slow persist has spent the crawl's context.
+func bookkeepingContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+}
+
+// deferCrawl parks a URL for a short retry without touching its attempt budget.
+// Used for infrastructure failures that say nothing about the URL itself.
+func (s *Spider) deferCrawl(ctx context.Context, rawURL string, logger *slog.Logger) {
+	rctx, cancel := bookkeepingContext(ctx)
+	defer cancel()
+	if err := s.policy.Park(rctx, rawURL, s.policy.Now().Add(requeueDelay)); err != nil {
+		logger.Error("Could not park a URL after an infrastructure failure",
+			"url", rawURL, "error", err)
+	}
+}
+
+// requeue returns a popped URL to the frontier and spends one attempt from the
+// same budget a failed fetch uses. PopFrontier removes an entry unconditionally,
+// so any failure before the page is persisted must put the URL back.
+func (s *Spider) requeue(ctx context.Context, rawURL string, logger *slog.Logger) {
+	rctx, cancel := bookkeepingContext(ctx)
+	defer cancel()
+	if err := s.policy.Requeue(rctx, rawURL); err != nil {
+		logger.Error("Could not return a popped URL to the frontier",
+			"url", rawURL, "error", err)
+	}
+}
+
 func (s *Spider) crawl(crawler_id int) {
 	ctx, cancel := context.WithTimeout(s.ctx, s.crawlerTimeout)
 	defer cancel()
 
 	logger := s.logger.With("component", "crawler", "crawler_id", crawler_id)
 
-	queue, err := s.mq.NewMessagingChannel()
+	queue, err := s.channelFor(crawler_id)
 	if err != nil {
 		logger.Error("Failed to create messaging channel", "error", err)
 		return
 	}
-	defer queue.Close()
 
 	select {
 	case s.fetchpool <- struct{}{}:
 	case <-ctx.Done():
-		fmt.Println("Crawler timed out waiting for fetch slot")
+		logger.Error("Crawler timed out waiting for fetch slot", "crawler_id", crawler_id)
 		return
 	}
 	defer func() { <-s.fetchpool }()
@@ -170,9 +255,17 @@ func (s *Spider) crawl(crawler_id int) {
 
 	rawUrl := next.URL
 
+	// The visited set is keyed by the canonical form, so fetch, persist and
+	// retire the same spelling or a rediscovered page is stored twice under two
+	// identities.
+	if canonical, ok := utils.CanonicalizeUrl(rawUrl, ""); ok {
+		rawUrl = canonical
+	}
+
 	verdict, err := s.policy.Admit(ctx, rawUrl)
 	if err != nil {
 		logger.Error("Could not ask the policy manager about a URL", "url", rawUrl, "error", err)
+		s.requeue(ctx, rawUrl, logger)
 		return
 	}
 	switch verdict.Kind {
@@ -180,25 +273,46 @@ func (s *Spider) crawl(crawler_id int) {
 	case policy.Defer:
 		if verdict.Until.IsZero() {
 			logger.Error("The policy manager deferred a URL with no due time, so it "+
-				"cannot be parked and has been dropped from the frontier",
+				"cannot be parked and has been put back on the frontier",
 				"url", rawUrl, "reason", verdict.Reason)
-		} else if err := s.policy.Park(ctx, rawUrl, verdict.Until); err != nil {
-			logger.Error("Could not park a deferred URL", "url", rawUrl, "error", err)
+			s.requeue(ctx, rawUrl, logger)
+		} else {
+			pctx, cancel := bookkeepingContext(ctx)
+			err := s.policy.Park(pctx, rawUrl, verdict.Until)
+			cancel()
+			if err != nil {
+				logger.Error("Could not park a deferred URL", "url", rawUrl, "error", err)
+			}
 		}
 		logger.Debug("URL deferred", "url", rawUrl, "reason", verdict.Reason, "until", verdict.Until)
 		return
 	case policy.Skip:
-		if err := s.policy.Retire(ctx, rawUrl); err != nil {
+		// PopFrontier is destructive. A future Until means "not now", not "never":
+		// retiring it would blacklist a host that was transiently cold or over budget.
+		if !verdict.Until.IsZero() && verdict.Until.After(s.policy.Now()) {
+			pctx, cancel := bookkeepingContext(ctx)
+			err := s.policy.Park(pctx, rawUrl, verdict.Until)
+			cancel()
+			if err != nil {
+				logger.Error("Could not park a temporarily skipped URL", "url", rawUrl, "error", err)
+			}
+			logger.Debug("URL skipped until later", "url", rawUrl,
+				"reason", verdict.Reason, "until", verdict.Until)
+			return
+		}
+		rctx, cancel := bookkeepingContext(ctx)
+		err := s.policy.Retire(rctx, rawUrl)
+		cancel()
+		if err != nil {
 			logger.Error("Could not retire a skipped URL", "url", rawUrl, "error", err)
 		}
 		logger.Debug("URL skipped", "url", rawUrl, "reason", verdict.Reason)
 		return
 	default:
 		logger.Error("The policy manager returned an unknown verdict", "url", rawUrl, "verdict", verdict.Kind)
+		s.requeue(ctx, rawUrl, logger)
 		return
 	}
-
-	host := verdict.Host
 
 	body, out := s.policy.Fetch(ctx, rawUrl)
 
@@ -206,6 +320,7 @@ func (s *Spider) crawl(crawler_id int) {
 	if err != nil {
 		logger.Error("Could not record a fetch outcome",
 			"url", rawUrl, "status", out.StatusCode, "error", err)
+		s.requeue(ctx, rawUrl, logger)
 		return
 	}
 	if action.Kind != policy.ActSuccess {
@@ -217,20 +332,26 @@ func (s *Spider) crawl(crawler_id int) {
 	page, err := s.parser.ParseHTML(bytes.NewReader(body), rawUrl)
 	if err != nil {
 		logger.Warn("Discarded a page that would not parse", "url", rawUrl, "error", err)
-		if derr := s.policy.Discard(ctx, rawUrl, policy.ReasonBodyUnparseable); derr != nil {
+		dctx, cancel := bookkeepingContext(ctx)
+		derr := s.policy.Discard(dctx, rawUrl, policy.ReasonBodyUnparseable)
+		cancel()
+		if derr != nil {
 			logger.Error("Could not discard an unparseable page", "url", rawUrl, "error", derr)
 		}
 		return
 	}
-	if page.URL == "" {
-		page.URL = rawUrl
-	}
+	// Storage identity stays the fetched URL: an `og:url` is display metadata,
+	// not a say in which `urls`/`pages` row the document lands in.
+	page.URL = rawUrl
 	page.StatusCode = out.StatusCode
 	page.HTML = body
 
 	if !policy.IsEnglish(page.Lang) {
 		logger.Info("Skipping non-English page", "url", rawUrl, "lang", page.Lang)
-		if err := s.policy.Discard(ctx, rawUrl, policy.ReasonLanguageNotEnglish); err != nil {
+		dctx, cancel := bookkeepingContext(ctx)
+		err := s.policy.Discard(dctx, rawUrl, policy.ReasonLanguageNotEnglish)
+		cancel()
+		if err != nil {
 			logger.Error("Could not record a discarded page", "url", rawUrl, "error", err)
 		}
 		return
@@ -258,25 +379,43 @@ func (s *Spider) crawl(crawler_id int) {
 	}
 	page.Links = admitted
 
-	pageId := s.store.Persist(ctx, page, host)
-	if pageId == uuid.Nil() {
-		logger.Warn("Page was not persisted; leaving it crawlable", "url", page.URL)
+	pageId, persistErr := s.store.Persist(ctx, page)
+	if persistErr != nil || pageId == uuid.Nil() {
+		logger.Warn("Page was not persisted; returning it to the frontier",
+			"url", page.URL, "error", persistErr)
+		s.requeue(ctx, rawUrl, logger)
 		return
 	}
 
-	if err := s.policy.Retire(ctx, rawUrl); err != nil {
+	// Publish before retiring so a failed publish leaves the URL reclaimable
+	// for a full retry.
+	pubctx, pcancel := bookkeepingContext(ctx)
+	err = queue.Publish(
+		pubctx,
+		s.config.App.JobQueue,
+		messaging.NewIndexerJobPayload(pageId.String()),
+	)
+	pcancel()
+	if err != nil {
+		logger.Error(
+			"Failed to publish job to indexer queue; returning the URL to the frontier",
+			"url", page.URL, "error", err,
+		)
+		s.dropChannel(crawler_id)
+		// A broker outage is not this URL's fault, so it must not spend the
+		// page's fetch-attempt budget (which would retire it permanently).
+		s.deferCrawl(ctx, rawUrl, logger)
+		return
+	}
+
+	rctx, cancel := bookkeepingContext(ctx)
+	err = s.policy.Retire(rctx, rawUrl)
+	cancel()
+	if err != nil {
 		logger.Error("Could not mark a stored page visited", "url", rawUrl, "error", err)
 	}
 
-	s.policy.Discover(ctx, page.Links)
-
-	if err := queue.Publish(
-		s.config.App.JobQueue,
-		messaging.NewIndexerJobPayload(pageId.String()),
-	); err != nil {
-		s.logger.Error(
-			"Failed to publish job to indexer queue",
-			"url", page.URL, "error", err,
-		)
-	}
+	dctx, dcancel := bookkeepingContext(ctx)
+	s.policy.Discover(dctx, page.Links)
+	dcancel()
 }

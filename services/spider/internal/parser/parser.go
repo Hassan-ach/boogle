@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -58,53 +57,12 @@ func (p *Parser) ParseHTML(r io.Reader, baseURL string) (*entity.Page, error) {
 	)
 
 	return &entity.Page{
+		// Identity is the URL the spider fetched. Everything the document claims
+		// about its own address stays in metadata.
+		URL:      baseURL,
 		MetaData: c.Meta,
 		Links: utils.NewSetFromSlice(
 			utils.CanonicalizeUrls(c.Links, u.Host)).GetAll(),
 		Images: utils.NewSetFromSlice(c.Imags).GetAll(),
 	}, nil
-}
-
-func (p *Parser) ParseRobots(txt, ua string) *entity.Robots {
-	r := &entity.Robots{
-		CrawlDelay: 5,
-	}
-
-	if ua == "" {
-		ua = "*"
-	}
-
-	var uaActive bool
-	for _, line := range strings.Split(txt, "\n") {
-
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		lower := strings.ToLower(line)
-
-		switch {
-		case strings.HasPrefix(lower, "user-agent:"):
-			userAgent := strings.TrimSpace(line[11:])
-			uaActive = (userAgent == ua || userAgent == "*")
-		case strings.HasPrefix(lower, "sitemap:"):
-			sitemapURL := strings.TrimSpace(line[8:])
-			r.SiteMaps = append(r.SiteMaps, sitemapURL)
-		case uaActive:
-			switch {
-			case strings.HasPrefix(lower, "disallow:"):
-				rule := strings.TrimSpace(line[9:])
-				r.Disallow = append(r.Disallow, rule)
-			case strings.HasPrefix(lower, "allow:"):
-				rule := strings.TrimSpace(line[6:])
-				r.Allow = append(r.Allow, rule)
-			case strings.HasPrefix(lower, "crawl-delay:"):
-				if d, err := strconv.Atoi(strings.TrimSpace(line[12:])); err == nil && d > 0 {
-					r.CrawlDelay = d
-				}
-			}
-		}
-	}
-	return r
 }

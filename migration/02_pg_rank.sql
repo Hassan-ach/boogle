@@ -18,19 +18,14 @@ BEGIN
     WHERE indexed = TRUE;
 
     IF node_num = 0 THEN
+        -- The early return skips the final cleanup, so clear stale scores here.
+        DELETE FROM page_rank;
         RETURN;
     END IF;
 
     -- PageRank values
-    -- url_id is used because graph_edges.from_url/to_url reference urls.id
-    --
-    -- Both working tables are created with DROP ... IF EXISTS first. They are
-    -- ON COMMIT DROP, so within a single transaction they outlive the first
-    -- call and the second call used to fail with
-    --   relation "temp_page_rank" already exists
-    -- which the ranking service treats as a non-retryable error. Anything that
-    -- ran the function twice in one transaction -- a backfill, a repair script,
-    -- a test -- was simply broken.
+    -- url_id matches graph_edges' url references. IF NOT EXISTS plus TRUNCATE
+    -- lets repeated calls in one transaction reuse the temp tables.
     CREATE TEMP TABLE IF NOT EXISTS temp_page_rank (
         url_id UUID PRIMARY KEY,
         score FLOAT NOT NULL
@@ -45,22 +40,8 @@ BEGIN
     FROM pages p
     WHERE p.indexed = TRUE;
 
-    -- The out-degree table must be built from exactly the edge set the rank
-    -- table is built from, or rank is not conserved.
-    --
-    -- It used to be `SELECT from_url, COUNT(*) FROM graph_edges GROUP BY
-    -- from_url`, i.e. every edge in the table. A page linking to ten targets
-    -- where only three are indexed therefore divided its rank by ten, and the
-    -- seven tenths pointing at unindexed pages vanished: `dangling_rank` never
-    -- saw them either, because the node *did* have a row in the out-degree
-    -- table. On the live index the total came to about 0.771, so a quarter of
-    -- all ranking signal was being deleted on every run and each recalculation
-    -- dragged every page's score further toward zero.
-    --
-    -- Restricting the edge set to indexed -> indexed fixes both halves at once:
-    -- the surviving links get a correct denominator, and links into unindexed
-    -- pages leave their source with no *indexed* out-degree, which is exactly
-    -- the dangling condition the redistribution term is defined over.
+    -- Out-degree and the rank join must use the same indexed -> indexed edge
+    -- set: unindexed targets would inflate the denominator and drop rank signal.
     CREATE TEMP TABLE IF NOT EXISTS temp_out_degree (
         from_url UUID PRIMARY KEY,
         cnt FLOAT NOT NULL
@@ -68,9 +49,7 @@ BEGIN
 
     TRUNCATE temp_out_degree;
 
-    -- The same restricted edge set is reused by the main join below. It has to
-    -- be one set, not two look-alikes: if the denominator and the numerator
-    -- disagree about which edges exist, the leak comes straight back.
+    -- One restricted edge set feeds both the denominator and the main join.
     CREATE TEMP TABLE IF NOT EXISTS temp_graph_edges (
         from_url UUID NOT NULL,
         to_url   UUID NOT NULL
@@ -94,9 +73,8 @@ BEGIN
     -- PageRank iterations
     FOR i IN 1..max_iterations LOOP
 
-        -- Total rank belonging to dangling nodes: indexed pages with no indexed
-        -- out-edge. Rank left on the floor is handed back through the teleport
-        -- term below, which is what keeps the total at exactly 1.0.
+        -- Dangling rank: indexed pages with no indexed out-edge. It is
+        -- redistributed below so the total stays at 1.0.
         SELECT COALESCE(SUM(tpr.score), 0.0)
         INTO dangling_rank
         FROM temp_page_rank tpr
@@ -150,10 +128,7 @@ BEGIN
 
     END LOOP;
 
-    -- A page that was unindexed between the node count and here would leave a
-    -- row behind, and one that became indexed would be missing. Dropping the
-    -- first kind keeps page_rank from accumulating scores for pages that are no
-    -- longer part of the ranking.
+    -- Remove ranks for pages that are no longer indexed before saving new ones.
     DELETE FROM page_rank
     WHERE url_id NOT IN (SELECT url_id FROM temp_page_rank);
 

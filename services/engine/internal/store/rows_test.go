@@ -114,7 +114,7 @@ func itoa(n int64) string {
 func TestGetDataReportsATruncatedResultSet(t *testing.T) {
 	s := openFaultyStore(t, 5, 2)
 
-	data, err := s.GetData(context.Background(), []string{"alpha"}, 0)
+	data, err := s.GetData(context.Background(), []string{"alpha"})
 	if err == nil {
 		t.Fatalf("GetData returned %d pages and no error after the stream broke",
 			len(data.Pages))
@@ -127,7 +127,7 @@ func TestGetDataReportsATruncatedResultSet(t *testing.T) {
 func TestGetDataRendersATruncatedResultSetAsAnAppError(t *testing.T) {
 	s := openFaultyStore(t, 5, 2)
 
-	_, err := s.GetData(context.Background(), []string{"alpha"}, 0)
+	_, err := s.GetData(context.Background(), []string{"alpha"})
 	if err == nil {
 		t.Fatal("no error")
 	}
@@ -143,7 +143,7 @@ func TestGetDataRendersATruncatedResultSetAsAnAppError(t *testing.T) {
 func TestGetDataAcceptsAStreamThatEndsCleanly(t *testing.T) {
 	s := openFaultyStore(t, 3, -1)
 
-	data, err := s.GetData(context.Background(), []string{"alpha"}, 0)
+	data, err := s.GetData(context.Background(), []string{"alpha"})
 	if err != nil {
 		t.Fatalf("GetData: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestGetDataAcceptsAStreamThatEndsCleanly(t *testing.T) {
 func TestGetDataReportsAStreamThatBreaksBeforeAnyRow(t *testing.T) {
 	s := openFaultyStore(t, 5, 0)
 
-	data, err := s.GetData(context.Background(), []string{"alpha"}, 0)
+	data, err := s.GetData(context.Background(), []string{"alpha"})
 	if err == nil {
 		t.Fatalf("GetData reported %d pages and no error", len(data.Pages))
 	}
@@ -178,7 +178,7 @@ func TestGetDataReportsAStreamThatBreaksBeforeAnyRow(t *testing.T) {
 func TestGetDataAcceptsAnEmptyResultSet(t *testing.T) {
 	s := openFaultyStore(t, 0, -1)
 
-	data, err := s.GetData(context.Background(), []string{"alpha"}, 0)
+	data, err := s.GetData(context.Background(), []string{"alpha"})
 	if err != nil {
 		t.Fatalf("GetData: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestGetDataReportsARowWithUnreadableMetadata(t *testing.T) {
 	t.Cleanup(func() { _ = conn.Close() })
 	s := PsqlStore{conn: conn, conf: store.StoreConfig{PageSize: 20}}
 
-	_, err = s.GetData(context.Background(), []string{"alpha"}, 0)
+	_, err = s.GetData(context.Background(), []string{"alpha"})
 	if err == nil {
 		t.Fatal("a row with unreadable metadata was accepted")
 	}

@@ -1,0 +1,118 @@
+# Boogle - Overall Architecture (Detailed)
+
+## Overview
+
+Boogle is a polyglot microservices search engine implementing a classic crawl-index-rank-search pipeline with event-driven communication via RabbitMQ. All services share a PostgreSQL database for persistent state and Redis where used by individual services.
+
+This document is the top-level overview. Each service section is a summary; the per-service documents are authoritative for internals.
+
+## Contents
+
+1. [High-Level Pipeline](#high-level-pipeline)
+2. [Services](#services)
+3. [Data Model (Core Tables)](#data-model-core-tables)
+4. [Messaging (RabbitMQ)](#messaging-rabbitmq)
+5. [Infrastructure](#infrastructure)
+6. [Configuration](#configuration)
+7. [Design Notes](#design-notes)
+
+## High-Level Pipeline
+
+```
+Web → Spider (Go) → RabbitMQ (indexer.jobs) → Indexer (Rust) → RabbitMQ (indexer.confirmations) → Ranking (Python) → PostgreSQL (page_rank, words.idf) → Engine (Go) → User
+```
+
+## Services
+
+### Spider (Go)
+- **Purpose**: Web crawling, URL discovery, link extraction, frontier management
+- **Detail**: see [SPIDER.md](./SPIDER.md)
+- **Entry**: `services/spider/cmd/spider/main.go`
+- **Key components**:
+  - Policy engine (`internal/policy/`) for admission control, backoff, host/rate limiting, robots enforcement
+  - Parser (`internal/parser/`) for HTML, sitemap, robots.txt
+  - Store (`internal/store/`) for Postgres/Redis persistence
+  - Messaging (`internal/messaging/`) publishes to `indexer.jobs`
+- **Behavior**: Fetches pages, normalizes/canonicalizes URLs, extracts links, filters by language/rules/robots, persists `urls`, `pages`, `graph_edges`, enqueues discovered URLs, publishes `Job{page_id}` to RabbitMQ after successful persist.
+- **State**: Frontier/host state managed via policy with Redis-backed caching.
+
+### Indexer (Rust)
+- **Purpose**: HTML parsing, tokenization, term frequency calculation, search index building
+- **Detail**: see [INDEXER.md](./INDEXER.md)
+- **Entry**: `services/indexer/src/main.rs`
+- **Key components**:
+  - `core/indexer.rs`: Consumer loop, concurrency control (semaphore), task tracking, sweep reconciliation
+  - `core/text_sink.rs`: html5ever-based text extraction (skips script/style), tokenization (alphabetic, lowercase, punctuation trimmed)
+  - `core/psql.rs`: Atomic page claiming (`FOR UPDATE SKIP LOCKED`), batched word upserts, page_word linking, stale claim recovery
+  - `core/messaging.rs`: RabbitMQ consumption/publishing with confirms
+- **Behavior**: Consumes from `indexer.jobs`, claims an unindexed page (`indexed=TRUE`, `index_attempts += 1`), parses HTML in a blocking task, writes `words` and `page_word` in one transaction, publishes `IndexConfirmation{page_id}` with confirms, then records completion in `indexed_at`, and acks. A publish or write failure releases the claim and requeues, so a lost confirmation is retried rather than acked away.
+- **Resilience**: The sweep reclaims only claims where `indexed_at IS NULL` and the claim is older than `SWEEP_GRACE_SECONDS`, respects `MAX_INDEX_ATTEMPTS`, and never touches a completed page. Poison messages are not requeued.
+
+### Ranking (Python)
+- **Purpose**: Compute relevance/importance scores (TF-IDF, PageRank)
+- **Detail**: see [RANKING.md](./RANKING.md)
+- **Entry**: `services/ranking/src/main.py`
+- **Key components**:
+  - `messaging.py`: FastStream consumer of confirmations, threshold-based triggering (default 100)
+  - `calculator.py`: IDF computation via SQL CTEs, PageRank via `update_page_rank()` PL/pgSQL function
+  - `psql.py`: Async connection pool with retries
+- **Behavior**: Counts confirmations (`RANKING_CONFIRMATION_THRESHOLD`, default 100); when the threshold is reached and no run is in flight, runs IDF and PageRank concurrently over the full corpus/graph, writes `words.idf` and `page_rank`, and consumes only the batch it covered. An initial run at startup (`RANKING_RUN_ON_STARTUP`) makes a small corpus searchable before the first threshold. Logs go to stdout; a file sink is opt-in via `LOG_PATH`.
+
+### Engine (Go)
+- **Purpose**: Web search interface
+- **Detail**: see [ENGINE.md](./ENGINE.md)
+- **Entry**: `services/engine/cmd/server/main.go`
+- **Key components**:
+  - Handlers for search/home/health
+  - Store querying Postgres with joins across `words`, `page_word`, `pages`, `page_rank`, `urls`
+  - Ranking service blends TF-IDF (cosine similarity over result window) with PageRank
+  - Spellchecker (aspell with fallback)
+  - Templ templates + HTMX
+- **Behavior**: Accepts a capped query (200 runes / 10 tokens), gets suggestions, fetches up to `RANKER_MAX_RESULTS` candidate pages (coarse SQL ranking by distinct word count and PageRank, left-joined so unranked pages remain searchable), re-ranks the whole window with TF-IDF blended with PageRank, then slices the requested page. Pagination counts result pages, not results.
+
+## Data Model (Core Tables)
+
+From `migration/01_schema.sql`:
+- `urls(id UUID PK, url TEXT UNIQUE)`
+- `pages(id UUID PK, url_id UUID UNIQUE FK->urls, html TEXT, metadata JSONB, indexed BOOLEAN, created_at, updated_at, last_index_attempt_at, indexed_at, index_attempts)` — `indexed_at` records completed indexing; a claim without it is reclaimable
+- `words(id UUID PK, word VARCHAR(25) UNIQUE, idf DOUBLE PRECISION, doc_frequency INTEGER)`
+- `page_word(page_id UUID FK->pages, word_id UUID FK->words, tf INTEGER, PK(page_id,word_id))`
+- `graph_edges(id BIGSERIAL PK, from_url UUID FK->urls, to_url UUID FK->urls, UNIQUE(from_url,to_url))`
+- `page_rank(url_id UUID PK FK->urls, score DOUBLE PRECISION, updated_at)`
+- `monitor_state` was dropped in migration 03 along with the monitoring service.
+
+PageRank function in `migration/02_pg_rank.sql` computes scores over indexed pages only using restricted edge set.
+
+## Messaging (RabbitMQ)
+
+- **Exchange/Queues** (typical setup): 
+  - `indexer.jobs` - Spider publishes page jobs to Indexer
+  - `indexer.confirmations` - Indexer publishes confirmations to Ranking
+- Messages are JSON serialized (`Job{page_id}`, `IndexConfirmation{page_id}`).
+- Both producers publish persistent messages with `mandatory` routing and wait
+  for a publisher confirm. The spider retires a URL only after its job is
+  confirmed; the indexer records `indexed_at` only after its confirmation is
+  confirmed.
+- Both consumers reconnect and re-declare their queues; the indexer also drains
+  in-flight work before exiting.
+
+## Infrastructure
+
+- **PostgreSQL**: Primary data store, persisted in the `pgdata` named volume. `scripts/migrate.sh` applies `migration/*.sql` idempotently after the first boot.
+- **RabbitMQ**: Message broker (with management UI)
+- **Redis**: Used by Spider for frontier/host state (password required)
+- **Docker Compose**: Orchestrates infra (`psql`, `redis`, `rabbitmq`, `adminer`). Datastore ports publish on `127.0.0.1` only.
+
+## Configuration
+
+All services configured via environment variables (see root `.env.example` and per-service `.env.example` files).
+
+## Design Notes
+
+- Event-driven pipeline decouples services and enables independent scaling
+- Atomic claiming with `SKIP LOCKED` prevents double-processing
+- Sweep/reconciliation provides crash recovery; `indexed_at` distinguishes a
+  finished page from a dead claim
+- Poison message handling prevents infinite retry loops
+- Full corpus/graph recomputation in Ranking (simple, learning-oriented)
+- Coarse SQL ranking + fine-grained re-ranking in Engine balances performance and flexibility

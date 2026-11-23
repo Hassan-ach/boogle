@@ -248,3 +248,17 @@ Check `.env` connection strings and network connectivity
 - [ ] Advanced search operators
 - [ ] Search analytics
 - [ ] Authentication layer
+
+
+## Result Window and Pagination
+
+The SQL pass returns the top `RANKER_MAX_RESULTS` candidates (default 100) ordered
+by word coverage and PageRank. `page_rank` is left-joined with a neutral score, so
+a page that has not been scored yet is still searchable. The engine re-ranks that
+whole window with TF-IDF blended with PageRank (`RANKER_WEIGHT_TF`) and only then
+slices `PAGE_SIZE` results for the requested page.
+
+Pagination therefore reports `ceil(reachable / PAGE_SIZE)` pages, where
+`reachable = min(total matches, RANKER_MAX_RESULTS)`, and an out-of-range `page`
+is clamped to the last page instead of rendering an empty dead end. Search terms
+are capped at 200 runes and 10 tokens before they reach aspell.

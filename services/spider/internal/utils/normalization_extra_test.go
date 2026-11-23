@@ -97,6 +97,41 @@ func TestNormalizeUrlKeepsNonWwwSubdomains(t *testing.T) {
 	}
 }
 
+func TestNormalizeUrlDoesNotFoldAPrefixLookalike(t *testing.T) {
+	// A host that merely ends in the Wikimedia domain belongs to someone else.
+	// Folding it would merge two unrelated sites into one visited-set bucket.
+	for _, host := range []string{
+		"fr.notwikipedia.org",
+		"de.fakewikibooks.org",
+		"pt.notwikivoyage.org",
+	} {
+		got, ok := NormalizeUrl("https://"+host+"/a", "")
+		if !ok {
+			t.Fatalf("NormalizeUrl rejected %q", host)
+		}
+		if want := "https://" + host + "/a"; got != want {
+			t.Errorf("NormalizeUrl(%q) = %q, want %q", host, got, want)
+		}
+	}
+}
+
+func TestNormalizeUrlStillFoldsRealWikimediaHosts(t *testing.T) {
+	for _, tc := range []struct{ raw, want string }{
+		{"https://fr.wikipedia.org/a", "https://en.wikipedia.org/a"},
+		{"https://de.m.wikipedia.org/a", "https://en.m.wikipedia.org/a"},
+		{"https://zh.wikibooks.org/a", "https://en.wikibooks.org/a"},
+		{"https://en.wikipedia.org/a", "https://en.wikipedia.org/a"},
+	} {
+		got, ok := NormalizeUrl(tc.raw, "")
+		if !ok {
+			t.Fatalf("NormalizeUrl rejected %q", tc.raw)
+		}
+		if got != tc.want {
+			t.Errorf("NormalizeUrl(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
 func TestNormalizeUrlFillsInTheBaseHostForRelativeURLs(t *testing.T) {
 	for _, tc := range []struct{ raw, base, want string }{
 		{"/a", "example.com", "https://example.com/a"},
@@ -460,157 +495,5 @@ func TestNormalizeUrlsOnAllRejected(t *testing.T) {
 	got := NormalizeUrls([]string{"#a", "ht tp://example.com/x", "#b"}, "")
 	if len(got) != 0 {
 		t.Errorf("NormalizeUrls() = %v, want an empty slice", got)
-	}
-}
-
-func TestIsDisallowedWithNoRulesAllowsEverything(t *testing.T) {
-	for _, path := range []string{"/", "/admin", "/anything"} {
-		if IsDisallowed(path, nil) {
-			t.Errorf("IsDisallowed(%q, nil) = true, want false", path)
-		}
-		if IsDisallowed(path, []string{}) {
-			t.Errorf("IsDisallowed(%q, []) = true, want false", path)
-		}
-	}
-}
-
-func TestIsDisallowedIgnoresEmptyRules(t *testing.T) {
-	rules := []string{"", "/admin/", ""}
-
-	for _, path := range []string{"/", "/public", "/docs/guide", "/index.html"} {
-		t.Run(path, func(t *testing.T) {
-			if IsDisallowed(path, rules) {
-				t.Errorf("IsDisallowed(%q, %v) = true; an empty rule must not block the whole host", path, rules)
-			}
-		})
-	}
-}
-
-func TestIsDisallowedStillAppliesRealRulesAlongsideEmptyOnes(t *testing.T) {
-	rules := []string{"", "/admin/", ""}
-
-	if !IsDisallowed("/admin/users", rules) {
-		t.Error("a real rule alongside empty ones was ignored")
-	}
-	if IsDisallowed("/administrative-guide", rules) {
-		t.Error("a path merely starting with a rule's characters was blocked")
-	}
-	if IsDisallowed("/admin", rules) {
-		t.Error("the rule /admin/ should not match the bare path /admin")
-	}
-}
-
-func TestIsDisallowedTreatsRuleLikePatternsAsRegexes(t *testing.T) {
-	rules := []string{`^/secret/.*`, `/admin/`, `\.php$`}
-
-	for _, tc := range []struct {
-		path string
-		want bool
-	}{
-		{"/secret/keys", true},
-		{"/secret/", true},
-		{"/admin/users", true},
-		{"/index.php", true},
-		{"/public/index.html", false},
-		{"/", false},
-	} {
-		t.Run(tc.path, func(t *testing.T) {
-			if got := IsDisallowed(tc.path, rules); got != tc.want {
-				t.Errorf("IsDisallowed(%q) = %v, want %v", tc.path, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestIsDisallowedIgnoresAnInvalidRegex(t *testing.T) {
-	rules := []string{"[unclosed", "/admin/"}
-
-	if !IsDisallowed("/admin/x", rules) {
-		t.Error("a valid rule alongside an invalid one was ignored")
-	}
-	if got := IsDisallowed("/public", rules); got {
-		t.Error("an invalid regex matched")
-	}
-}
-
-func TestIsDisallowedAndValidateLinksAgree(t *testing.T) {
-	rules := []string{"", "/admin/", "^/secret/"}
-
-	for _, path := range []string{"/", "/public", "/admin/x", "/secret/y"} {
-		t.Run(path, func(t *testing.T) {
-			direct := IsDisallowed(path, rules)
-			viaValidate := len(ValidateLinks([]string{"https://example.com" + path}, rules)) == 0
-			if direct != viaValidate {
-				t.Errorf("IsDisallowed(%q) = %v but ValidateLinks dropped it = %v",
-					path, direct, viaValidate)
-			}
-		})
-	}
-}
-
-func TestValidateLinksDropsDisallowedPaths(t *testing.T) {
-	got := ValidateLinks([]string{
-		"https://example.com/public",
-		"https://example.com/admin/users",
-		"https://example.com/secret/x",
-		"https://example.com/other",
-	}, []string{"/admin/", "^/secret/"})
-
-	want := []string{"https://example.com/other", "https://example.com/public"}
-	if len(got) != len(want) {
-		t.Fatalf("ValidateLinks() = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("ValidateLinks()[%d] = %q, want %q", i, got[i], want[i])
-		}
-	}
-}
-
-func TestValidateLinksDeduplicates(t *testing.T) {
-	got := ValidateLinks([]string{
-		"https://example.com/a",
-		"https://example.com/a",
-		"https://example.com/a",
-	}, nil)
-
-	if len(got) != 1 {
-		t.Errorf("ValidateLinks() = %v, want one entry", got)
-	}
-}
-
-func TestValidateLinksDropsUnparseableLinks(t *testing.T) {
-	got := ValidateLinks([]string{
-		"https://example.com/good",
-		"://bad",
-		"ht tp://example.com/x",
-	}, nil)
-
-	if len(got) != 1 || got[0] != "https://example.com/good" {
-		t.Errorf("ValidateLinks() = %v, want only the good link", got)
-	}
-}
-
-func TestValidateLinksOnEmptyInput(t *testing.T) {
-	if got := ValidateLinks(nil, []string{"/admin/"}); len(got) != 0 {
-		t.Errorf("ValidateLinks(nil) = %v, want an empty slice", got)
-	}
-}
-
-func TestValidateLinksIsDeterministic(t *testing.T) {
-	links := []string{
-		"https://example.com/a", "https://example.com/b", "https://example.com/c",
-		"https://example.com/d", "https://example.com/e", "https://example.com/f",
-	}
-
-	first := ValidateLinks(links, nil)
-	for i := 0; i < 200; i++ {
-		got := ValidateLinks(links, nil)
-		for j := range first {
-			if got[j] != first[j] {
-				t.Fatalf("run %d: position %d = %q, want %q\n got %v\nwant %v",
-					i, j, got[j], first[j], got, first)
-			}
-		}
 	}
 }

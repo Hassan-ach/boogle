@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH released AS (\n                   UPDATE pages\n                   SET indexed = FALSE,\n                       indexed_at = NULL,\n                       last_index_attempt_at = NOW()\n                   WHERE id = $1 AND indexed_at IS NULL\n                   RETURNING id\n               )\n               DELETE FROM page_word pw\n               USING released\n               WHERE pw.page_id = released.id",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9c0806bc03abef4ac833faf785744950be3d00926b165933232959a30ed467c1"
+}

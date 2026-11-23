@@ -3,7 +3,6 @@ package config
 import (
 	"github.com/Hassan-ach/boogle/services/engine/internal/config/ranker"
 	"github.com/Hassan-ach/boogle/services/engine/internal/config/store"
-
 )
 
 type Config struct {

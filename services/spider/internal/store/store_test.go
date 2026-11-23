@@ -4,12 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
 
 	"github.com/Hassan-ach/boogle/services/spider/internal/entity"
-	"github.com/Hassan-ach/boogle/services/spider/internal/policy"
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"uuid"
 )
 
@@ -17,33 +18,47 @@ type fakeDB struct {
 	pageID uuid.UUID
 	err    error
 
+	urlsErr     error
+	edgesErr    error
+	returnedIDs map[string]string
+
 	withTxCalls int
 	inserted    []string
 	edgesFrom   string
 	edgesTo     []string
 }
 
-func (f *fakeDB) InsertPage(ctx context.Context, tx *sql.Tx, page *entity.Page) (uuid.UUID, error) {
+func (f *fakeDB) InsertPage(ctx context.Context, tx *sql.Tx, page *entity.Page) (uuid.UUID, string, error) {
 	if f.err != nil {
-		return uuid.Nil(), f.err
+		return uuid.Nil(), "", f.err
 	}
-	return f.pageID, nil
+	return f.pageID, "page-url-id", nil
 }
 
 func (f *fakeDB) InsertGraphEdges(ctx context.Context, tx *sql.Tx, from string, to []string) error {
+	if f.edgesErr != nil {
+		return f.edgesErr
+	}
 	f.edgesFrom = from
 	f.edgesTo = to
 	return f.err
 }
 
-func (f *fakeDB) InsertURLs(ctx context.Context, tx *sql.Tx, urls []string) ([]string, error) {
+func (f *fakeDB) InsertURLs(ctx context.Context, tx *sql.Tx, urls []string) (map[string]string, error) {
+	if f.urlsErr != nil {
+		return nil, f.urlsErr
+	}
 	if f.err != nil {
 		return nil, f.err
 	}
 	f.inserted = urls
-	ids := make([]string, len(urls))
-	for i := range urls {
-		ids[i] = urls[i]
+	if f.returnedIDs != nil {
+		return f.returnedIDs, nil
+	}
+	ids := make(map[string]string, len(urls))
+	for i, u := range urls {
+		// Deliberately not derived from position: the caller must map by URL.
+		ids[u] = fmt.Sprintf("id-%d", len(urls)-i)
 	}
 	return ids, nil
 }
@@ -55,36 +70,17 @@ func (f *fakeDB) WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 
 func (f *fakeDB) Close() {}
 
-type fakeCache struct {
-	written map[string]*entity.Host
-	err     error
-}
-
-func (c *fakeCache) AddHostMetaData(ctx context.Context, h string, host *entity.Host) error {
-	if c.err != nil {
-		return c.err
-	}
-	if c.written == nil {
-		c.written = map[string]*entity.Host{}
-	}
-	c.written[h] = host
-	return nil
-}
-
-func (c *fakeCache) GetHostMetaData(ctx context.Context, h string) (*entity.Host, bool, error) {
-	host, ok := c.written[h]
-	return host, ok, nil
-}
+type fakeCache struct{}
 
 func (c *fakeCache) Close() {}
 
-func newTestStore(t *testing.T) (*Store, *policy.MemoryState) {
+func newTestStore(t *testing.T) (*Store, *state.MemoryState) {
 	t.Helper()
-	st := policy.NewMemoryState()
+	st := state.NewMemoryState()
 	return &Store{
 		db:    &fakeDB{pageID: uuid.New()},
 		cache: &fakeCache{},
-		state: st,
+		st:    st,
 		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}, st
 }
@@ -195,42 +191,85 @@ func TestStorePersistPageStopsAtAFailedInsert(t *testing.T) {
 	}
 }
 
-func TestStorePersistHostNoLongerWritesAWaitedMarker(t *testing.T) {
+func TestPersistPageMapsEdgesByURLNotByPosition(t *testing.T) {
 	s, _ := newTestStore(t)
+	db := s.db.(*fakeDB)
 
-	host := &entity.Host{Name: "example.com", Delay: 5}
-	s.persistHost(context.Background(), host)
-
-	cache, ok := s.cache.(*fakeCache)
-	if !ok {
-		t.Fatal("unexpected cache type")
+	page := &entity.Page{
+		URL:   "https://example.com/page",
+		Links: []string{"https://example.com/a", "https://example.com/b"},
 	}
-	if _, ok := cache.written["example.com"]; !ok {
-		t.Error("host metadata was not written")
+	if _, err := s.persistPage(context.Background(), page); err != nil {
+		t.Fatal(err)
+	}
+
+	if db.withTxCalls != 1 {
+		t.Errorf("persist used %d transactions, want 1", db.withTxCalls)
+	}
+	if db.edgesFrom != "page-url-id" {
+		t.Errorf("edges start at %q, want the page's URL id", db.edgesFrom)
+	}
+	// fakeDB returns reversed ids, so a positional implementation would attach
+	// the wrong URL to every edge. Assert order, not set membership.
+	want := []string{"id-2", "id-1"}
+	if len(db.edgesTo) != len(want) {
+		t.Fatalf("inserted %d edges, want %d: %v", len(db.edgesTo), len(want), db.edgesTo)
+	}
+	for i := range want {
+		if db.edgesTo[i] != want[i] {
+			t.Errorf("edge %d target = %q, want %q (order follows page.Links)",
+				i, db.edgesTo[i], want[i])
+		}
 	}
 }
 
-func TestStoreGetHostMetaData(t *testing.T) {
+func TestPersistPageFailsWhenALinkHasNoURLID(t *testing.T) {
 	s, _ := newTestStore(t)
-	ctx := context.Background()
+	db := s.db.(*fakeDB)
+	db.returnedIDs = map[string]string{"https://example.com/a": "id-a"}
 
-	host := &entity.Host{Name: "example.com", Delay: 5}
-	s.persistHost(ctx, host)
+	page := &entity.Page{
+		URL:   "https://example.com/page",
+		Links: []string{"https://example.com/a", "https://example.com/missing"},
+	}
+	if _, err := s.persistPage(context.Background(), page); err == nil {
+		t.Fatal("persistPage silently dropped a link with no id")
+	}
+}
 
-	got, found, err := s.GetHostMetaData(ctx, "example.com")
-	if err != nil {
+func TestPersistPageRollsBackTheWholeTransactionOnALinkFailure(t *testing.T) {
+	for name, configure := range map[string]func(*fakeDB){
+		"urls":  func(db *fakeDB) { db.urlsErr = errors.New("url upsert failed") },
+		"edges": func(db *fakeDB) { db.edgesErr = errors.New("edge insert failed") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, _ := newTestStore(t)
+			db := s.db.(*fakeDB)
+			configure(db)
+
+			page := &entity.Page{URL: "https://example.com/page", Links: []string{"https://example.com/a"}}
+			if _, err := s.persistPage(context.Background(), page); err == nil {
+				t.Fatal("persistPage reported success")
+			}
+			if db.withTxCalls != 1 {
+				t.Errorf("persist used %d transactions, want exactly 1", db.withTxCalls)
+			}
+		})
+	}
+}
+
+func TestPersistPageSkipsASelfLink(t *testing.T) {
+	s, _ := newTestStore(t)
+	db := s.db.(*fakeDB)
+
+	page := &entity.Page{
+		URL:   "https://example.com/page",
+		Links: []string{"https://example.com/page", "https://example.com/a"},
+	}
+	if _, err := s.persistPage(context.Background(), page); err != nil {
 		t.Fatal(err)
 	}
-	if !found {
-		t.Fatal("host metadata was not found")
-	}
-	if got.Delay != 5 {
-		t.Errorf("Delay = %d, want 5", got.Delay)
-	}
-
-	if _, found, err := s.GetHostMetaData(ctx, "absent.com"); err != nil {
-		t.Fatal(err)
-	} else if found {
-		t.Error("a host that was never written was reported as found")
+	if len(db.edgesTo) != 1 {
+		t.Errorf("inserted %d edges for one link plus a self-link, want 1", len(db.edgesTo))
 	}
 }

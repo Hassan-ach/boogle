@@ -11,6 +11,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
+	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
 
 var ErrRedirectLoop = errors.New("redirect limit exceeded")
@@ -33,8 +36,19 @@ func categorize(out Outcome, cfg *Config) (ActionKind, Reason) {
 	if errors.Is(out.Err, ErrRedirectLoop) {
 		return ActPermanent, ReasonRedirectLoop
 	}
+	if errors.Is(out.Err, utils.ErrRedirectScheme) {
+		// A redirect to ftp:// or file:// fails identically on every attempt;
+		// retrying it costs the full URL budget for no chance of success.
+		return ActPermanent, ReasonNonHTTPScheme
+	}
 	if cfg.MaxRedirects > 0 && out.Redirects > cfg.MaxRedirects {
 		return ActPermanent, ReasonRedirectLoop
+	}
+
+	// A body that fails mid-stream still carries a 2xx status line, so check the
+	// transfer error first; otherwise a truncated body indexes half a page.
+	if out.Err != nil && out.StatusCode >= 200 && out.StatusCode < 300 {
+		return ActBackoff, ReasonTruncatedBody
 	}
 
 	if out.StatusCode != 0 {
@@ -210,7 +224,7 @@ func (m *PolicyManager) Classify(ctx context.Context, rawURL string, out Outcome
 	}
 	host := hostOfURL(rawURL)
 
-	urlState, err := m.state.URLState(ctx, rawURL)
+	urlState, err := m.st.URLState(ctx, rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("read the retry record for %s: %w", rawURL, err)
 	}
@@ -240,23 +254,23 @@ func (m *PolicyManager) Classify(ctx context.Context, rawURL string, out Outcome
 
 func (m *PolicyManager) recordSuccess(ctx context.Context, host, url string) error {
 	if host != "" {
-		if err := m.state.RecordSuccess(ctx, host, m.now()); err != nil {
+		if err := m.st.RecordSuccess(ctx, host, m.now()); err != nil {
 			return fmt.Errorf("record a successful page on %s: %w", host, err)
 		}
 	}
-	if err := m.state.ClearURLState(ctx, url); err != nil {
+	if err := m.st.ClearURLState(ctx, url); err != nil {
 		return fmt.Errorf("clear the retry record for %s: %w", url, err)
 	}
 	return nil
 }
 
 func (m *PolicyManager) recordBackoff(ctx context.Context, host, url string, act *Action) error {
-	if _, err := m.state.BumpAttempts(ctx, url); err != nil {
+	if _, err := m.st.BumpAttempts(ctx, url); err != nil {
 		return fmt.Errorf("count a failed attempt at %s: %w", url, err)
 	}
 
 	if host != "" {
-		failures, err := m.state.RecordFailure(ctx, host)
+		failures, err := m.st.RecordFailure(ctx, host)
 		if err != nil {
 			return fmt.Errorf("record a failure on %s: %w", host, err)
 		}
@@ -277,25 +291,25 @@ func (m *PolicyManager) recordBackoff(ctx context.Context, host, url string, act
 
 func (m *PolicyManager) markAfterFailure(ctx context.Context, host string, reason Reason, failures int) error {
 	var (
-		marker MarkerKind
+		marker state.MarkerKind
 		ttl    time.Duration
 	)
 	switch reason {
 	case ReasonDNSFailure, ReasonConnectionRefused, ReasonTLSError:
-		marker = MarkerDead
+		marker = state.MarkerDead
 		ttl = m.cfg.DeadHostTTL(failures)
 	case ReasonTimeout, ReasonRateLimited, ReasonServerError:
-		st, err := m.state.HostState(ctx, host)
+		st, err := m.st.HostState(ctx, host)
 		if err != nil {
 			return fmt.Errorf("read host state to cool %s down: %w", host, err)
 		}
-		marker = MarkerCooldown
+		marker = state.MarkerCooldown
 		ttl = m.cfg.HostCooldown(failures, st.CrawlDelay)
 	default:
 		return nil
 	}
 
-	if err := m.state.SetMarker(ctx, host, marker, ttl); err != nil {
+	if err := m.st.SetMarker(ctx, host, marker, ttl); err != nil {
 		return fmt.Errorf("mark %s %s: %w", host, marker, err)
 	}
 	m.log.Info("host marked after a failed fetch",
@@ -304,10 +318,10 @@ func (m *PolicyManager) markAfterFailure(ctx context.Context, host string, reaso
 }
 
 func (m *PolicyManager) recordPermanent(ctx context.Context, host, url string) error {
-	if err := m.state.MarkVisited(ctx, url); err != nil {
+	if err := m.st.MarkVisited(ctx, url); err != nil {
 		return fmt.Errorf("retire %s: %w", url, err)
 	}
-	if err := m.state.ClearURLState(ctx, url); err != nil {
+	if err := m.st.ClearURLState(ctx, url); err != nil {
 		return fmt.Errorf("clear the retry record for %s: %w", url, err)
 	}
 	return nil
@@ -319,7 +333,7 @@ func (m *PolicyManager) Discard(ctx context.Context, url string, reason Reason) 
 		return errNoDiscardReason
 	}
 	m.countReason(ctx, host, reason)
-	if err := m.state.MarkVisited(ctx, url); err != nil {
+	if err := m.st.MarkVisited(ctx, url); err != nil {
 		return fmt.Errorf("discard %s: %w", url, err)
 	}
 	m.log.Info("page discarded after a successful fetch",
@@ -331,7 +345,7 @@ func (m *PolicyManager) countReason(ctx context.Context, host string, reason Rea
 	if host == "" || reason == "" {
 		return
 	}
-	if err := m.state.CountReason(ctx, host, reason); err != nil {
+	if err := m.st.CountReason(ctx, host, reason); err != nil {
 		m.log.Warn("could not record a refusal reason",
 			"host", host, "reason", reason, "error", err)
 	}

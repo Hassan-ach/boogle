@@ -68,26 +68,3 @@ func TestNormalizeUrl(t *testing.T) {
 		})
 	}
 }
-
-func TestIsDisallowed(t *testing.T) {
-	disallowed := []string{"/admin/", "/private", `^/secret/.*`}
-
-	tests := []struct {
-		path     string
-		expected bool
-	}{
-		{"/admin/users", true},
-		{"/private/data", true},
-		{"/secret/keys", true},
-		{"/public/index.html", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.path, func(t *testing.T) {
-			got := IsDisallowed(tt.path, disallowed)
-			if got != tt.expected {
-				t.Errorf("IsDisallowed(%s) = %v, expected %v", tt.path, got, tt.expected)
-			}
-		})
-	}
-}

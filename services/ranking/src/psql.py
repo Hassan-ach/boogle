@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 import psycopg
 from psycopg import OperationalError, InterfaceError
+from psycopg.conninfo import make_conninfo
 from psycopg_pool import AsyncConnectionPool
 
 logger = logging.getLogger(__name__)
@@ -15,14 +16,8 @@ logger = logging.getLogger(__name__)
 def retry_on_db_error(max_retries: int = 3, delay: float = 1.0, backoff: float = 2.0):
     """Retry a coroutine when the database connection fails.
 
-    ``max_retries`` counts retries *after* the first attempt, so the default of 3
-    means four calls in total. This is the opposite of the indexer's Rust
-    ``retry_async``, whose ``max_attempts`` includes the first try; the two
-    services do not share a retry budget.
-
-    Only OperationalError and InterfaceError are retried. Those signal a broken
-    connection. Any other exception is raised immediately, because a bad query
-    will fail identically on every attempt.
+    ``max_retries`` counts retries after the first attempt. Only connection
+    errors are retried; other failures are raised immediately.
     """
 
     def decorator(func):
@@ -75,21 +70,33 @@ class DatabaseManager:
         self.connection_url = connection_url or os.getenv("DATABASE_URL")
         self._pool: Optional[AsyncConnectionPool] = None
 
+    def _build_conninfo(self) -> str:
+        """Return the DSN from DATABASE_URL or PG_* variables, failing closed."""
+        if self.connection_url:
+            return self.connection_url
+
+        values = {
+            "host": os.getenv("PG_HOST"),
+            "port": os.getenv("PG_PORT"),
+            "dbname": os.getenv("PG_DBNAME"),
+            "user": os.getenv("PG_USER"),
+            "password": os.getenv("PG_PASSWORD"),
+        }
+        missing = [key for key, value in values.items() if value is None]
+        if missing:
+            raise ValueError(
+                "Missing DATABASE_URL or database environment variables: "
+                + ", ".join(missing)
+            )
+        return make_conninfo(**values)
+
     async def initialize(self) -> None:
         if self._pool is not None:
             logger.warning("Connection pool is already initialized")
             return
 
         try:
-            if self.connection_url:
-                conninfo = self.connection_url
-            else:
-                host = os.getenv("PG_HOST", "localhost")
-                port = os.getenv("PG_PORT", "5432")
-                dbname = os.getenv("PG_DBNAME", "boogle")
-                user = os.getenv("PG_USER", "postgres")
-                password = os.getenv("PG_PASSWORD", "")
-                conninfo = f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+            conninfo = self._build_conninfo()
 
             self._pool = AsyncConnectionPool(
                 conninfo=conninfo,
@@ -97,7 +104,9 @@ class DatabaseManager:
                 max_size=self.max_conn,
                 open=False,
             )
-            await self._pool.open()
+            # wait=True surfaces a bad DSN here instead of reporting success and
+            # failing on the first query.
+            await self._pool.open(wait=True)
             logger.info(
                 f"Database Connection pool opened ({self.min_conn}-{self.max_conn} connections)"
             )
@@ -126,13 +135,7 @@ class DatabaseManager:
             logger.warning(
                 "Connection pool not initialized, creating direct connection"
             )
-            conn = await psycopg.AsyncConnection.connect(
-                host=os.getenv("PG_HOST"),
-                port=os.getenv("PG_PORT"),
-                dbname=os.getenv("PG_DBNAME"),
-                user=os.getenv("PG_USER"),
-                password=os.getenv("PG_PASSWORD"),
-            )
+            conn = await psycopg.AsyncConnection.connect(self._build_conninfo())
             try:
                 yield conn
             finally:

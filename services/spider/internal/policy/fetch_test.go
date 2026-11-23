@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"errors"
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -188,8 +189,8 @@ func TestWithConfigRebuildsTheBuiltInFetcher(t *testing.T) {
 }
 
 func TestFetchWithoutATransportIsAClassifiableFailure(t *testing.T) {
-	st := NewMemoryState()
-	m := &PolicyManager{state: st, log: testLogger(), cfg: DefaultConfig(), now: time.Now}
+	st := state.NewMemoryState()
+	m := &PolicyManager{st: st, log: testLogger(), cfg: DefaultConfig(), now: time.Now}
 
 	body, out := m.Fetch(context.Background(), "https://example.com/")
 	if out.Err == nil {

@@ -55,17 +55,20 @@ async fn main() -> Result<(), AppError> {
 
     token.cancel();
 
-    let consumer = match indexer_handle.await {
-        Ok(Ok(consumer)) => consumer,
+    // Always drain both loops before exiting; the exit code still reports any
+    // loop failure so an orchestrator restarts the container.
+    let mut had_error = false;
+    match indexer_handle.await {
+        Ok(Ok(())) => info!(log, "Indexer loop stopped"),
         Ok(Err(err)) => {
             error!(log, "Indexer loop exited with error"; "error" => %err);
-            process::exit(1);
+            had_error = true;
         }
         Err(err) => {
             error!(log, "Indexer loop task panicked"; "error" => %err);
-            process::exit(1);
+            had_error = true;
         }
-    };
+    }
     if let Err(err) = sweep_handle.await {
         error!(log, "Sweep loop task failed"; "error" => %err);
         process::exit(1);
@@ -92,10 +95,11 @@ async fn main() -> Result<(), AppError> {
         }
     }
 
-    drop(consumer);
-
     info!(log, "Indexer service shutting down");
     indx.close().await;
 
+    if had_error {
+        process::exit(1);
+    }
     Ok(())
 }

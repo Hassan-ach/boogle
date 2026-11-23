@@ -1,0 +1,57 @@
+name: Docs CI
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - "mkdocs.yml"
+      - "docs/**"
+      - "services/*/docs/**"
+      - "assets/**"
+      - "scripts/docs.py"
+      - "justfile"
+      - ".gitignore"
+      - "README.md"
+      - "services/README.md"
+      - ".github/workflows/docs_ci.yaml"
+  pull_request:
+    paths:
+      - "mkdocs.yml"
+      - "docs/**"
+      - "services/*/docs/**"
+      - "assets/**"
+      - "scripts/docs.py"
+      - "justfile"
+      - ".gitignore"
+      - "README.md"
+      - "services/README.md"
+      - ".github/workflows/docs_ci.yaml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: docs/requirements.txt
+
+      - name: Install documentation dependencies
+        run: python -m pip install -r docs/requirements.txt
+
+      # Strict mode fails on broken internal links, missing nav targets and
+      # invalid configuration; check() also verifies every service page is in nav.
+      - name: Validate the complete site
+        run: python scripts/docs.py check
+
+      - name: Build each service's documentation independently
+        run: |
+          for service in spider engine indexer ranking; do
+            echo "==> $service"
+            python scripts/docs.py service "$service"
+          done

@@ -7,7 +7,9 @@ WORKDIR /app
 COPY . .
 
 ENV SQLX_OFFLINE=true
-ENV RUSTFLAGS="-C target-cpu=native"
+# Baseline x86-64-v2 instead of -C target-cpu=native: the image is built in CI
+# and may run on an older host, where native instructions abort with SIGILL (M-23).
+ENV RUSTFLAGS="-C target-cpu=x86-64-v2"
 
 RUN rustup target add x86_64-unknown-linux-musl
 RUN cargo build --release --target x86_64-unknown-linux-musl
@@ -27,6 +29,6 @@ COPY --chown=app:app --chmod=0555 entrypoint.sh /entrypoint.sh
 USER 10001:10001
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD pgrep -x indexer > /dev/null || exit 1
+  CMD pidof indexer > /dev/null || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]

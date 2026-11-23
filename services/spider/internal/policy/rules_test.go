@@ -1,9 +1,11 @@
 package policy
 
 import (
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
@@ -198,30 +200,6 @@ func TestSkipsWikiLanguageSubpageRequiresBothConditions(t *testing.T) {
 	}
 }
 
-func TestFoldsLanguageSubdomainOnlyOnKnownDomains(t *testing.T) {
-	r := DefaultRules()
-
-	cases := []struct{ in, want string }{
-		{"fr.wikipedia.org", "en.wikipedia.org"},
-		{"de.wikibooks.org", "en.wikibooks.org"},
-		{"zh-min-nan.wikivoyage.org", "en.wikivoyage.org"},
-		{"en.wikipedia.org", "en.wikipedia.org"},
-		{"wikipedia.org", "wikipedia.org"},
-		{"www.fr.wikipedia.org", "en.wikipedia.org"},
-
-		{"go.example.com", "go.example.com"},
-		{"it.example.co.uk", "it.example.co.uk"},
-		{"FR.EXAMPLE.COM", "fr.example.com"},
-		{"blog.example.com", "blog.example.com"},
-	}
-
-	for _, tc := range cases {
-		if got := r.FoldsLanguageSubdomain(tc.in); got != tc.want {
-			t.Errorf("FoldsLanguageSubdomain(%q) = %q, want %q", tc.in, got, tc.want)
-		}
-	}
-}
-
 func TestRuleSetZeroMeansDefaultRules(t *testing.T) {
 	m, _ := newTestManager(t)
 
@@ -230,7 +208,7 @@ func TestRuleSetZeroMeansDefaultRules(t *testing.T) {
 	}
 
 	var zero Config
-	m2 := New(zero, NewMemoryState(), testLogger())
+	m2 := New(zero, state.NewMemoryState(), testLogger())
 	if r := m2.rules(); r.isZero() {
 		t.Error("a zero Config produced no rules; every skip rule would be disabled")
 	} else if !r.SkipsPath("/login") {
@@ -243,9 +221,67 @@ func TestRuleSetZeroMeansDefaultRules(t *testing.T) {
 		SkipFileExtensions:   []string{},
 		WikiNoisyNamespaces:  []string{},
 	}
-	m3 := New(permissive, NewMemoryState(), testLogger())
+	m3 := New(permissive, state.NewMemoryState(), testLogger())
 	if m3.rules().SkipsPath("/login") {
 		t.Error("an explicitly emptied rule list was replaced by the defaults")
+	}
+}
+
+// The compiled cache is derived from Allow/Disallow, so it has to answer the
+// same as compiling fresh would. A state.HostState from WithRobots has a cache; one
+// built by hand or rebuilt from Redis does not, and both must behave alike.
+func TestHostStateRulesMatchesAFreshCompile(t *testing.T) {
+	allow := []string{"/private/public/"}
+	disallow := []string{"/private/", "/tag/", "/a*b/"}
+
+	fromCache := state.HostState{}.WithRobots("example.com", allow, disallow, nil, time.Second, time.Unix(1, 0))
+	fromCache = fromCache.WithCompiled(NewRobotsRules(allow, disallow))
+	if fromCache.Rules() == nil {
+		t.Fatal("the compiled rules were not attached to the HostState")
+	}
+	byHand := state.HostState{Name: "example.com", Allow: allow, Disallow: disallow}
+	if byHand.Rules() != nil {
+		t.Fatal("test setup: a hand-built state.HostState should fall back to a fresh compile")
+	}
+
+	// A hand-built HostState carries no compiled value, so the manager is the
+	// thing that has to supply one. This is the shape every HostState read back
+	// out of RedisState arrives in.
+	m := New(DefaultConfig(), state.NewMemoryState(), testLogger())
+	byHandRules := m.robotsRules(byHand)
+
+	fresh := NewRobotsRules(allow, disallow)
+	for _, path := range []string{
+		"/private/public/x", "/private/y", "/tag/z", "/zzz", "/a/b/", "/a/b/c",
+		"/", "", "/private",
+	} {
+		wantAllowed, wantRule := fresh.Allows(path)
+		gotAllowed, gotRule := fromCache.Rules().Allows(path)
+		if gotAllowed != wantAllowed || gotRule != wantRule {
+			t.Errorf("Rules().Allows(%q) = (%v, %q), want (%v, %q)",
+				path, gotAllowed, gotRule, wantAllowed, wantRule)
+		}
+		gotAllowed, gotRule = byHandRules.Allows(path)
+		if gotAllowed != wantAllowed || gotRule != wantRule {
+			t.Errorf("hand-built compiled Rules().Allows(%q) = (%v, %q), want (%v, %q)",
+				path, gotAllowed, gotRule, wantAllowed, wantRule)
+		}
+	}
+}
+
+// WithRobots re-reading a host's robots.txt must replace the cache, not append
+// to or outlive the previous one.
+func TestWithRobotsReplacesTheCompiledRules(t *testing.T) {
+	st := state.HostState{}.WithRobots("example.com", nil, []string{"/old/"}, nil, time.Second, time.Unix(1, 0))
+	st = st.WithCompiled(NewRobotsRules(nil, []string{"/old/"}))
+	st = st.WithRobots("example.com", nil, []string{"/new/"}, nil, time.Second, time.Unix(2, 0))
+	st = st.WithCompiled(NewRobotsRules(nil, []string{"/new/"}))
+
+	if st.Rules().Refuses("/old/") {
+		t.Error("the cache still carries a rule from the previous robots.txt")
+	}
+	if !st.Rules().Refuses("/new/") {
+		t.Error("the cache was not rebuilt from the new robots.txt")
 	}
 }
 
@@ -416,6 +452,30 @@ Sitemap: https://example.com/sitemap.xml
 	}
 	if got.CrawlDelay != 5 {
 		t.Errorf("CrawlDelay = %d, want 5", got.CrawlDelay)
+	}
+}
+
+// Agent matching must run against the string actually sent on the wire, not the
+// configured token. defaultUserAgent appends a version and contact to a bare
+// token, so the two differ: a site that echoes back the exact agent it was
+// addressed as would match neither the bare token nor a substring of it.
+func TestParseRobotsMatchesTheVersionedAgentOnTheWire(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.UserAgent = "BoogleBot"
+	sent := defaultUserAgent(cfg)
+
+	if sent == cfg.UserAgent {
+		t.Fatal("this test needs a UserAgent that defaultUserAgent rewrites")
+	}
+
+	body := "User-agent: " + sent + "\nDisallow: /boogle-only/\n"
+
+	if got := parseRobots(body, cfg.UserAgent); len(got.Disallow) != 0 {
+		t.Errorf("matching against the configured token picked up %#v; the agent "+
+			"on the wire is %q", got.Disallow, sent)
+	}
+	if got := parseRobots(body, sent); !equalStrings(got.Disallow, []string{"/boogle-only/"}) {
+		t.Errorf("Disallow = %#v, want the site's own rules to apply for %q", got.Disallow, sent)
 	}
 }
 

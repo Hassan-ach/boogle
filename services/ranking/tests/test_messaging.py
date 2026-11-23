@@ -58,13 +58,14 @@ def test_explicit_arguments_win_over_the_environment(monkeypatch: pytest.MonkeyP
     assert service.queue_name == "indexer.confirmations"
 
 
-def test_queue_name_falls_back_to_the_environment() -> None:
-    os.environ["RABBITMQ_CONFIRMATION_QUEUE"] = "custom.confirmations"
-    try:
-        service = MessagingService(broker_url="amqp://guest:guest@localhost:5672")
-        assert service.queue_name == "custom.confirmations"
-    finally:
-        del os.environ["RABBITMQ_CONFIRMATION_QUEUE"]
+def test_queue_name_falls_back_to_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RABBITMQ_CONFIRMATION_QUEUE", "custom.confirmations")
+
+    service = MessagingService(broker_url="amqp://guest:guest@localhost:5672")
+
+    assert service.queue_name == "custom.confirmations"
 
 
 def test_broker_credentials_are_built_from_the_individual_variables(
@@ -86,10 +87,22 @@ def test_broker_url_falls_back_to_rabbitmq_url(monkeypatch: pytest.MonkeyPatch) 
     assert MessagingService().broker_url == "amqp://from-env:5672"
 
 
-def test_credentials_default_when_nothing_is_configured() -> None:
+def test_missing_broker_configuration_fails_closed() -> None:
+    with pytest.raises(ValueError, match="BROKER_URL"):
+        MessagingService()
+
+
+def test_credentials_from_individual_variables_are_url_escaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RABBITMQ_USER", "user@example.com")
+    monkeypatch.setenv("RABBITMQ_PASSWORD", "p@ss:word")
+    monkeypatch.setenv("RABBITMQ_HOST", "broker")
+
     service = MessagingService()
 
-    assert service.broker_url == "amqp://admin:admin@localhost:5672"
+    assert "user%40example.com" in service.broker_url
+    assert "p%40ss%3Aword" in service.broker_url
 
 
 async def test_no_pipeline_runs_below_the_threshold() -> None:
@@ -229,7 +242,7 @@ async def test_a_failing_pipeline_does_not_kill_the_consumer() -> None:
     assert calls == 2, "a failure must not wedge the trigger"
 
 
-async def test_a_failing_pipeline_still_consumes_its_batch() -> None:
+async def test_a_failing_pipeline_keeps_its_batch_pending() -> None:
     calls = 0
 
     async def exploding() -> None:
@@ -244,7 +257,7 @@ async def test_a_failing_pipeline_still_consumes_its_batch() -> None:
     await settle()
 
     assert calls == 1, "a failing handler must not be retried in a tight loop"
-    assert service._indexer_pages == 0
+    assert service._indexer_pages == 1, "a failed batch must not be lost"
 
 
 async def test_pipeline_is_a_no_op_without_a_handler() -> None:

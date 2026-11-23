@@ -52,9 +52,20 @@ indexer/
 
 ## Indexing Process
 
-1. **Fetch** - Each worker queries unindexed pages
+1. **Claim** - Each worker atomically claims an unindexed page. The claim sets
+   `indexed = TRUE`, clears `indexed_at`, records the attempt time and increments
+   `index_attempts`, so a crashed worker is distinguishable from a finished page.
    ```sql
-   SELECT * FROM pages WHERE indexed = false LIMIT 1
+   WITH cte AS (
+       SELECT id, url_id, html FROM pages
+       WHERE indexed = FALSE AND id = $1 AND index_attempts < $2
+       FOR UPDATE SKIP LOCKED LIMIT 1
+   )
+   UPDATE pages
+   SET indexed = TRUE, indexed_at = NULL,
+       last_index_attempt_at = NOW(), index_attempts = index_attempts + 1
+   FROM cte WHERE pages.id = cte.id
+   RETURNING pages.id, pages.url_id, pages.html;
    ```
 
 2. **Parse** - Extract text from HTML
@@ -79,16 +90,31 @@ indexer/
    "world" appears 1 time in 3 words = TF = 1
    ```
 
-5. **Store** - Write to database
+5. **Store** - Write the page's term set in one transaction. The old rows for
+   the page are deleted first, so a re-crawl drops words the page no longer has.
    ```sql
-   INSERT INTO words VALUES ('example', tf=1)
-   INSERT INTO page_word VALUES (page_id, word_id, tf=1)
+   DELETE FROM page_word WHERE page_id = $1;
+   INSERT INTO words (word) SELECT ... ON CONFLICT (word) DO NOTHING;
+   INSERT INTO page_word (page_id, word_id, tf) SELECT ...;
    ```
 
-6. **Mark** - Update indexed flag
+6. **Confirm, then mark** - Publish `IndexConfirmation` with publisher confirms,
+   then record completion. The order matters: a mark without a confirmation
+   starves ranking, while a duplicate confirmation only triggers an extra scoring
+   run.
    ```sql
-   UPDATE pages SET indexed = true WHERE id = page_id
+   UPDATE pages
+   SET indexed_at = NOW(), last_index_attempt_at = NULL, index_attempts = 0
+   WHERE id = $1 AND indexed = TRUE AND indexed_at IS NULL;
    ```
+
+   A publish or write failure releases the claim (`indexed = FALSE`, words
+   deleted) and nacks the job, so it is retried.
+
+7. **Sweep** - Every `SWEEP_INTERVAL_SECONDS`, reclaim claims where
+   `indexed_at IS NULL` and the claim is older than `SWEEP_GRACE_SECONDS`, delete
+   their partial words, and republish up to `SWEEP_BATCH_SIZE` pages. Completed
+   pages are never touched; pages past `MAX_INDEX_ATTEMPTS` are left alone.
 
 ## TF Calculation
 
@@ -130,7 +156,10 @@ CREATE TABLE pages (
     url_id UUID UNIQUE NOT NULL,
     html TEXT NOT NULL,
     metadata JSONB NOT NULL,
-    indexed BOOLEAN NOT NULL DEFAULT FALSE  -- Set to true after indexing
+    indexed BOOLEAN NOT NULL DEFAULT FALSE,  -- claimed
+    last_index_attempt_at TIMESTAMP,          -- when the current claim was taken
+    indexed_at TIMESTAMP,                     -- NULL until indexing completes
+    index_attempts INT NOT NULL DEFAULT 0
 );
 ```
 
@@ -138,7 +167,11 @@ CREATE TABLE pages (
 
 Configuration:
 ```env
-INDEXER_COUNT=4  # Number of concurrent workers
+PG_MAX_CONNECTIONS=10   # Also sets the worker/prefetch concurrency
+MAX_INDEX_ATTEMPTS=3    # Claims per page before the sweep gives up
+SWEEP_INTERVAL_SECONDS=300
+SWEEP_GRACE_SECONDS=600
+SWEEP_BATCH_SIZE=500
 ```
 
 Each worker:

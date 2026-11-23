@@ -47,12 +47,8 @@ templ ResultHeader() {
                 }
                 }">
                 <button
-                    @click="goToTab('all')"
+                    @click.prevent="goToTab('all')"
                     class="filter-tab cursor-pointer"
-                    hx-get="/search?tab=all"
-                    hx-trigger="click"
-                    hx-target="#results"
-                    hx-push-url="true"
                     :class="tab == 'all' 
                         ? 'text-blue-600 border-blue-600 pointer-events-none' 
                         : 'text-gray-600 hover:text-gray-800 hover:border-gray-300'"

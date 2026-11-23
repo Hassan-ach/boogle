@@ -1,5 +1,4 @@
 use crate::core::errors::{AppError, DatabaseError};
-use crate::core::utils::retry_async;
 use crate::core::{config::PsqlConfig, indexer::Page};
 use slog::{Logger, error, info, warn};
 use std::collections::HashMap;
@@ -7,12 +6,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 use sqlx::postgres::PgConnectOptions;
-use sqlx::{Pool, Postgres};
+use sqlx::{PgConnection, Pool, Postgres};
 use uuid::Uuid;
 
 #[async_trait::async_trait]
 pub trait DB: Send + Sync {
-    async fn get_page_by_id(&self, page_id: Uuid) -> Result<Page, AppError>;
+    async fn get_page_by_id(&self, page_id: Uuid, max_attempts: i32) -> Result<Page, AppError>;
     async fn batch_words(
         &self,
         words: &HashMap<String, u32>,
@@ -20,10 +19,16 @@ pub trait DB: Send + Sync {
     ) -> Result<(), AppError>;
     async fn undo_indexing(&self, page_id: Uuid) -> Result<(), AppError>;
     async fn close(&self);
+    /// Records that this page's word index is complete.
+    ///
+    /// A completed page sets `indexed_at`; a worker that claimed the page and
+    /// died leaves it NULL, which is what the sweep reclaims.
+    async fn mark_indexed(&self, page_id: Uuid) -> Result<(), AppError>;
     async fn get_stale_unindexed(
         &self,
         older_than: Duration,
         limit: i64,
+        max_attempts: i32,
     ) -> Result<Vec<Uuid>, AppError>;
 }
 
@@ -50,24 +55,60 @@ impl Psql {
 
 #[async_trait::async_trait]
 impl DB for Psql {
+    async fn mark_indexed(&self, page_id: Uuid) -> Result<(), AppError> {
+        // Guard on `indexed_at IS NULL` so a late mark from a straggling worker
+        // cannot re-stamp completion over a newer claim, and reset the attempt
+        // counter so the budget is per indexing episode, not per page lifetime.
+        let result = sqlx::query!(
+            "UPDATE pages
+             SET indexed_at = NOW(),
+                 last_index_attempt_at = NULL,
+                 index_attempts = 0
+             WHERE id = $1 AND indexed = TRUE AND indexed_at IS NULL",
+            page_id
+        )
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            warn!(self.log, "no claimed page found to mark indexed";
+                  "page_id" => page_id.to_string()
+            );
+            return Err(AppError::Database(DatabaseError::NotFoundError(format!(
+                "page {} is not claimed and cannot be marked indexed",
+                page_id
+            ))));
+        }
+        info!(self.log, "marked page as indexed";
+              "page_id" => page_id.to_string()
+        );
+        Ok(())
+    }
+
     async fn get_stale_unindexed(
         &self,
         older_than: Duration,
         limit: i64,
+        max_attempts: i32,
     ) -> Result<Vec<Uuid>, AppError> {
+        // Reclaim only claims that never completed: a finished page has
+        // `indexed_at` set and is untouched no matter how old its claim is.
         sqlx::query!(
             r#"WITH released AS (
                     UPDATE pages
-                    SET indexed = FALSE
+                    SET indexed = FALSE,
+                        last_index_attempt_at = NULL
                     WHERE indexed = TRUE
+                        AND indexed_at IS NULL
                         AND last_index_attempt_at IS NOT NULL
                         AND last_index_attempt_at < NOW() - make_interval(secs => $1)
+                        AND index_attempts < $2
                     RETURNING id
                 )
                 DELETE FROM page_word pw
                 USING released
                 WHERE pw.page_id = released.id"#,
-            older_than.as_secs() as f64
+            older_than.as_secs() as f64,
+            max_attempts
         )
         .execute(&self.pool)
         .await?;
@@ -83,7 +124,7 @@ impl DB for Psql {
                 LIMIT $2"#,
             older_than.as_secs() as f64,
             limit,
-            3
+            max_attempts
         )
         .fetch_all(&self.pool)
         .await?;
@@ -97,10 +138,10 @@ impl DB for Psql {
     /// claim and the `indexed = TRUE` update share one statement so no row can be
     /// handed out without being marked.
     ///
-    /// `indexed = TRUE` is set before indexing actually runs. A crash mid-index
-    /// leaves the page marked, and `find_stale_pages` picks it back up via
-    /// `updated_at`/`index_attempts` rather than leaving it unindexed forever.
-    async fn get_page_by_id(&self, page_id: Uuid) -> Result<Page, AppError> {
+    /// `index_attempts` is incremented here, not on failure: every delivery
+    /// counts, including one that aborts before the failure path can run
+    /// (`panic = "abort"`).
+    async fn get_page_by_id(&self, page_id: Uuid, max_attempts: i32) -> Result<Page, AppError> {
         let mut tx = self.pool.begin().await?;
         let query = sqlx::query_as::<_, Page>(
             "WITH cte AS (
@@ -108,17 +149,21 @@ impl DB for Psql {
                  FROM pages
                  WHERE indexed = FALSE
                     AND id = $1
+                    AND index_attempts < $2
                  FOR UPDATE SKIP LOCKED
                  LIMIT 1
             )
             UPDATE pages
             SET indexed = TRUE,
-                last_index_attempt_at = NOW()
+                indexed_at = NULL,
+                last_index_attempt_at = NOW(),
+                index_attempts = pages.index_attempts + 1
             FROM cte
             WHERE pages.id = cte.id
             RETURNING pages.id, pages.url_id, pages.html",
         )
-        .bind(page_id);
+        .bind(page_id)
+        .bind(max_attempts);
         let Some(page) = query.fetch_optional(&mut *tx).await? else {
             tx.commit().await?;
             return Err(AppError::Database(DatabaseError::NotFoundError(format!(
@@ -131,12 +176,9 @@ impl DB for Psql {
         Ok(page)
     }
 
-    /// Writes one page's word counts in a single multi-row upsert.
-    ///
-    /// One statement rather than a loop: a page with thousands of distinct words
-    /// would otherwise cost thousands of round trips. Word ids come from an
-    /// upsert of the words themselves, so a word never seen before is created in
-    /// the same transaction.
+    /// Writes one page's word counts atomically; a failure leaves the previous
+    /// index intact. Retrying is the caller's job: a failed statement aborts the
+    /// transaction and `index_page` retries the whole write.
     async fn batch_words(
         &self,
         words: &HashMap<String, u32>,
@@ -146,6 +188,7 @@ impl DB for Psql {
             warn!(self.log, "no word to index for page";
                   "page_id" => page_id.to_string()
             );
+            replace_page_words(&self.pool, page_id).await?;
             return Ok(());
         }
 
@@ -171,13 +214,22 @@ impl DB for Psql {
             warn!(self.log, "every token on this page is too long to store";
                   "page_id" => page_id.to_string()
             );
+            replace_page_words(&self.pool, page_id).await?;
             return Ok(());
         }
 
         let mut keys: Vec<String> = storable.keys().map(|w| (*w).clone()).collect();
         keys.sort_unstable();
 
-        let map = batch_upsert_words(&self.pool, keys, self.conf.word_batch_size, &self.log)
+        let mut tx = self.pool.begin().await?;
+
+        // A re-index replaces the page's term set; without this delete, stale
+        // words would still be scored by TF-IDF.
+        sqlx::query!("DELETE FROM page_word WHERE page_id = $1", page_id)
+            .execute(&mut *tx)
+            .await?;
+
+        let map = batch_upsert_words(&mut tx, keys, self.conf.word_batch_size, &self.log)
             .await
             .map_err(|err| {
                 error!(self.log, "failed to upsert words for page";
@@ -211,46 +263,55 @@ impl DB for Psql {
         }
 
         link_words_to_page(
-            &self.pool,
+            &mut tx,
             page_id,
             word_id_count,
             self.conf.page_word_batch_size,
             &self.log,
-            self.conf.max_retries,
         )
-        .await
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn undo_indexing(&self, page_id: Uuid) -> Result<(), AppError> {
-        let removed = sqlx::query!("DELETE FROM page_word WHERE page_id = $1", page_id)
-            .execute(&self.pool)
-            .await?;
-        if removed.rows_affected() > 0 {
-            info!(self.log, "discarded the words of a failed indexing attempt";
+        // Guarded so a straggling worker cannot delete the index of a page that
+        // has since been completed by someone else. The words and the claim are
+        // released together: if this rolls back, the page stays consistent.
+        let mut tx = self.pool.begin().await?;
+
+        let result = sqlx::query!(
+            r#"WITH released AS (
+                   UPDATE pages
+                   SET indexed = FALSE,
+                       indexed_at = NULL,
+                       last_index_attempt_at = NOW()
+                   WHERE id = $1 AND indexed_at IS NULL
+                   RETURNING id
+               )
+               DELETE FROM page_word pw
+               USING released
+               WHERE pw.page_id = released.id"#,
+            page_id
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        if result.rows_affected() > 0 {
+            info!(self.log, "released a failed indexing attempt and its words";
                   "page_id" => page_id.to_string(),
-                  "words" => removed.rows_affected()
+                  "words" => result.rows_affected()
+            );
+        } else {
+            // Either the page does not exist or a newer attempt already recorded
+            // completion; both make the undo a no-op.
+            warn!(self.log, "nothing to undo for page";
+                  "page_id" => page_id.to_string()
             );
         }
 
-        let result = sqlx::query!(
-            "UPDATE pages
-                    SET indexed = FALSE,
-                    last_index_attempt_at = NOW(),
-                    index_attempts = index_attempts + 1
-                    WHERE id = $1",
-            page_id
-        )
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
-            warn!(self.log, "no page found to undo indexing";
-                  "page_id" => page_id.to_string()
-            );
-        } else {
-            info!(self.log, "successfully undone indexing for page";
-                  "page_id" => page_id.to_string()
-            );
-        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -301,7 +362,23 @@ async fn db_connectioon(conf: &PsqlConfig) -> Result<Pool<Postgres>, AppError> {
     Ok(pool)
 }
 
-async fn upsert_words(pool: &Pool<Postgres>, words: Vec<String>) -> Result<HashMap<String, Uuid>> {
+/// Replaces a page's term rows with an empty set.
+///
+/// Used when a re-crawl yields nothing storable: leaving the old rows behind
+/// would keep scoring words the page no longer contains.
+async fn replace_page_words(pool: &Pool<Postgres>, page_id: Uuid) -> Result<(), AppError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query!("DELETE FROM page_word WHERE page_id = $1", page_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn upsert_words(
+    conn: &mut PgConnection,
+    words: Vec<String>,
+) -> Result<HashMap<String, Uuid>> {
     if words.is_empty() {
         return Ok(HashMap::new());
     }
@@ -312,14 +389,14 @@ async fn upsert_words(pool: &Pool<Postgres>, words: Vec<String>) -> Result<HashM
            ON CONFLICT (word) DO NOTHING"#,
         &words[..]
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     let rows = sqlx::query!(
         r#"SELECT id, word FROM words WHERE word = ANY($1)"#,
         &words[..]
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     let mut ids = HashMap::with_capacity(rows.len());
@@ -337,10 +414,12 @@ const MAX_WORD_LEN: usize = 25;
 
 /// Upserts word rows in chunks and returns each word's id.
 ///
-/// Chunked because Postgres caps a statement at 65535 bind parameters, and a
-/// page can easily have more distinct words than that.
+/// Chunked for statement size and memory, not for the bind-parameter ceiling:
+/// each chunk binds a single `text[]`, so parameter count is constant. A page
+/// with tens of thousands of distinct tokens would otherwise build one very large
+/// statement and hold every id in memory at once.
 async fn batch_upsert_words(
-    pool: &Pool<Postgres>,
+    conn: &mut PgConnection,
     words: Vec<String>,
     batch_size: usize,
     log: &Logger,
@@ -352,7 +431,7 @@ async fn batch_upsert_words(
     let mut all_ids = HashMap::with_capacity(words.len());
 
     for chunk in words.chunks(batch_size) {
-        match upsert_words(pool, chunk.to_vec()).await {
+        match upsert_words(&mut *conn, chunk.to_vec()).await {
             Ok(chunk_ids) => {
                 all_ids.extend(chunk_ids);
             }
@@ -370,12 +449,11 @@ async fn batch_upsert_words(
 }
 
 async fn link_words_to_page(
-    pool: &Pool<Postgres>,
+    conn: &mut PgConnection,
     page_id: Uuid,
     word_id_count: HashMap<Uuid, u32>,
     batch_size: usize,
     log: &Logger,
-    max_retries: usize,
 ) -> Result<(), AppError> {
     if word_id_count.is_empty() {
         return Ok(());
@@ -385,35 +463,18 @@ async fn link_words_to_page(
     entries.sort_unstable_by_key(|(id, _)| **id);
 
     for chunk in entries.chunks(batch_size) {
-        match retry_async(max_retries, || async {
-            batch_link_words_to_page(pool, page_id, chunk, log).await
-        })
-        .await
-        {
-            Err(err) => {
-                error!(log, "failed to link batch of words to page after retries";
-                      "batch_size" => chunk.len(),
-                      "error" => %err
-                );
-                return Err(AppError::Database(DatabaseError::BatchWordsError(format!(
-                    "failed to link batch of words to page {} after retries: {}",
-                    page_id, err
-                ))));
-            }
-            Ok(_) => {
-                info!(log, "successfully linked batch of words to page";
-                      "batch_size" => chunk.len(),
-                      "page_id" => page_id.to_string()
-                );
-            }
-        }
+        batch_link_words_to_page(&mut *conn, page_id, chunk, log).await?;
+        info!(log, "linked batch of words to page";
+              "batch_size" => chunk.len(),
+              "page_id" => page_id.to_string()
+        );
     }
 
     Ok(())
 }
 
 async fn batch_link_words_to_page(
-    pool: &Pool<Postgres>,
+    conn: &mut PgConnection,
     page_id: Uuid,
     chunk: &[(&Uuid, &u32)],
     log: &Logger,
@@ -436,7 +497,7 @@ async fn batch_link_words_to_page(
         &word_ids,
         &counts
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await;
 
     if let Err(err) = result {
@@ -482,7 +543,6 @@ mod db_integration {
             statement_timeout_ms: 15_000,
             word_batch_size: 100,
             page_word_batch_size: 100,
-            max_retries: 3,
         }
     }
 
@@ -534,7 +594,10 @@ mod db_integration {
         let store = store_or_skip!();
         let (url_id, page_id) = seed_page(&store, "claim").await;
 
-        let page = store.get_page_by_id(page_id).await.expect("get_page_by_id");
+        let page = store
+            .get_page_by_id(page_id, 3)
+            .await
+            .expect("get_page_by_id");
 
         assert_eq!(page.id, page_id);
         assert_eq!(page.url_id, url_id);
@@ -550,6 +613,13 @@ mod db_integration {
         assert!(indexed, "the page was returned but not claimed");
         assert!(claimed, "claimed without a timestamp");
 
+        let attempts: i32 = sqlx::query_scalar("SELECT index_attempts FROM pages WHERE id = $1")
+            .bind(page_id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("read attempts");
+        assert_eq!(attempts, 1, "the delivery was not counted in the claim");
+
         cleanup(&store, url_id).await;
     }
 
@@ -559,9 +629,9 @@ mod db_integration {
         let store = store_or_skip!();
         let (url_id, page_id) = seed_page(&store, "dup").await;
 
-        store.get_page_by_id(page_id).await.expect("first claim");
+        store.get_page_by_id(page_id, 3).await.expect("first claim");
 
-        let second = store.get_page_by_id(page_id).await;
+        let second = store.get_page_by_id(page_id, 3).await;
         match second {
             Err(AppError::Database(DatabaseError::NotFoundError(_))) => {}
             other => panic!("a second claim succeeded: {other:?}"),
@@ -575,7 +645,7 @@ mod db_integration {
     async fn get_page_by_id_reports_a_random_id_as_not_found() {
         let store = store_or_skip!();
 
-        match store.get_page_by_id(Uuid::new_v4()).await {
+        match store.get_page_by_id(Uuid::new_v4(), 3).await {
             Err(AppError::Database(DatabaseError::NotFoundError(_))) => {}
             other => panic!("a random id resolved to a page: {other:?}"),
         }
@@ -645,6 +715,10 @@ mod db_integration {
             got.get("fresh").copied(),
             Some(4),
             "a word added by the re-crawl is missing: {rows:?}"
+        );
+        assert!(
+            got.get("gone").is_none(),
+            "a word the re-crawl removed is still indexed: {rows:?}"
         );
 
         cleanup(&store, url_id).await;
@@ -750,11 +824,12 @@ mod db_integration {
 
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
-    async fn undo_indexing_returns_the_page_to_the_queue_and_counts_the_attempt() {
+    async fn undo_indexing_returns_the_page_to_the_queue_without_double_counting() {
         let store = store_or_skip!();
         let (url_id, page_id) = seed_page(&store, "undo").await;
 
-        sqlx::query("UPDATE pages SET indexed = TRUE WHERE id = $1")
+        // A claim always counts the attempt, so seed the state a claim leaves.
+        sqlx::query("UPDATE pages SET indexed = TRUE, index_attempts = 1 WHERE id = $1")
             .bind(page_id)
             .execute(&store.pool)
             .await
@@ -772,7 +847,10 @@ mod db_integration {
             !indexed,
             "the page is still claimed, so the sweep will never see it"
         );
-        assert_eq!(attempts, 1, "the failed attempt was not recorded");
+        assert_eq!(
+            attempts, 1,
+            "undo_indexing incremented the attempt a second time"
+        );
 
         cleanup(&store, url_id).await;
     }
@@ -864,7 +942,7 @@ mod db_integration {
         .expect("age the claim");
 
         let found = store
-            .get_stale_unindexed(Duration::from_secs(3600), 100)
+            .get_stale_unindexed(Duration::from_secs(3600), 100, 3)
             .await
             .expect("get_stale_unindexed");
 
@@ -898,7 +976,7 @@ mod db_integration {
         .expect("mark a recent claim");
 
         let found = store
-            .get_stale_unindexed(Duration::from_secs(3600), 100)
+            .get_stale_unindexed(Duration::from_secs(3600), 100, 3)
             .await
             .expect("get_stale_unindexed");
 
@@ -918,6 +996,78 @@ mod db_integration {
 
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
+    async fn mark_indexed_records_completion_and_clears_the_claim() {
+        let store = store_or_skip!();
+        let (url_id, page_id) = seed_page(&store, "mark").await;
+
+        store.get_page_by_id(page_id, 3).await.expect("claim");
+        store.mark_indexed(page_id).await.expect("mark indexed");
+
+        let (indexed, indexed_at, claimed): (bool, bool, bool) = sqlx::query_as(
+            "SELECT indexed, indexed_at IS NOT NULL, last_index_attempt_at IS NOT NULL \
+             FROM pages WHERE id = $1",
+        )
+        .bind(page_id)
+        .fetch_one(&store.pool)
+        .await
+        .expect("read the completion marker");
+
+        assert!(indexed);
+        assert!(indexed_at, "the success marker was not written");
+        assert!(!claimed, "a finished page still looks like an open claim");
+
+        cleanup(&store, url_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
+    async fn get_stale_unindexed_never_touches_a_completed_page() {
+        let store = store_or_skip!();
+        let (url_id, page_id) = seed_page(&store, "complete").await;
+
+        store.get_page_by_id(page_id, 3).await.expect("claim");
+        store
+            .batch_words(&words(&[("durable", 1)]), page_id)
+            .await
+            .expect("batch_words");
+        store.mark_indexed(page_id).await.expect("mark indexed");
+
+        // Age both timestamps: a completed page must survive any sweep window.
+        sqlx::query(
+            "UPDATE pages SET indexed_at = NOW() - INTERVAL '2 hours', \
+             last_index_attempt_at = NOW() - INTERVAL '2 hours' WHERE id = $1",
+        )
+        .bind(page_id)
+        .execute(&store.pool)
+        .await
+        .expect("age the completed page");
+
+        let found = store
+            .get_stale_unindexed(Duration::from_secs(3600), 100, 3)
+            .await
+            .expect("get_stale_unindexed");
+
+        assert!(
+            !found.contains(&page_id),
+            "a successfully indexed page was reclaimed for reindexing: {found:?}"
+        );
+
+        let (indexed, words_left): (bool, i64) = sqlx::query_as(
+            "SELECT p.indexed, (SELECT count(*) FROM page_word WHERE page_id = p.id) \
+             FROM pages p WHERE p.id = $1",
+        )
+        .bind(page_id)
+        .fetch_one(&store.pool)
+        .await
+        .expect("read the page and its words");
+        assert!(indexed, "the sweep un-indexed a completed page");
+        assert_eq!(words_left, 1, "the sweep deleted a completed page's words");
+
+        cleanup(&store, url_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
     async fn get_stale_unindexed_gives_up_on_a_page_after_three_failed_attempts() {
         let store = store_or_skip!();
         let (url_id, page_id) = seed_page(&store, "gave-up").await;
@@ -929,7 +1079,7 @@ mod db_integration {
             .expect("exhaust the attempts");
 
         let found = store
-            .get_stale_unindexed(Duration::from_secs(3600), 100)
+            .get_stale_unindexed(Duration::from_secs(3600), 100, 3)
             .await
             .expect("get_stale_unindexed");
 
@@ -953,7 +1103,7 @@ mod db_integration {
         }
 
         let found = store
-            .get_stale_unindexed(Duration::from_secs(3600), 2)
+            .get_stale_unindexed(Duration::from_secs(3600), 2, 3)
             .await
             .expect("get_stale_unindexed");
         assert!(found.len() <= 2, "a limit of 2 returned {}", found.len());
@@ -983,7 +1133,7 @@ mod db_integration {
             .expect("age the newer page");
 
         let found = store
-            .get_stale_unindexed(Duration::from_secs(3600), 100)
+            .get_stale_unindexed(Duration::from_secs(3600), 100, 3)
             .await
             .expect("get_stale_unindexed");
 
@@ -1005,11 +1155,86 @@ mod db_integration {
             Some(url) => url,
             None => return,
         };
-        let mangled = bogus.replace("@", "@no-such-host-9d3f@");
+        let mangled = bogus.replace("localhost", "no-such-host-9d3f.invalid");
 
         match Psql::new(conf(&mangled), test_logger()).await {
             Err(AppError::Database(_)) => {}
             other => panic!("connecting to a bogus host did not fail cleanly: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
+    async fn a_page_that_used_its_attempt_budget_cannot_be_claimed_again() {
+        let store = store_or_skip!();
+        let (url_id, page_id) = seed_page(&store, "cap").await;
+
+        sqlx::query("UPDATE pages SET index_attempts = 3 WHERE id = $1")
+            .bind(page_id)
+            .execute(&store.pool)
+            .await
+            .expect("exhaust the attempts");
+
+        // Broker redelivery goes through the same claim, so the cap has to be
+        // enforced here and not only in the sweep.
+        match store.get_page_by_id(page_id, 3).await {
+            Err(AppError::Database(DatabaseError::NotFoundError(_))) => {}
+            other => panic!("a page past its attempt budget was claimed: {other:?}"),
+        }
+
+        cleanup(&store, url_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
+    async fn mark_indexed_resets_the_attempt_budget() {
+        let store = store_or_skip!();
+        let (url_id, page_id) = seed_page(&store, "reset").await;
+
+        store.get_page_by_id(page_id, 3).await.expect("claim");
+        store.mark_indexed(page_id).await.expect("mark");
+
+        let attempts: i32 = sqlx::query_scalar("SELECT index_attempts FROM pages WHERE id = $1")
+            .bind(page_id)
+            .fetch_one(&store.pool)
+            .await
+            .expect("read attempts");
+        assert_eq!(attempts, 0, "success did not restore the attempt budget");
+
+        cleanup(&store, url_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; run with `cargo test -- --ignored`"]
+    async fn undo_indexing_cannot_delete_a_completed_pages_words() {
+        let store = store_or_skip!();
+        let (url_id, page_id) = seed_page(&store, "straggler").await;
+
+        store.get_page_by_id(page_id, 3).await.expect("claim");
+        store
+            .batch_words(&words(&[("survives", 1)]), page_id)
+            .await
+            .expect("batch_words");
+        store.mark_indexed(page_id).await.expect("mark");
+
+        // A straggling worker that lost its claim must not be able to wipe the
+        // result a newer worker already committed.
+        store.undo_indexing(page_id).await.expect("undo");
+
+        let (indexed, words_left): (bool, i64) = sqlx::query_as(
+            "SELECT p.indexed, (SELECT count(*) FROM page_word WHERE page_id = p.id) \
+             FROM pages p WHERE p.id = $1",
+        )
+        .bind(page_id)
+        .fetch_one(&store.pool)
+        .await
+        .expect("read the page");
+        assert!(indexed, "a straggler un-indexed a completed page");
+        assert_eq!(
+            words_left, 1,
+            "a straggler deleted a completed page's words"
+        );
+
+        cleanup(&store, url_id).await;
     }
 }

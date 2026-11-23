@@ -2,6 +2,8 @@ package main
 
 import (
 	"embed"
+	"log"
+	"time"
 
 	"github.com/Hassan-ach/boogle/services/engine/internal/config"
 	"github.com/Hassan-ach/boogle/services/engine/internal/handlers"
@@ -17,14 +19,19 @@ import (
 var embeddedFiles embed.FS
 
 func main() {
-	conf, _ := config.LoadConfig()
+	conf, err := config.LoadConfig()
+	if err != nil {
+		log.Fatalf("failed to load config: %v", err)
+	}
 
 	store := store.NewStore(conf.Store)
 
 	var speller service.Speller
-	speller, err := spellchecker.NewAspellSpellingService()
+	aspellSpeller, err := spellchecker.NewAspellSpellingService()
 	if err != nil {
 		speller = spellchecker.NewDummySpellingService()
+	} else {
+		speller = aspellSpeller
 	}
 
 	ranker := ranking.NewRankingService(conf.Ranker)
@@ -38,7 +45,24 @@ func main() {
 	e.HTTPErrorHandler = handlers.HandleError
 	e.Use(echoMiddleware.Recover())
 	e.Use(echoMiddleware.RequestID())
-	e.Use(echoMiddleware.RequestLogger())
+	// Log path only: the stock RequestLogger logs the full URI, including search terms.
+	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c *echo.Context) error {
+			started := time.Now()
+			err := next(c)
+			status := 0
+			if response, ok := c.Response().(*echo.Response); ok {
+				status = response.Status
+			}
+			e.Logger.Info("request",
+				"method", c.Request().Method,
+				"path", c.Request().URL.Path,
+				"status", status,
+				"latency", time.Since(started).String(),
+			)
+			return err
+		}
+	})
 	e.Use(echoMiddleware.GzipWithConfig(echoMiddleware.GzipConfig{Level: 5}))
 	e.Use(echoMiddleware.RateLimiter(echoMiddleware.NewRateLimiterMemoryStore(20)))
 

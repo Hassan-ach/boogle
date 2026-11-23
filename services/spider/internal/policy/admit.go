@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
 
@@ -39,7 +40,7 @@ func (m *PolicyManager) Admit(ctx context.Context, rawURL string) (*Verdict, err
 
 	host := hostKey(parsed)
 
-	visited, err := m.state.IsVisited(ctx, norm)
+	visited, err := m.st.IsVisited(ctx, norm)
 	if err != nil {
 		return m.unavailable(ctx, host, norm, err)
 	}
@@ -70,7 +71,7 @@ func (m *PolicyManager) Admit(ctx context.Context, rawURL string) (*Verdict, err
 
 	if hostState.BudgetExhausted(m.cfg.MaxPagesPerHost) {
 		until := m.now().Add(m.cfg.HostColdPeriod)
-		if err := m.state.SetMarker(ctx, host, MarkerCold, m.cfg.HostColdPeriod); err != nil {
+		if err := m.st.SetMarker(ctx, host, state.MarkerCold, m.cfg.HostColdPeriod); err != nil {
 			m.log.Warn("could not mark a budget-exhausted host cold; it will be re-checked next url",
 				"host", host, "error", err)
 		}
@@ -84,12 +85,11 @@ func (m *PolicyManager) Admit(ctx context.Context, rawURL string) (*Verdict, err
 	return &Verdict{
 		Kind:   Allow,
 		Reason: ReasonOK,
-		Host:   hostState.ToEntity(m.cfg.URLMaxAttempts),
 	}, nil
 }
 
-func (m *PolicyManager) admitsLocally(st HostState, parsed *url.URL) (Reason, bool) {
-	if allowed, rule := NewRobotsRules(st.Allow, st.Disallow).Allows(parsed.EscapedPath()); !allowed {
+func (m *PolicyManager) admitsLocally(st state.HostState, parsed *url.URL) (Reason, bool) {
+	if allowed, rule := m.robotsRules(st).Allows(parsed.EscapedPath()); !allowed {
 		m.log.Debug("refused by robots.txt", "url", parsed.String(), "rule", rule)
 		return ReasonRobotsDisallow, false
 	}
@@ -110,7 +110,25 @@ func (m *PolicyManager) admitsLocally(st HostState, parsed *url.URL) (Reason, bo
 	return ReasonOK, true
 }
 
-func (m *PolicyManager) filterLocally(st HostState, urls []string) (admitted []string, refused []Reason) {
+// robotsRules returns the host's compiled robots rules, compiling them here when
+// the HostState did not arrive carrying a compiled value.
+//
+// A nil cache is the normal case for anything read back out of RedisState, which
+// rebuilds the struct from hash fields on every read, and for a HostState built
+// by hand. EnsureHost attaches a compiled value on the reading it just took, so
+// the hot path -- admitting every link off one page against one host -- never
+// recompiles. Everything else compiles once per read.
+func (m *PolicyManager) robotsRules(st state.HostState) RobotsRules {
+	// A checked assertion rather than a bare one: state.PathRules is a wider
+	// interface than RobotsRules, so falling back costs one compile and keeps a
+	// future second implementation from panicking in the admit path.
+	if rules, ok := st.Rules().(RobotsRules); ok {
+		return rules
+	}
+	return NewRobotsRules(st.Allow, st.Disallow)
+}
+
+func (m *PolicyManager) filterLocally(st state.HostState, urls []string) (admitted []string, refused []Reason) {
 	admitted = make([]string, 0, len(urls))
 	refused = make([]Reason, 0, len(urls))
 
@@ -137,14 +155,14 @@ func (m *PolicyManager) filterLocally(st HostState, urls []string) (admitted []s
 
 var errWindowReset = errors.New("could not reset an expired crawl window")
 
-func (m *PolicyManager) rollWindow(ctx context.Context, host string, st *HostState) bool {
+func (m *PolicyManager) rollWindow(ctx context.Context, host string, st *state.HostState) bool {
 	if st.WindowStartedAt.IsZero() || m.cfg.HostColdPeriod <= 0 {
 		return false
 	}
 	if m.now().Before(st.WindowStartedAt.Add(m.cfg.HostColdPeriod)) {
 		return false
 	}
-	if err := m.state.ResetWindow(ctx, host, m.now()); err != nil {
+	if err := m.st.ResetWindow(ctx, host, m.now()); err != nil {
 		m.log.Error("could not start a new page window for a host whose window expired",
 			"host", host, "window_started_at", st.WindowStartedAt, "error", err)
 		return true

@@ -5,42 +5,52 @@ import "github.com/Hassan-ach/boogle/services/engine/view/layout"
 import "github.com/Hassan-ach/boogle/services/engine/view/component"
 import "github.com/Hassan-ach/boogle/services/engine/view/page/result/tab"
 
-templ ShowAll(pages []*model.Page, totalPages, curentPage int,  isHtmx bool) {
-    if !isHtmx {
-        @layout.Base(){
+// ShowAll renders the search results.
+//
+// #results is the htmx swap target, so the full page renders it once and the
+// partial response renders only its inner content. Pagination lives inside it,
+// which is what keeps page navigation inside the swapped region.
+templ ShowAll(pages []*model.Page, totalResults int, totalPages int, currentPage int, isHtmx bool) {
+    if isHtmx {
+        @tab.All(pages, totalResults, totalPages, currentPage)
+    } else {
+        @layout.Base() {
             <div class="page-wrapper">
                 @component.ResultHeader()
-                @tab.All(pages)
+                <div id="results" class="content-container py-6">
+                    @tab.All(pages, totalResults, totalPages, currentPage)
+                </div>
             </div>
-
         }
-    }else {
-        <div class="page-wrapper">
-            @tab.All(pages)
-        </div>
-    }
-    if len(pages) > 0 {
-        @component.Pagination(totalPages,curentPage)
     }
 }
 
 templ ShowGraph(result any, isHtmx bool) {
-    @layout.Base(){
-        <div class="page-wrapper">
-        if !isHtmx {
-            @component.ResultHeader()
-        }
+    if isHtmx {
         @tab.Graph()
-        </div>
+    } else {
+        @layout.Base() {
+            <div class="page-wrapper">
+                @component.ResultHeader()
+                <div id="results" class="content-container py-6">
+                    @tab.Graph()
+                </div>
+            </div>
+        }
     }
 }
-templ ShowImages(result any,isHtmx bool) {
-    @layout.Base(){
-        <div class="page-wrapper">
-        if !isHtmx {
-            @component.ResultHeader()
-        }
+
+templ ShowImages(result any, isHtmx bool) {
+    if isHtmx {
         @tab.Images()
-        </div>
+    } else {
+        @layout.Base() {
+            <div class="page-wrapper">
+                @component.ResultHeader()
+                <div id="results" class="content-container py-6">
+                    @tab.Images()
+                </div>
+            </div>
+        }
     }
 }

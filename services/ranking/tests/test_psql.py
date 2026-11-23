@@ -163,3 +163,37 @@ async def test_concurrent_calls_do_not_share_a_delay_counter() -> None:
 
     assert sorted(results) == ["a", "b"]
     assert calls == {"a": 2, "b": 2}
+
+
+def test_conninfo_escapes_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    from psql import DatabaseManager
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("PG_HOST", "db")
+    monkeypatch.setenv("PG_PORT", "5432")
+    monkeypatch.setenv("PG_DBNAME", "boogle")
+    monkeypatch.setenv("PG_USER", "user@example.com")
+    monkeypatch.setenv("PG_PASSWORD", "p@ss:word")
+
+    conninfo = DatabaseManager()._build_conninfo()
+
+    # make_conninfo emits keyword=value form, so credentials round-trip without
+    # being reparsed as URL structure.
+    from psycopg.conninfo import conninfo_to_dict
+
+    parsed = conninfo_to_dict(conninfo)
+    assert parsed["user"] == "user@example.com"
+    assert parsed["password"] == "p@ss:word"
+    assert parsed["host"] == "db"
+
+
+def test_conninfo_fails_closed_without_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from psql import DatabaseManager
+
+    for key in ["DATABASE_URL", "PG_HOST", "PG_PORT", "PG_DBNAME", "PG_USER", "PG_PASSWORD"]:
+        monkeypatch.delenv(key, raising=False)
+
+    with pytest.raises(ValueError, match="DATABASE_URL"):
+        DatabaseManager()._build_conninfo()

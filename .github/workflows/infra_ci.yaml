@@ -1,0 +1,39 @@
+name: Infra CI
+
+on:
+  pull_request:
+    branches:
+      - main
+      - dev
+    paths:
+      - "docker-compose.yml"
+      - "services/*/docker-compose.yml"
+      - "services/*/Dockerfile"
+      - "services/*/entrypoint.sh"
+      - "scripts/**"
+      - "migration/**"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate compose files
+        run: |
+          cp .env.example .env
+          for file in docker-compose.yml services/*/docker-compose.yml; do
+            echo "==> $file"
+            docker compose -f "$file" --env-file .env config -q
+          done
+
+      - name: Shellcheck entrypoints and scripts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+          shellcheck scripts/*.sh services/*/entrypoint.sh
+
+      - name: Migrations are idempotent SQL files
+        run: |
+          test -n "$(ls migration/*.sql)"
+          for file in migration/*.sql; do grep -qiE 'create|alter|drop|insert|update' "$file"; done

@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"errors"
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"io"
 	"log/slog"
 	"testing"
@@ -13,16 +14,16 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-func newTestManager(t *testing.T) (*PolicyManager, *MemoryState) {
+func newTestManager(t *testing.T) (*PolicyManager, *state.MemoryState) {
 	t.Helper()
-	st := NewMemoryState()
+	st := state.NewMemoryState()
 	return New(DefaultConfig(), st, testLogger()), st
 }
 
-func newTestManagerAt(t *testing.T, now time.Time) (*PolicyManager, *MemoryState) {
+func newTestManagerAt(t *testing.T, now time.Time) (*PolicyManager, *state.MemoryState) {
 	t.Helper()
 	clock := func() time.Time { return now }
-	st := NewMemoryStateAt(clock)
+	st := state.NewMemoryStateAt(clock)
 	return New(DefaultConfig(), st, testLogger()).WithClock(clock), st
 }
 
@@ -31,10 +32,10 @@ func TestHostGateFailsClosed(t *testing.T) {
 
 	cases := []struct {
 		name    string
-		breakIt func(*MemoryState)
+		breakIt func(*state.MemoryState)
 	}{
-		{"markers unreadable", func(s *MemoryState) {}},
-		{"host state unreadable", func(s *MemoryState) {}},
+		{"markers unreadable", func(s *state.MemoryState) {}},
+		{"host state unreadable", func(s *state.MemoryState) {}},
 	}
 
 	for _, tc := range cases {
@@ -72,7 +73,7 @@ func TestHostGateOrdering(t *testing.T) {
 		m, st := newTestManager(t)
 		ctx := context.Background()
 
-		if err := st.SetMarker(ctx, "example.com", MarkerDead, time.Hour); err != nil {
+		if err := st.SetMarker(ctx, "example.com", state.MarkerDead, time.Hour); err != nil {
 			t.Fatal(err)
 		}
 		st.FailOn = map[string]error{"HostState": errors.New("should never be reached")}
@@ -93,7 +94,7 @@ func TestHostGateOrdering(t *testing.T) {
 		m, st := newTestManager(t)
 		ctx := context.Background()
 
-		for _, kind := range AllMarkers {
+		for _, kind := range state.AllMarkers {
 			if err := st.SetMarker(ctx, "example.com", kind, time.Hour); err != nil {
 				t.Fatal(err)
 			}
@@ -108,10 +109,10 @@ func TestHostGateOrdering(t *testing.T) {
 		m, st := newTestManager(t)
 		ctx := context.Background()
 
-		if err := st.SetMarker(ctx, "example.com", MarkerCold, time.Hour); err != nil {
+		if err := st.SetMarker(ctx, "example.com", state.MarkerCold, time.Hour); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.SetMarker(ctx, "example.com", MarkerCooldown, time.Minute); err != nil {
+		if err := st.SetMarker(ctx, "example.com", state.MarkerCooldown, time.Minute); err != nil {
 			t.Fatal(err)
 		}
 		_, verdict, _ := m.hostGate(ctx, "example.com")
@@ -125,7 +126,7 @@ func TestHostGateCooldownDefersRatherThanSkips(t *testing.T) {
 	m, st := newTestManager(t)
 	ctx := context.Background()
 
-	if err := st.SetMarker(ctx, "example.com", MarkerCooldown, 30*time.Second); err != nil {
+	if err := st.SetMarker(ctx, "example.com", state.MarkerCooldown, 30*time.Second); err != nil {
 		t.Fatal(err)
 	}
 
@@ -152,7 +153,7 @@ func TestHostGateDeadReportsWhenItExpires(t *testing.T) {
 	m = m.WithClock(func() time.Time { return base })
 	st.SetClock(func() time.Time { return base })
 
-	if err := st.SetMarker(ctx, "example.com", MarkerDead, time.Hour); err != nil {
+	if err := st.SetMarker(ctx, "example.com", state.MarkerDead, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 
@@ -169,7 +170,7 @@ func TestHostGateExaminesAMarkerIsExhausted(t *testing.T) {
 	m, st := newTestManager(t)
 	ctx := context.Background()
 
-	if err := st.SetMarker(ctx, "example.com", MarkerDead, time.Minute); err != nil {
+	if err := st.SetMarker(ctx, "example.com", state.MarkerDead, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 
@@ -199,11 +200,11 @@ func TestSetMarkerDoesNotExtendAnExistingDeadline(t *testing.T) {
 	base := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 	st.SetClock(func() time.Time { return base })
 
-	if err := st.SetMarker(ctx, "example.com", MarkerDead, time.Minute); err != nil {
+	if err := st.SetMarker(ctx, "example.com", state.MarkerDead, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	st.Advance(10 * time.Second)
-	if err := st.SetMarker(ctx, "example.com", MarkerDead, time.Hour); err != nil {
+	if err := st.SetMarker(ctx, "example.com", state.MarkerDead, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 
@@ -211,7 +212,7 @@ func TestSetMarkerDoesNotExtendAnExistingDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ttl := markers[MarkerDead]
+	ttl := markers[state.MarkerDead]
 	if ttl > 55*time.Second {
 		t.Errorf("marker TTL = %v, want about 50s -- SetMarker must not extend an "+
 			"existing deadline", ttl)
@@ -222,16 +223,16 @@ func TestSetMarkerReplacesAnExpiredOne(t *testing.T) {
 	_, st := newTestManager(t)
 	ctx := context.Background()
 
-	if err := st.SetMarker(ctx, "example.com", MarkerDead, time.Minute); err != nil {
+	if err := st.SetMarker(ctx, "example.com", state.MarkerDead, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	st.Advance(2 * time.Minute)
 
-	if err := st.SetMarker(ctx, "example.com", MarkerDead, 4*time.Hour); err != nil {
+	if err := st.SetMarker(ctx, "example.com", state.MarkerDead, 4*time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	markers, _ := st.Markers(ctx, "example.com")
-	if _, ok := markers[MarkerDead]; !ok {
+	if _, ok := markers[state.MarkerDead]; !ok {
 		t.Error("a new marker was not raised after the old one expired")
 	}
 }
@@ -240,14 +241,14 @@ func TestSetMarkerWithNonPositiveTTLClears(t *testing.T) {
 	_, st := newTestManager(t)
 	ctx := context.Background()
 
-	if err := st.SetMarker(ctx, "example.com", MarkerCooldown, time.Minute); err != nil {
+	if err := st.SetMarker(ctx, "example.com", state.MarkerCooldown, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SetMarker(ctx, "example.com", MarkerCooldown, 0); err != nil {
+	if err := st.SetMarker(ctx, "example.com", state.MarkerCooldown, 0); err != nil {
 		t.Fatal(err)
 	}
 	markers, _ := st.Markers(ctx, "example.com")
-	if _, ok := markers[MarkerCooldown]; ok {
+	if _, ok := markers[state.MarkerCooldown]; ok {
 		t.Error("a zero-TTL marker survived; the cooldown would never be enforced")
 	}
 }
@@ -299,12 +300,71 @@ func TestCountingAFailureNeverBreaksARefusal(t *testing.T) {
 	}
 }
 
+// SaveHostState must not disturb the fields the counters own. Another spider
+// process sharing this Redis can record a success or take the sitemap claim
+// between this process's read and its save, and the two backends have to behave
+// the same way or a host's budget depends on which store it was running against.
+func TestSaveHostStateDoesNotDisturbTheCounters(t *testing.T) {
+	_, st := newTestManager(t)
+	ctx := context.Background()
+	const host = "example.com"
+
+	if won, err := st.ClaimSiteMaps(ctx, host, time.Unix(1000, 0)); err != nil || !won {
+		t.Fatalf("first sitemap claim: won=%v err=%v", won, err)
+	}
+	if err := st.RecordSuccess(ctx, host, time.Unix(2000, 0)); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		if _, err := st.RecordFailure(ctx, host); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A snapshot taken before any of the above, as a reader that raced a
+	// concurrent spider would hold.
+	stale := state.HostState{Name: host}
+	stale = stale.WithRobots(host, nil, []string{"/x"}, nil, time.Second, time.Unix(3000, 0))
+	if err := st.SaveHostState(ctx, host, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.HostState(ctx, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PagesCrawled != 1 {
+		t.Errorf("PagesCrawled = %d, want 1: saving a stale snapshot rolled the counter back, "+
+			"so the host's page budget restarts from zero", got.PagesCrawled)
+	}
+	if got.ConsecFailures != 5 {
+		t.Errorf("ConsecFailures = %d, want 5: a stale save cleared the failure run that "+
+			"keeps a flapping host from looking healthy", got.ConsecFailures)
+	}
+	if !got.LastSuccess.Equal(time.Unix(2000, 0)) {
+		t.Errorf("LastSuccess = %v, want the recorded success at %v", got.LastSuccess, time.Unix(2000, 0))
+	}
+	if !got.SiteMapsClaimedAt.Equal(time.Unix(1000, 0)) {
+		t.Errorf("SiteMapsClaimedAt = %v, want %v", got.SiteMapsClaimedAt, time.Unix(1000, 0))
+	}
+
+	// The fields SaveHostState does own still land. Read through NewRobotsRules,
+	// not Rules(): a value read back out of the store has no compiled cache.
+	if !NewRobotsRules(got.Allow, got.Disallow).Refuses("/x") {
+		t.Errorf("the saved robots.txt rules were not applied: Allow=%v Disallow=%v",
+			got.Allow, got.Disallow)
+	}
+	if !got.RobotsFetchedAt.Equal(time.Unix(3000, 0)) {
+		t.Errorf("RobotsFetchedAt = %v, want %v", got.RobotsFetchedAt, time.Unix(3000, 0))
+	}
+}
+
 func TestHostStateBudgetIsPerWindow(t *testing.T) {
 	_, st := newTestManager(t)
 	ctx := context.Background()
 
 	const maxPages = 5
-	if err := st.SaveHostState(ctx, "example.com", HostState{
+	if err := st.SaveHostState(ctx, "example.com", state.HostState{
 		Name:            "example.com",
 		MaxPages:        maxPages,
 		WindowStartedAt: time.Now(),
@@ -338,16 +398,16 @@ func TestHostStateBudgetIsPerWindow(t *testing.T) {
 func TestBudgetExhaustedPrefersTheLowerLimit(t *testing.T) {
 	tests := []struct {
 		name      string
-		state     HostState
+		state     state.HostState
 		globalMax int
 		want      bool
 	}{
-		{"under the global cap", HostState{PagesCrawled: 5}, 10, false},
-		{"at the global cap", HostState{PagesCrawled: 10}, 10, true},
-		{"a lower host limit wins", HostState{PagesCrawled: 3, MaxPages: 3}, 10, true},
-		{"a higher host limit does not raise the cap", HostState{PagesCrawled: 10, MaxPages: 1000}, 10, true},
-		{"no limits at all means no limit", HostState{PagesCrawled: 9999}, 0, false},
-		{"a zero host limit falls back to the global", HostState{PagesCrawled: 4, MaxPages: 0}, 3, true},
+		{"under the global cap", state.HostState{PagesCrawled: 5}, 10, false},
+		{"at the global cap", state.HostState{PagesCrawled: 10}, 10, true},
+		{"a lower host limit wins", state.HostState{PagesCrawled: 3, MaxPages: 3}, 10, true},
+		{"a higher host limit does not raise the cap", state.HostState{PagesCrawled: 10, MaxPages: 1000}, 10, true},
+		{"no limits at all means no limit", state.HostState{PagesCrawled: 9999}, 0, false},
+		{"a zero host limit falls back to the global", state.HostState{PagesCrawled: 4, MaxPages: 0}, 3, true},
 	}
 
 	for _, tc := range tests {
@@ -489,7 +549,7 @@ func TestWithClockDoesNotMutateTheOriginal(t *testing.T) {
 }
 
 func TestLogIsOptional(t *testing.T) {
-	st := NewMemoryState()
+	st := state.NewMemoryState()
 	m := New(DefaultConfig(), st, nil)
 	if m.log == nil {
 		t.Fatal("New left the logger nil")
@@ -500,7 +560,7 @@ func TestLogIsOptional(t *testing.T) {
 }
 
 func TestMemoryStateRejectsUseAfterClose(t *testing.T) {
-	st := NewMemoryState()
+	st := state.NewMemoryState()
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}

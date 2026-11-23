@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 # Create (or reset) the isolated `boogle_test` database and apply the migrations.
-#
-# Integration tests must never touch the live `boogle` database: the PageRank
-# and IDF tests write scores and would otherwise shift every stored ranking.
+# Tests write scores, so they must never touch the live `boogle` database.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -13,9 +11,8 @@ PGUSER="${PG_USER:-admin}"
 PGPASSWORD="${PG_PASSWORD:-1234}"
 TEST_DB="${BOOGLE_TEST_DB:-boogle_test}"
 
-# Inside docker-compose the host is the service name ("psql"), which does not
-# resolve outside the network. Fall back to localhost for local runs unless the
-# caller has said otherwise.
+# The compose service name ("psql") does not resolve outside the network;
+# fall back to localhost for local runs unless the caller overrides it.
 if [[ -z "${BOOGLE_TEST_PGHOST:-}" && "${PGHOST}" != "localhost" && "${PGHOST}" != "127.0.0.1" ]]; then
   if ! getent hosts "$PGHOST" >/dev/null 2>&1; then
     echo "==> host ${PGHOST} does not resolve; using localhost"

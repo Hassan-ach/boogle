@@ -97,21 +97,38 @@ CREATE TABLE urls (
 ```sql
 CREATE TABLE pages (
     id UUID PRIMARY KEY,
-    url_id UUID REFERENCES urls(id),
+    url_id UUID UNIQUE NOT NULL REFERENCES urls(id) ON DELETE CASCADE,
     html TEXT NOT NULL,
-    metadata JSONB NOT NULL
+    metadata JSONB NOT NULL DEFAULT '{}',
+    indexed BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    last_index_attempt_at TIMESTAMP,
+    indexed_at TIMESTAMP,
+    index_attempts INT NOT NULL DEFAULT 0
 );
 ```
+
+`pages.metadata` stores display metadata. `<meta property="og:url">` is kept there
+as `ogUrl` only when it is on the same origin; storage identity is always the
+fetched, canonicalized URL in `urls.url`.
 
 ### graph_edges
 ```sql
 CREATE TABLE graph_edges (
     id BIGSERIAL PRIMARY KEY,
-    from_url UUID REFERENCES urls(id),
-    to_url UUID REFERENCES urls(id),
+    from_url UUID NOT NULL REFERENCES urls(id) ON DELETE CASCADE,
+    to_url   UUID NOT NULL REFERENCES urls(id) ON DELETE CASCADE,
     UNIQUE (from_url, to_url)
 );
+
+CREATE INDEX idx_graph_edges_from_page ON graph_edges(from_url);
+CREATE INDEX idx_graph_edges_to_page   ON graph_edges(to_url);
 ```
+
+There is exactly one uniqueness rule. The former reverse index on
+`(to_url, from_url)` silently discarded reciprocal links (`a → b` blocked
+`b → a`), so it was removed.
 
 ## Link Graph Example
 

@@ -25,6 +25,9 @@ jobs:
       - name: Install dependencies
         run: go mod tidy
 
+      - name: Check formatting
+        run: test -z "$(gofmt -l . | grep -v node_modules)" || (gofmt -l . && exit 1)
+
       - name: Run tests
         run: go test -v ./...
 

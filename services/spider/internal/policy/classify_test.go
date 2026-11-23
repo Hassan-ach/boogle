@@ -7,10 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"strconv"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
+	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
 
 type timeoutErr struct{ msg string }
@@ -862,8 +866,8 @@ func TestClassifyMarksADeadHostOnlyForConnectionFailures(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, dead := markers[MarkerDead]
-			_, cooling := markers[MarkerCooldown]
+			_, dead := markers[state.MarkerDead]
+			_, cooling := markers[state.MarkerCooldown]
 			if dead != tc.wantDead {
 				t.Errorf("dead marker present = %v, want %v (markers: %s)",
 					dead, tc.wantDead, markerNames(markers))
@@ -889,11 +893,11 @@ func TestClassifyNeverMarksAHostDeadForATimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, dead := markers[MarkerDead]; dead {
+	if _, dead := markers[state.MarkerDead]; dead {
 		t.Error("a timeout marked the host dead; its URLs would be answered from Redis " +
 			"for an hour because it was slow once")
 	}
-	if _, cooling := markers[MarkerCooldown]; !cooling {
+	if _, cooling := markers[state.MarkerCooldown]; !cooling {
 		t.Errorf("a timeout should cool the host down, got markers: %s", markerNames(markers))
 	}
 }
@@ -905,7 +909,7 @@ func TestTheCooldownRespectsTheRobotsCrawlDelay(t *testing.T) {
 	const host = "h.example"
 	const target = "https://h.example/page"
 
-	if err := st.SaveHostState(ctx, host, HostState{
+	if err := st.SaveHostState(ctx, host, state.HostState{
 		Name:            host,
 		CrawlDelay:      30 * time.Second,
 		MaxPages:        100,
@@ -920,7 +924,7 @@ func TestTheCooldownRespectsTheRobotsCrawlDelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ttl, ok := markers[MarkerCooldown]
+	ttl, ok := markers[state.MarkerCooldown]
 	if !ok {
 		t.Fatalf("no cooldown was raised; markers: %s", markerNames(markers))
 	}
@@ -944,7 +948,7 @@ func TestTheDeadMarkerGrowsWithEachConsecutiveFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstTTL := first[MarkerDead]
+	firstTTL := first[state.MarkerDead]
 
 	mustClassify(t, m, "https://gone.example/b", Outcome{Err: &net.DNSError{Err: "no such host"}})
 	second, err := st.Markers(ctx, host)
@@ -952,7 +956,7 @@ func TestTheDeadMarkerGrowsWithEachConsecutiveFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := st.ClearMarker(ctx, host, MarkerDead); err != nil {
+	if err := st.ClearMarker(ctx, host, state.MarkerDead); err != nil {
 		t.Fatal(err)
 	}
 	mustClassify(t, m, "https://gone.example/c", Outcome{Err: &net.DNSError{Err: "no such host"}})
@@ -960,14 +964,14 @@ func TestTheDeadMarkerGrowsWithEachConsecutiveFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if third[MarkerDead] <= firstTTL {
+	if third[state.MarkerDead] <= firstTTL {
 		t.Errorf("the dead ttl is %v after three host failures, want more than the %v "+
-			"it was after one", third[MarkerDead], firstTTL)
+			"it was after one", third[state.MarkerDead], firstTTL)
 	}
-	if second[MarkerDead] != firstTTL {
+	if second[state.MarkerDead] != firstTTL {
 		t.Errorf("the ttl changed under a live marker: %v then %v; a marker that "+
 			"extended itself would keep a host out for ever after enough failures",
-			firstTTL, second[MarkerDead])
+			firstTTL, second[state.MarkerDead])
 	}
 }
 
@@ -1129,3 +1133,29 @@ func TestHostOfURLReportsNothingForSomethingUnparseable(t *testing.T) {
 }
 
 var _ net.Error = timeoutError{}
+
+func TestATruncatedTwoHundredBacksOffInsteadOfIndexingHalfAPage(t *testing.T) {
+	cfg := DefaultConfig()
+	out := Outcome{
+		StatusCode:  http.StatusOK,
+		ContentType: "text/html",
+		Err:         errors.New("unexpected EOF"),
+	}
+
+	kind, reason := categorize(out, &cfg)
+
+	if kind != ActBackoff || reason != ReasonTruncatedBody {
+		t.Fatalf("categorize = (%v, %v), want (backoff, %v)", kind, reason, ReasonTruncatedBody)
+	}
+}
+
+func TestARedirectToAnotherSchemeIsPermanent(t *testing.T) {
+	cfg := DefaultConfig()
+	out := Outcome{Err: fmt.Errorf("%w: ftp", utils.ErrRedirectScheme)}
+
+	kind, _ := categorize(out, &cfg)
+
+	if kind != ActPermanent {
+		t.Fatalf("categorize = %v, want permanent", kind)
+	}
+}

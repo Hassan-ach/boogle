@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
+	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 )
 
 const (
@@ -36,56 +38,61 @@ func (m *PolicyManager) WithRobotsFetcher(f RobotsFetcher) *PolicyManager {
 func (m *PolicyManager) WithRobotsClient(client *http.Client) *PolicyManager {
 	cp := *m
 	if client != nil {
-		cp.fetchRobots = newHTTPRobotsFetcher(client, defaultUserAgent(cp.cfg))
+		cp.fetchRobots = robotsFetcherFrom(client, defaultUserAgent(cp.cfg))
 	}
 	return &cp
 }
 
-func newHTTPRobotsFetcher(client *http.Client, userAgent string) RobotsFetcher {
+// robotsFetcherFrom adapts utils.GetReq to the RobotsFetcher shape, so robots
+// requests go out over the same HTTP path as every other fetch and pick up its
+// Accept and Accept-Language headers. The Accept-Language hint matters here:
+// the index is English only, and a robots.txt is the one resource where a
+// site will happily serve a different set of rules per language.
+func robotsFetcherFrom(client *http.Client, userAgent string) RobotsFetcher {
 	if client == nil {
 		client = &http.Client{Timeout: defaultRobotsTimeout}
 	}
 
-	return func(ctx context.Context, url string) ([]byte, int, error) {
+	return func(ctx context.Context, rawURL string) ([]byte, int, error) {
 		ctx, cancel := context.WithTimeout(ctx, defaultRobotsTimeout)
 		defer cancel()
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return nil, 0, fmt.Errorf("build robots request: %w", err)
-		}
-		if userAgent != "" {
-			req.Header.Set("User-Agent", userAgent)
-		}
-
-		resp, err := client.Do(req)
+		res, err := utils.GetReq(ctx, client, rawURL, utils.GetOptions{
+			UserAgent: userAgent,
+			MaxBytes:  maxRobotsBytes,
+		})
 		if err != nil {
 			return nil, 0, fmt.Errorf("fetch robots: %w", err)
 		}
-		defer drainAndClose(resp)
-
-		body, err := io.ReadAll(io.LimitReader(resp.Body, maxRobotsBytes))
-		if err != nil {
-			return nil, resp.StatusCode, fmt.Errorf("read robots: %w", err)
+		// 429 and 5xx are returned rather than raised: EnsureHost branches on the
+		// status to put the host into cooldown instead of treating it as dead.
+		if res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500 {
+			return nil, res.StatusCode, nil
 		}
-		return body, resp.StatusCode, nil
+		if res.StatusCode != http.StatusOK {
+			return nil, res.StatusCode, fmt.Errorf("robots %s returned %d", rawURL, res.StatusCode)
+		}
+		// utils.GetReq reads one byte past the limit so a caller can detect an
+		// oversized body, which the content path relies on. There is nothing to
+		// detect here: a truncated robots.txt still yields the rules at its front,
+		// so trim back to the cap rather than let the bound creep by one byte.
+		body := res.Body
+		if len(body) > maxRobotsBytes {
+			body = body[:maxRobotsBytes]
+		}
+		return body, res.StatusCode, nil
 	}
 }
 
-func drainAndClose(resp *http.Response) {
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxRobotsBytes))
-	_ = resp.Body.Close()
-}
-
-func (m *PolicyManager) EnsureHost(ctx context.Context, host string) (HostState, error) {
+func (m *PolicyManager) EnsureHost(ctx context.Context, host string) (state.HostState, error) {
 	host = strings.TrimSpace(strings.ToLower(host))
 	if host == "" {
-		return HostState{}, errEmptyHost
+		return state.HostState{}, state.ErrEmptyHost
 	}
 
-	st, err := m.state.HostState(ctx, host)
+	st, err := m.st.HostState(ctx, host)
 	if err != nil {
-		return HostState{}, fmt.Errorf("read host state for %s: %w", host, err)
+		return state.HostState{}, fmt.Errorf("read host state for %s: %w", host, err)
 	}
 
 	if !st.RobotsFetchedAt.IsZero() && !m.robotsStale(st) {
@@ -94,12 +101,12 @@ func (m *PolicyManager) EnsureHost(ctx context.Context, host string) (HostState,
 
 	robotsURL, err := robotsURLFor(host)
 	if err != nil {
-		return HostState{}, m.markHostUnreachable(ctx, host, err)
+		return state.HostState{}, m.markHostUnreachable(ctx, host, err)
 	}
 
 	body, status, err := m.fetchRobots(ctx, robotsURL)
 	if err != nil {
-		return HostState{}, m.markHostUnreachable(ctx, host, err)
+		return state.HostState{}, m.markHostUnreachable(ctx, host, err)
 	}
 
 	if status == http.StatusTooManyRequests || status >= 500 {
@@ -107,14 +114,18 @@ func (m *PolicyManager) EnsureHost(ctx context.Context, host string) (HostState,
 		if status == http.StatusTooManyRequests {
 			reason = ReasonRateLimited
 		}
-		if merr := m.state.SetMarker(ctx, host, MarkerCooldown, m.cfg.HostCooldown(1, 0)); merr != nil {
+		if merr := m.st.SetMarker(ctx, host, state.MarkerCooldown, m.cfg.HostCooldown(1, 0)); merr != nil {
 			m.log.Warn("could not set a cooldown on a refusing host",
 				"host", host, "error", merr)
 		}
-		return HostState{}, &robotsRefusedError{host: host, status: status, reason: reason}
+		return state.HostState{}, &robotsRefusedError{host: host, status: status, reason: reason}
 	}
 
-	robots := parseRobots(string(body), m.cfg.UserAgent)
+	// Match agents against the string actually sent on the wire, not the
+	// configured token. defaultUserAgent appends a version and contact to a bare
+	// token, so "BoogleBot" reaches robots.txt as "BoogleBot/1.0 (+...)" and a
+	// site naming only the bare token would otherwise match nothing.
+	robots := parseRobots(string(body), defaultUserAgent(m.cfg))
 
 	delay := time.Duration(robots.CrawlDelay) * time.Second
 	if delay < m.cfg.MinCrawlDelay {
@@ -127,15 +138,16 @@ func (m *PolicyManager) EnsureHost(ctx context.Context, host string) (HostState,
 	}
 
 	st = st.WithRobots(host, robots.Allow, robots.Disallow, robots.SiteMaps, delay, m.now())
+	st = st.WithCompiled(NewRobotsRules(robots.Allow, robots.Disallow))
 	st.MaxPages = maxPages
 	if st.Status == "" {
-		st.Status = statusReady
+		st.Status = state.StatusReady
 	}
 	if st.FirstSeen.IsZero() {
 		st.FirstSeen = m.now()
 	}
 
-	if err := m.state.SaveHostState(ctx, host, st); err != nil {
+	if err := m.st.SaveHostState(ctx, host, st); err != nil {
 		m.log.Error("could not cache host state; the next url will re-fetch robots.txt",
 			"host", host, "error", err)
 	}
@@ -163,7 +175,7 @@ func RobotsRefusedReason(err error) (Reason, bool) {
 	return "", false
 }
 
-func (m *PolicyManager) robotsStale(st HostState) bool {
+func (m *PolicyManager) robotsStale(st state.HostState) bool {
 	if st.RobotsFetchedAt.IsZero() {
 		return true
 	}
@@ -179,14 +191,14 @@ func (m *PolicyManager) robotsStale(st HostState) bool {
 func (m *PolicyManager) markHostUnreachable(ctx context.Context, host string, cause error) error {
 	_, reason := categorizeError(cause)
 
-	marker := MarkerDead
+	marker := state.MarkerDead
 	ttl := m.cfg.DeadHostTTL(1)
 	if isTimeout(cause) {
-		marker = MarkerCooldown
+		marker = state.MarkerCooldown
 		ttl = m.cfg.HostCooldown(1, 0)
 	}
 
-	if err := m.state.SetMarker(ctx, host, marker, ttl); err != nil {
+	if err := m.st.SetMarker(ctx, host, marker, ttl); err != nil {
 		m.log.Error("could not mark a host unreachable; the next url will retry it",
 			"host", host, "reason", reason, "error", err)
 	}
@@ -199,7 +211,7 @@ func (m *PolicyManager) markHostUnreachable(ctx context.Context, host string, ca
 func robotsURLFor(host string) (string, error) {
 	host = strings.TrimSpace(strings.ToLower(host))
 	if host == "" {
-		return "", errEmptyHost
+		return "", state.ErrEmptyHost
 	}
 	if strings.ContainsAny(host, " \t\r\n/?#@") {
 		return "", fmt.Errorf("host %q is not a bare hostname", host)
@@ -390,12 +402,12 @@ func (m *PolicyManager) WithSiteMapResolver(r SiteMapResolver) *PolicyManager {
 // time, so only the spider that fetched robots first does the work. The cost of
 // a lost race is that sitemaps may be queued twice, which the frontier tolerates;
 // the cost of skipping the claim would be never resolving them at all.
-func (m *PolicyManager) discoverSiteMaps(ctx context.Context, st HostState) {
+func (m *PolicyManager) discoverSiteMaps(ctx context.Context, st state.HostState) {
 	if m.resolveSiteMaps == nil || len(st.SiteMaps) == 0 {
 		return
 	}
 
-	won, err := m.state.ClaimSiteMaps(ctx, st.Name, st.RobotsFetchedAt)
+	won, err := m.st.ClaimSiteMaps(ctx, st.Name, st.RobotsFetchedAt)
 	if err != nil {
 		m.log.Warn("could not claim a host's sitemaps; they may be queued twice",
 			"host", st.Name, "error", err)
@@ -424,7 +436,7 @@ func (m *PolicyManager) discoverSiteMaps(ctx context.Context, st HostState) {
 		byReason[r]++
 	}
 	for reason, n := range byReason {
-		if err := m.state.CountReason(ctx, st.Name, reason); err != nil {
+		if err := m.st.CountReason(ctx, st.Name, reason); err != nil {
 			m.log.Warn("could not record a sitemap refusal",
 				"host", st.Name, "reason", reason, "error", err)
 		}

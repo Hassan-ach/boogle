@@ -18,6 +18,7 @@ import (
 	"github.com/Hassan-ach/boogle/services/spider/internal/messaging"
 	"github.com/Hassan-ach/boogle/services/spider/internal/parser"
 	"github.com/Hassan-ach/boogle/services/spider/internal/policy"
+	"github.com/Hassan-ach/boogle/services/spider/internal/state"
 	"github.com/Hassan-ach/boogle/services/spider/internal/utils"
 	"uuid"
 )
@@ -25,9 +26,9 @@ import (
 type fakeStore struct {
 	mu    sync.Mutex
 	pages []*entity.Page
-	hosts []string
 
-	pageID uuid.UUID
+	pageID     uuid.UUID
+	persistErr error
 }
 
 func newFakeStore() *fakeStore {
@@ -38,26 +39,20 @@ func (s *fakeStore) Init([]string) error { return nil }
 
 func (s *fakeStore) Close() {}
 
-func (s *fakeStore) Persist(_ context.Context, page *entity.Page, host *entity.Host) uuid.UUID {
+func (s *fakeStore) Persist(_ context.Context, page *entity.Page) (uuid.UUID, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.pages = append(s.pages, page)
-	if host != nil {
-		s.hosts = append(s.hosts, host.Name)
+	if s.persistErr != nil {
+		return s.pageID, s.persistErr
 	}
-	return s.pageID
+	s.pages = append(s.pages, page)
+	return s.pageID, nil
 }
 
 func (s *fakeStore) persisted() []*entity.Page {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]*entity.Page(nil), s.pages...)
-}
-
-func (s *fakeStore) persistedHosts() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]string(nil), s.hosts...)
 }
 
 type fakeQueue struct{}
@@ -69,14 +64,18 @@ func (fakeQueue) DeclareQueue(string) error { return nil }
 func (fakeQueue) Close()                    {}
 
 type fakeChannel struct {
-	mu        sync.Mutex
-	published []string
-	closed    bool
+	mu         sync.Mutex
+	published  []string
+	closed     bool
+	publishErr error
 }
 
-func (c *fakeChannel) Publish(queueName string, body []byte) error {
+func (c *fakeChannel) Publish(_ context.Context, queueName string, body []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.publishErr != nil {
+		return c.publishErr
+	}
 	c.published = append(c.published, queueName+":"+string(body))
 	return nil
 }
@@ -198,7 +197,7 @@ func (s *site) pageURL(path string) string {
 
 type harness struct {
 	spider *Spider
-	state  *policy.MemoryState
+	state  *state.MemoryState
 	policy *policy.PolicyManager
 	site   *site
 	store  *fakeStore
@@ -237,10 +236,10 @@ func newHarnessWithConfig(
 	if adjust != nil {
 		adjust(&cfg)
 	}
-	state := policy.NewMemoryStateAt(clock.Now)
+	mem := state.NewMemoryStateAt(clock.Now)
 	logs := utils.NewDiscardLogger()
 
-	pm := policy.New(cfg, state, logs.Logger).WithClock(clock.Now).
+	pm := policy.New(cfg, mem, logs.Logger).WithClock(clock.Now).
 		WithRobotsClient(s.srv.Client()).
 		WithFetchClient(s.srv.Client())
 
@@ -250,7 +249,7 @@ func newHarnessWithConfig(
 
 	st := newFakeStore()
 	return &harness{
-		state:  state,
+		state:  mem,
 		policy: pm,
 		site:   s,
 		store:  st,
@@ -353,7 +352,7 @@ func TestADeadHostCostsNothingPerURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, dead := markers[policy.MarkerDead]; !dead {
+	if _, dead := markers[state.MarkerDead]; !dead {
 		t.Errorf("the host was never marked dead (markers: %v), so every one of its "+
 			"URLs will try again", markers)
 	}
@@ -511,12 +510,6 @@ func TestASuccessfulPageIsPersistedOnceAndPublished(t *testing.T) {
 		t.Errorf("persisted StatusCode = %d, want 200: the loop was handing the store "+
 			"a page with no status", pages[0].StatusCode)
 	}
-
-	hosts := h.store.persistedHosts()
-	if len(hosts) != 1 || hosts[0] != hostOf(s.srv.URL) {
-		t.Errorf("persisted host = %v, want [%s]: the host record has to be the one "+
-			"the policy manager resolved", hosts, hostOf(s.srv.URL))
-	}
 }
 
 func TestAnOutcomeThatCouldNotBeRecordedIsNotPersisted(t *testing.T) {
@@ -544,6 +537,59 @@ func TestAnOutcomeThatCouldNotBeRecordedIsNotPersisted(t *testing.T) {
 	}
 	if got := ch.messages(); len(got) != 0 {
 		t.Errorf("published %v for an outcome nothing recorded, want nothing", got)
+	}
+}
+
+func TestAPersistenceErrorRequeuesThePage(t *testing.T) {
+	clock := &testClock{t: time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)}
+	s := newSite(t)
+	const path = "/edge-failure"
+	s.serve(path, englishPage)
+
+	h := newHarness(t, s, nil, clock)
+	// A non-nil id with an error is what a failed second transaction looks like.
+	h.spider.store = &fakeStore{
+		pageID:     uuid.New(),
+		persistErr: errors.New("insert graph edges failed"),
+	}
+
+	h.enqueue(t, s.pageURL(path))
+	h.crawl(t)
+
+	if _, parked := h.delayed(t)[s.pageURL(path)]; !parked {
+		t.Errorf("a page whose edges failed to commit was not requeued: %v",
+			h.delayed(t))
+	}
+}
+
+func TestASkipWithAFutureUntilIsParkedNotRetired(t *testing.T) {
+	clock := &testClock{t: time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)}
+	s := newSite(t)
+
+	// One page per host: the second URL hits the budget gate, which returns Skip
+	// with Until set to the host cold period.
+	h := newHarnessWithConfig(t, s, nil, clock, func(c *policy.Config) {
+		c.MaxPagesPerHost = 1
+	})
+	s.serve("/first", englishPage)
+	s.serve("/second", englishPage)
+
+	h.enqueue(t, s.pageURL("/first"))
+	h.crawl(t)
+
+	h.enqueue(t, s.pageURL("/second"))
+	h.crawl(t)
+
+	if _, parked := h.delayed(t)[s.pageURL("/second")]; !parked {
+		t.Errorf("a Skip carrying a future Until was retired instead of parked: %v",
+			h.delayed(t))
+	}
+	visited, err := h.state.IsVisited(context.Background(), s.pageURL("/second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if visited {
+		t.Error("a temporary refusal permanently blacklisted the URL")
 	}
 }
 
@@ -580,6 +626,13 @@ func TestAPageThatFailsToPersistStaysCrawlable(t *testing.T) {
 	if got := h.frontierLen(t); got != 0 {
 		t.Errorf("frontier holds %d urls after a page that failed to persist was "+
 			"expanded; its links are discovered only once the page itself is stored", got)
+	}
+
+	// PopFrontier is destructive, so the failed URL must come back on the
+	// delayed frontier or the work is silently gone.
+	if _, parked := h.delayed(t)[s.pageURL(path)]; !parked {
+		t.Errorf("a page that failed to persist was dropped from the frontier: %v",
+			h.delayed(t))
 	}
 }
 
@@ -743,7 +796,7 @@ func TestAnEmptyFrontierDoesNothingAtAll(t *testing.T) {
 	}
 }
 
-func TestTheMessagingChannelIsClosedAfterEveryRound(t *testing.T) {
+func TestACrawlerReusesItsMessagingChannelAcrossRounds(t *testing.T) {
 	ch := &fakeChannel{}
 	mq := &queueOpening{channel: ch}
 
@@ -756,11 +809,17 @@ func TestTheMessagingChannelIsClosedAfterEveryRound(t *testing.T) {
 		h.crawl(t)
 	}
 
-	if got := mq.opens(); got != 3 {
-		t.Errorf("opened %d channels for three rounds, want 3", got)
+	// The channel is opened once and reused across crawls.
+	if got := mq.opens(); got != 1 {
+		t.Errorf("opened %d channels for three rounds, want 1", got)
 	}
+	if ch.closed {
+		t.Error("the channel was closed between rounds")
+	}
+
+	h.spider.Close()
 	if !ch.closed {
-		t.Error("the channel was not closed at the end of the round")
+		t.Error("Close did not close the crawler's channel")
 	}
 }
 
@@ -824,4 +883,35 @@ func hostOf(raw string) string {
 		}
 	}
 	return strings.ToLower(trimmed)
+}
+
+func TestAFailedPublishParksThePageWithoutRetiringIt(t *testing.T) {
+	clock := &testClock{t: time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)}
+	s := newSite(t)
+	const path = "/publish-fails"
+	s.serve(path, englishPage)
+
+	ch := &fakeChannel{publishErr: errors.New("broker is down")}
+	h := newHarness(t, s, nil, clock)
+	h.spider.mq = &queueOpening{channel: ch}
+	h.enqueue(t, s.pageURL(path))
+
+	h.crawl(t)
+
+	if len(h.store.persisted()) != 1 {
+		t.Fatalf("the page was not persisted before the publish attempt")
+	}
+	if _, parked := h.delayed(t)[s.pageURL(path)]; !parked {
+		t.Errorf("a failed publish dropped the URL instead of retrying it: %v", h.delayed(t))
+	}
+	visited, err := h.state.IsVisited(context.Background(), s.pageURL(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if visited {
+		t.Error("a page whose index job never reached the broker was retired")
+	}
+	if got := ch.messages(); len(got) != 0 {
+		t.Errorf("recorded a publish despite the error: %v", got)
+	}
 }

@@ -18,7 +18,6 @@ pub struct PsqlConfig {
     pub statement_timeout_ms: u64,
     pub word_batch_size: usize,
     pub page_word_batch_size: usize,
-    pub max_retries: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +34,9 @@ pub struct AppConfig {
     pub max_concurrent_tasks: usize,
     pub sweep_interval: std::time::Duration,
     pub sweep_grace: std::time::Duration,
+    pub sweep_batch_size: i64,
+    pub max_index_attempts: i32,
+    pub max_retries: usize,
     pub confirmation_queue_name: String,
 }
 
@@ -46,7 +48,38 @@ pub fn load_config(env_path: String) -> Config {
     let app = load_app_config();
     let psql = load_psql_config();
     let rabbit = load_rabbit_config();
-    Config { app, psql, rabbit }
+    let mut config = Config { app, psql, rabbit };
+    sanitize(&mut config);
+    config
+}
+
+/// Rejects values that would wedge or crash a worker at runtime.
+///
+/// A zero batch size makes `slice::chunks` panic inside an async task, and a zero
+/// semaphore slot count means the consumer never gets a permit. Both are typos in
+/// an env file, so they are corrected loudly at startup rather than left to
+/// surface as a hang or an abort later.
+fn sanitize(config: &mut Config) {
+    if config.psql.word_batch_size == 0 {
+        eprintln!("WORD_BATCH_SIZE must be at least 1; using 1000");
+        config.psql.word_batch_size = 1000;
+    }
+    if config.psql.page_word_batch_size == 0 {
+        eprintln!("PAGE_WORD_BATCH_SIZE must be at least 1; using 500");
+        config.psql.page_word_batch_size = 500;
+    }
+    if config.app.max_concurrent_tasks == 0 {
+        eprintln!("PG_MAX_CONNECTIONS must be at least 1 for the task semaphore; using 10");
+        config.app.max_concurrent_tasks = 10;
+    }
+    if config.app.sweep_batch_size <= 0 {
+        eprintln!("SWEEP_BATCH_SIZE must be positive; using 500");
+        config.app.sweep_batch_size = 500;
+    }
+    if config.app.max_index_attempts <= 0 {
+        eprintln!("MAX_INDEX_ATTEMPTS must be positive; using 3");
+        config.app.max_index_attempts = 3;
+    }
 }
 
 fn load_app_config() -> AppConfig {
@@ -70,6 +103,18 @@ fn load_app_config() -> AppConfig {
     );
     let confirmation_queue_name = env::var("RABBITMQ_CONFIRMATION_QUEUE")
         .unwrap_or_else(|_| "indexer.confirmations".to_string());
+    let sweep_batch_size = env::var("SWEEP_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(500);
+    let max_index_attempts = env::var("MAX_INDEX_ATTEMPTS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(3);
+    let max_retries = env::var("MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3);
 
     AppConfig {
         log_path,
@@ -77,6 +122,9 @@ fn load_app_config() -> AppConfig {
         max_concurrent_tasks,
         sweep_grace,
         sweep_interval,
+        sweep_batch_size,
+        max_index_attempts,
+        max_retries,
         confirmation_queue_name,
     }
 }
@@ -111,11 +159,6 @@ fn load_psql_config() -> PsqlConfig {
         .unwrap_or_else(|_| "500".to_string())
         .parse::<usize>()
         .expect("PAGE_WORD_BATCH_SIZE must be a number");
-    let max_retries = env::var("MAX_RETRIES")
-        .unwrap_or_else(|_| "3".to_string())
-        .parse::<usize>()
-        .expect("MAX_RETRIES must be a number");
-
     PsqlConfig {
         url,
         max_connections,
@@ -125,7 +168,6 @@ fn load_psql_config() -> PsqlConfig {
         statement_timeout_ms,
         word_batch_size,
         page_word_batch_size,
-        max_retries,
     }
 }
 
@@ -178,6 +220,8 @@ mod tests {
             "MAX_RETRIES",
             "SWEEP_INTERVAL_SECONDS",
             "SWEEP_GRACE_SECONDS",
+            "SWEEP_BATCH_SIZE",
+            "MAX_INDEX_ATTEMPTS",
         ] {
             remove_var(key);
         }
@@ -198,6 +242,9 @@ mod tests {
         assert_eq!(app.max_concurrent_tasks, 10);
         assert_eq!(app.sweep_interval, Duration::from_secs(300));
         assert_eq!(app.sweep_grace, Duration::from_secs(600));
+        assert_eq!(app.sweep_batch_size, 500);
+        assert_eq!(app.max_index_attempts, 3);
+        assert_eq!(app.max_retries, 3);
     }
 
     #[test]
@@ -211,6 +258,9 @@ mod tests {
         set_var("PG_MAX_CONNECTIONS", "42");
         set_var("SWEEP_INTERVAL_SECONDS", "30");
         set_var("SWEEP_GRACE_SECONDS", "90");
+        set_var("SWEEP_BATCH_SIZE", "25");
+        set_var("MAX_INDEX_ATTEMPTS", "7");
+        set_var("MAX_RETRIES", "5");
 
         let app = load_app_config();
 
@@ -220,6 +270,9 @@ mod tests {
         assert_eq!(app.max_concurrent_tasks, 42);
         assert_eq!(app.sweep_interval, Duration::from_secs(30));
         assert_eq!(app.sweep_grace, Duration::from_secs(90));
+        assert_eq!(app.sweep_batch_size, 25);
+        assert_eq!(app.max_index_attempts, 7);
+        assert_eq!(app.max_retries, 5);
     }
 
     #[test]
@@ -260,7 +313,6 @@ mod tests {
         assert_eq!(psql.statement_timeout_ms, 60000);
         assert_eq!(psql.word_batch_size, 1000);
         assert_eq!(psql.page_word_batch_size, 500);
-        assert_eq!(psql.max_retries, 3);
     }
 
     #[test]
@@ -284,7 +336,6 @@ mod tests {
         assert_eq!(psql.statement_timeout_ms, 9999);
         assert_eq!(psql.word_batch_size, 7);
         assert_eq!(psql.page_word_batch_size, 11);
-        assert_eq!(psql.max_retries, 9);
     }
 
     #[test]
@@ -329,5 +380,29 @@ mod tests {
 
         assert_eq!(app.queue_name, rabbit.queue);
         assert_eq!(app.confirmation_queue_name, rabbit.confirmation_queue_name);
+    }
+
+    #[test]
+    fn sanitize_replaces_values_that_would_panic_or_wedge_a_worker() {
+        let _guard = env_lock();
+        clear_env();
+        let mut config = Config {
+            app: load_app_config(),
+            psql: load_psql_config(),
+            rabbit: load_rabbit_config(),
+        };
+        config.psql.word_batch_size = 0;
+        config.psql.page_word_batch_size = 0;
+        config.app.max_concurrent_tasks = 0;
+        config.app.sweep_batch_size = 0;
+        config.app.max_index_attempts = 0;
+
+        sanitize(&mut config);
+
+        assert_eq!(config.psql.word_batch_size, 1000);
+        assert_eq!(config.psql.page_word_batch_size, 500);
+        assert_eq!(config.app.max_concurrent_tasks, 10);
+        assert_eq!(config.app.sweep_batch_size, 500);
+        assert_eq!(config.app.max_index_attempts, 3);
     }
 }

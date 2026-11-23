@@ -105,3 +105,26 @@ func TestCosineSimilarity(t *testing.T) {
 		})
 	}
 }
+
+func TestCosineSimilarityOfAVectorWithNoScoredTermsIsZero(t *testing.T) {
+	cases := [][2][]float64{
+		{{0, 0}, {0, 0}},
+		{{0, 0}, {1, 2}},
+		{{1, 2}, {0, 0}},
+		{{}, {}},
+	}
+
+	for _, c := range cases {
+		got := cosineSimilarity(c[0], c[1])
+		if got != 0 || math.IsNaN(got) {
+			t.Errorf("cosineSimilarity(%v, %v) = %v, want 0", c[0], c[1], got)
+		}
+	}
+}
+
+func TestCosineSimilarityIsNeverNaN(t *testing.T) {
+	got := cosineSimilarity([]float64{math.NaN(), 1}, []float64{1, 1})
+	if math.IsNaN(got) {
+		t.Fatalf("cosineSimilarity returned NaN: %v", got)
+	}
+}

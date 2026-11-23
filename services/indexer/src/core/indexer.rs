@@ -1,4 +1,3 @@
-use lapin::Consumer;
 use lapin::options::BasicAckOptions;
 use lapin::options::BasicNackOptions;
 use tokio::sync::Mutex;
@@ -45,18 +44,14 @@ pub struct Indexer<DBImpl: DB, MQImpl: MessagingQueue> {
 
 #[async_trait::async_trait]
 pub trait Indexe {
-    async fn start(self: Arc<Self>, tk: CancellationToken) -> Result<Consumer, AppError>;
+    async fn start(self: Arc<Self>, tk: CancellationToken) -> Result<(), AppError>;
     async fn close(&self);
     async fn sweep_loop(self: Arc<Self>, tk: CancellationToken);
 }
 
-/// Decides whether a failed message goes back on the queue.
-///
-/// This is the poison-message line: requeueing a permanent failure loops forever,
-/// and dropping a transient one loses work that would have succeeded. A parse or
-/// serde error will fail identically on every retry, so it is dropped; a database
-/// or messaging error may succeed later. `NotFoundError` is excluded from requeue
-/// because the referenced row is gone for good.
+/// Requeue only errors that may succeed later: database and messaging ones.
+/// Parse/serde errors and `NotFoundError` are permanent and must be dropped
+/// rather than looping on a message that will always fail.
 pub fn should_requeue(err: &AppError) -> bool {
     match err {
         AppError::Database(db_err) => !matches!(db_err, DatabaseError::NotFoundError(_)),
@@ -85,106 +80,144 @@ where
     }
     pub async fn handler(&self, body: Vec<u8>) -> Result<(), AppError> {
         let job: Job = serde_json::from_slice(&body)?;
-        let page = self.db.get_page_by_id(job.page_id).await?;
+        let page = self
+            .db
+            .get_page_by_id(job.page_id, self.conf.max_index_attempts)
+            .await?;
         self.index_page(page).await?;
         Ok(())
     }
 
-    pub async fn index_loop(self: Arc<Self>, tk: CancellationToken) -> Result<Consumer, AppError> {
+    /// Releases a claim without hiding the failure that triggered it.
+    ///
+    /// A failed undo must not replace the original error: `should_requeue`
+    /// classifies by error kind, and turning a parse failure into a database
+    /// error would change whether the message is retried.
+    async fn release_claim(&self, page_id: Uuid) {
+        if let Err(undo_err) = self.db.undo_indexing(page_id).await {
+            error!(self.log, "failed to release the page claim";
+                   "page_id" => page_id.to_string(),
+                   "error" => undo_err.to_string()
+            );
+        }
+    }
+
+    /// Consume until shutdown, reconnecting with backoff across broker blips.
+    /// Only startup failure is fatal: stream errors are retried and shutdown
+    /// drains in-flight work.
+    pub async fn index_loop(self: Arc<Self>, tk: CancellationToken) -> Result<(), AppError> {
         if tk.is_cancelled() {
             info!(
                 self.log,
                 "indexing task received shutdown signal, stopping..."
             );
-            return Err(AppError::Other(
-                "indexing task received shutdown signal before consuming".to_string(),
-            ));
+            return Ok(());
         }
-        match retry_async(MAX_ATTEMPTS, || async {
+
+        let mut backoff = std::time::Duration::from_secs(1);
+        loop {
+            match self.consume_until_closed(tk.clone()).await {
+                Ok(()) => backoff = std::time::Duration::from_secs(1),
+                Err(err) => {
+                    error!(self.log, "consumer stopped; reconnecting";
+                           "queue" => self.conf.queue_name.to_string(),
+                           "error" => err.to_string(),
+                           "backoff_seconds" => backoff.as_secs()
+                    );
+                }
+            }
+
+            if tk.is_cancelled() {
+                return Ok(());
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = tk.cancelled() => return Ok(()),
+            }
+            backoff = std::cmp::min(backoff * 2, std::time::Duration::from_secs(30));
+        }
+    }
+
+    async fn consume_until_closed(self: &Arc<Self>, tk: CancellationToken) -> Result<(), AppError> {
+        let mut consumer = retry_async(MAX_ATTEMPTS, || async {
             self.mq
                 .consume(&self.conf.queue_name, self.conf.max_concurrent_tasks)
                 .await
         })
-        .await
-        {
-            Ok(mut consumer) => loop {
-                // select! on cancellation and the consumer stream: whichever
-                // fires first wins, so a shutdown does not wait for the next
-                // message to arrive.
-                tokio::select! {
-                    _ = tk.cancelled() => {
-                        info!(self.log, "Received shutdown signal, stopping consumer for queue"; "queue" => self.conf.queue_name.to_string());
-                        return Ok(consumer);
-                    }
-                    result = consumer.next() => {
-                        let Some(result) = result else {
-                            info!(self.log, "Consumer stream ended for queue"; "queue" => self.conf.queue_name.to_string());
-                            return Ok(consumer);
-                        };
+        .await?;
 
-                        let delivery = result?;
-                        let indx = Arc::clone(&self);
-                        let log = indx.log.clone();
-                        let queue_name = indx.conf.queue_name.clone();
+        loop {
+            // select! on cancellation and the consumer stream: whichever fires
+            // first wins, so a shutdown does not wait for the next message.
+            tokio::select! {
+                _ = tk.cancelled() => {
+                    info!(self.log, "Received shutdown signal, stopping consumer for queue"; "queue" => self.conf.queue_name.to_string());
+                    return Ok(());
+                }
+                result = consumer.next() => {
+                    let Some(result) = result else {
+                        info!(self.log, "Consumer stream ended for queue"; "queue" => self.conf.queue_name.to_string());
+                        return Ok(());
+                    };
 
-                        info!(log, "Received message from queue"; "queue" => &queue_name, "payload_size" => delivery.data.len());
+                    let delivery = result?;
+                    let indx = Arc::clone(self);
+                    let log = indx.log.clone();
+                    let queue_name = indx.conf.queue_name.clone();
 
-                                                // The semaphore caps concurrent indexing. Cancellation
-                        // is raced against acquiring it, otherwise shutdown would
-                        // block until an in-flight task released its permit.
-                        let permit = tokio::select! {
-                            Ok(p) = Arc::clone(&indx.limit).acquire_owned() => p,
-                            _ = tk.cancelled() => {
-                                info!(log, "Received shutdown signal while waiting for permit, stopping"; "queue" => queue_name.clone());
-                                return Ok(consumer);
-                            }
-                        };
+                    info!(log, "Received message from queue"; "queue" => &queue_name, "payload_size" => delivery.data.len());
 
-                        let mut tasks = self.tasks.lock().await;
-                        tasks.spawn(async move {
-                            // Held for the task's lifetime, which is what keeps
-                            // in-flight work within max_concurrent_tasks.
-                            let _permit = permit;
+                    // The semaphore caps concurrent indexing. Cancellation is
+                    // raced against acquiring it, otherwise shutdown would block
+                    // until an in-flight task released its permit.
+                    let permit = tokio::select! {
+                        Ok(p) = Arc::clone(&indx.limit).acquire_owned() => p,
+                        _ = tk.cancelled() => {
+                            info!(log, "Received shutdown signal while waiting for permit, stopping"; "queue" => queue_name.clone());
+                            return Ok(());
+                        }
+                    };
 
-                            // Ack only after indexing succeeded, so a crash
-                            // mid-index leaves the message unacked and it returns
-                            // to the queue.
-                            match indx.handler(delivery.data.clone()).await {
-                                Ok(()) => {
-                                    if let Err(err) = delivery.ack(BasicAckOptions::default()).await {
-                                        error!(log.clone(), "ACK error"; "err" => %err, "queue" => queue_name.clone());
-                                    }
-                                }
-                                Err(err) => {
-                                    let requeue = should_requeue(&err);
-                                    match &err {
-                                        AppError::Database(db_err) => error!(log.clone(), "Database error"; "err" => %db_err, "queue" => queue_name.clone()),
-                                        AppError::Messaging(msg_err) => error!(log.clone(), "Messaging error"; "err" => %msg_err, "queue" => queue_name.clone()),
-                                        AppError::SerdeError(serde_err) => error!(log.clone(), "Serde error"; "err" => %serde_err, "queue" => queue_name.clone()),
-                                        AppError::Other(msg) => error!(log.clone(), "Other error"; "err" => msg, "queue" => queue_name.clone()),
-                                        AppError::ParseError(msg) => error!(log.clone(), "Parse error"; "err" => msg, "queue" => queue_name.clone()),
-                                    }
-                                    if let Err(nack_err) = delivery.nack(BasicNackOptions { requeue, ..Default::default() }).await {
-                                        error!(log.clone(), "NACK error"; "err" => %nack_err, "queue" => queue_name.clone());
-                                    }
+                    let mut tasks = self.tasks.lock().await;
+                    tasks.spawn(async move {
+                        // Held for the task's lifetime, which is what keeps
+                        // in-flight work within max_concurrent_tasks.
+                        let _permit = permit;
+
+                        // Ack only after indexing succeeded, so a crash
+                        // mid-index leaves the message unacked and it returns
+                        // to the queue.
+                        match indx.handler(delivery.data.clone()).await {
+                            Ok(()) => {
+                                if let Err(err) = delivery.ack(BasicAckOptions::default()).await {
+                                    error!(log.clone(), "ACK error"; "err" => %err, "queue" => queue_name.clone());
                                 }
                             }
-                        });
-                    }
+                            Err(err) => {
+                                let requeue = should_requeue(&err);
+                                match &err {
+                                    AppError::Database(db_err) => error!(log.clone(), "Database error"; "err" => %db_err, "queue" => queue_name.clone()),
+                                    AppError::Messaging(msg_err) => error!(log.clone(), "Messaging error"; "err" => %msg_err, "queue" => queue_name.clone()),
+                                    AppError::SerdeError(serde_err) => error!(log.clone(), "Serde error"; "err" => %serde_err, "queue" => queue_name.clone()),
+                                    AppError::Other(msg) => error!(log.clone(), "Other error"; "err" => msg, "queue" => queue_name.clone()),
+                                    AppError::ParseError(msg) => error!(log.clone(), "Parse error"; "err" => msg, "queue" => queue_name.clone()),
+                                }
+                                if let Err(nack_err) = delivery.nack(BasicNackOptions { requeue, ..Default::default() }).await {
+                                    error!(log.clone(), "NACK error"; "err" => %nack_err, "queue" => queue_name.clone());
+                                }
+                            }
+                        }
+                    });
                 }
+            }
 
-                let mut tasks = self.tasks.lock().await;
+            let mut tasks = self.tasks.lock().await;
 
-                while let Some(result) = tasks.try_join_next() {
-                    if let Err(err) = result {
-                        error!(self.log.clone(), "Indexer worker task failed"; "error" => %err);
-                    }
+            while let Some(result) = tasks.try_join_next() {
+                if let Err(err) = result {
+                    error!(self.log.clone(), "Indexer worker task failed"; "error" => %err);
                 }
-            },
-
-            Err(err) => {
-                error!(self.log, "failed to consume messages from queue"; "error" => err.to_string());
-                return Err(err);
             }
         }
     }
@@ -204,7 +237,7 @@ where
                        "url_id" => page.url_id.to_string(),
                        "error" => err.to_string()
                 );
-                self.db.undo_indexing(page.id).await?;
+                self.release_claim(page.id).await;
                 return Err(AppError::ParseError(format!(
                     "Failed to parse page: {}",
                     err
@@ -216,7 +249,7 @@ where
                        "url_id" => page.url_id.to_string(),
                        "error" => err.to_string()
                 );
-                self.db.undo_indexing(page.id).await?;
+                self.release_claim(page.id).await;
                 return Err(AppError::Other(format!(
                     "Failed to spawn blocking task: {}",
                     err
@@ -224,13 +257,13 @@ where
             }
         };
 
-        match retry_async(MAX_ATTEMPTS, || async {
+        match retry_async(self.conf.max_retries.max(1), || async {
             self.db.batch_words(&words, page.id).await
         })
         .await
         {
             Ok(_) => {
-                info!(self.log, "successfully indexed page";
+                info!(self.log, "wrote the word index for page";
                      "page_id" => page.id.to_string(),
                      "url_id" => page.url_id.to_string(),
                      "word_count" => words.len()
@@ -242,16 +275,19 @@ where
                        "url_id" => page.url_id.to_string(),
                        "error" => err.to_string()
                 );
-                self.db.undo_indexing(page.id).await?;
+                self.release_claim(page.id).await;
                 return Err(err);
             }
         }
 
-        match retry_sync(MAX_ATTEMPTS, || {
+        // Publish before marking completion: the two writes cannot share a
+        // transaction, and a missing confirmation starves ranking while a
+        // duplicate is harmless. A publish failure releases the claim for retry.
+        match retry_sync(self.conf.max_retries.max(1), || {
             serde_json::to_vec(&IndexConfirmation { page_id: page.id })
         }) {
             Ok(payload) => {
-                if let Err(err) = retry_async(MAX_ATTEMPTS, || async {
+                if let Err(err) = retry_async(self.conf.max_retries.max(1), || async {
                     self.mq
                         .publish_with_confirm(&self.conf.confirmation_queue_name, payload.clone())
                         .await
@@ -263,6 +299,8 @@ where
                            "url_id" => page.url_id.to_string(),
                            "error" => err.to_string()
                     );
+                    self.release_claim(page.id).await;
+                    return Err(err);
                 }
             }
             Err(err) => {
@@ -271,10 +309,30 @@ where
                        "url_id" => page.url_id.to_string(),
                        "error" => err.to_string()
                 );
+                self.release_claim(page.id).await;
+                return Err(AppError::SerdeError(err));
             }
         }
 
-        return Ok(());
+        // No retry here: NotFound is permanent, and a transient failure is
+        // recoverable because releasing the claim lets the sweep redeliver it.
+        if let Err(err) = self.db.mark_indexed(page.id).await {
+            error!(self.log, "failed to mark page as indexed";
+                   "page_id" => page.id.to_string(),
+                   "url_id" => page.url_id.to_string(),
+                   "error" => err.to_string()
+            );
+            self.release_claim(page.id).await;
+            return Err(err);
+        }
+
+        info!(self.log, "successfully indexed page";
+             "page_id" => page.id.to_string(),
+             "url_id" => page.url_id.to_string(),
+             "word_count" => words.len()
+        );
+
+        Ok(())
     }
 }
 
@@ -284,7 +342,7 @@ where
     DBImpl: DB + Sync + Send + 'static,
     MQImpl: MessagingQueue + Send + Sync + 'static,
 {
-    async fn start(self: Arc<Self>, tk: CancellationToken) -> Result<Consumer, AppError> {
+    async fn start(self: Arc<Self>, tk: CancellationToken) -> Result<(), AppError> {
         let tk_clone = tk.clone();
         let res = Arc::clone(&self).index_loop(tk_clone).await;
         tk.cancel();
@@ -312,7 +370,11 @@ where
 
             match self
                 .db
-                .get_stale_unindexed(self.conf.sweep_grace, 500)
+                .get_stale_unindexed(
+                    self.conf.sweep_grace,
+                    self.conf.sweep_batch_size,
+                    self.conf.max_index_attempts,
+                )
                 .await
             {
                 Ok(ids) if ids.is_empty() => {}
@@ -364,6 +426,9 @@ mod tests {
             max_concurrent_tasks: 4,
             sweep_interval: Duration::from_secs(300),
             sweep_grace: Duration::from_secs(600),
+            sweep_batch_size: 500,
+            max_index_attempts: 3,
+            max_retries: 3,
             confirmation_queue_name: "indexer.confirmations".into(),
         }
     }
@@ -373,6 +438,7 @@ mod tests {
         page: Mutex<Option<Page>>,
         batch_failures_remaining: AtomicUsize,
         undo_calls: AtomicUsize,
+        marked_indexed: AtomicUsize,
         closed: AtomicUsize,
         batched_words: Mutex<Vec<HashMap<String, u32>>>,
         stale: Mutex<Vec<Uuid>>,
@@ -410,7 +476,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl DB for MockDB {
-        async fn get_page_by_id(&self, _page_id: Uuid) -> Result<Page, AppError> {
+        async fn get_page_by_id(
+            &self,
+            _page_id: Uuid,
+            _max_attempts: i32,
+        ) -> Result<Page, AppError> {
             Ok(self.page.lock().unwrap().clone().unwrap())
         }
 
@@ -440,10 +510,16 @@ mod tests {
             self.closed.fetch_add(1, Ordering::SeqCst);
         }
 
+        async fn mark_indexed(&self, _page_id: Uuid) -> Result<(), AppError> {
+            self.marked_indexed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
         async fn get_stale_unindexed(
             &self,
             _older_than: Duration,
             _limit: i64,
+            _max_attempts: i32,
         ) -> Result<Vec<Uuid>, AppError> {
             self.sweep_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.stale.lock().unwrap().clone())
@@ -488,7 +564,11 @@ mod tests {
             Ok(())
         }
 
-        async fn consume(&self, _queue: &str, _prefetch: usize) -> Result<Consumer, AppError> {
+        async fn consume(
+            &self,
+            _queue: &str,
+            _prefetch: usize,
+        ) -> Result<lapin::Consumer, AppError> {
             Err(AppError::Other("not supported in tests".into()))
         }
 
@@ -608,7 +688,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn index_page_keeps_the_page_indexed_when_confirmation_publish_fails() {
+    async fn index_page_releases_the_claim_when_confirmation_publish_fails() {
         let db = MockDB::with_page("<body>alpha</body>");
         let mq = MockMQ {
             publish_failures_remaining: AtomicUsize::new(99),
@@ -619,9 +699,42 @@ mod tests {
 
         let result = indexer.index_page(page).await;
 
-        assert!(result.is_ok(), "publish failure must not fail indexing");
-        assert_eq!(indexer.db.undo_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(indexer.db.batched_words.lock().unwrap().len(), 1);
+        let err = result.expect_err("a lost confirmation must be retryable");
+        assert!(
+            matches!(err, AppError::Messaging(_)),
+            "unexpected error kind: {err:?}"
+        );
+        assert!(
+            should_requeue(&err),
+            "the job must go back on the queue so ranking is not starved"
+        );
+        assert_eq!(
+            indexer.db.undo_calls.load(Ordering::SeqCst),
+            1,
+            "the claim must be released while the page is unconfirmed"
+        );
+        assert_eq!(
+            indexer.db.marked_indexed.load(Ordering::SeqCst),
+            0,
+            "a page must never be marked indexed before its confirmation lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_page_marks_the_page_complete_only_after_the_confirmation() {
+        let db = MockDB::with_page("<body>alpha</body>");
+        let mq = MockMQ::default();
+        let indexer = Indexer::new(db, mq, app_config(), discard_logger());
+        let page = indexer.db.page.lock().unwrap().clone().unwrap();
+
+        indexer.index_page(page).await.expect("index");
+
+        assert_eq!(indexer.mq.confirmed.lock().unwrap().len(), 1);
+        assert_eq!(
+            indexer.db.marked_indexed.load(Ordering::SeqCst),
+            1,
+            "the success marker is what stops the sweep rebuilding the page"
+        );
     }
 
     #[tokio::test]
@@ -806,7 +919,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_loop_refuses_to_consume_after_cancellation() {
+    async fn index_loop_stops_cleanly_when_already_cancelled() {
         let db = MockDB::with_page("<body>alpha</body>");
         let mq = MockMQ::default();
         let indexer = Arc::new(Indexer::new(db, mq, app_config(), discard_logger()));
@@ -814,11 +927,10 @@ mod tests {
         let tk = CancellationToken::new();
         tk.cancel();
 
-        let err = indexer.index_loop(tk).await.unwrap_err();
-
-        assert!(
-            matches!(err, AppError::Other(ref m) if m.contains("shutdown signal")),
-            "unexpected error: {err:?}"
-        );
+        // Shutdown before consuming is a normal stop, not a startup failure.
+        indexer
+            .index_loop(tk)
+            .await
+            .expect("a cancelled loop must stop cleanly");
     }
 }

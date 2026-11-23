@@ -165,15 +165,18 @@ async def test_run_pipeline_gathers_both_stages_concurrently() -> None:
 async def test_run_pipeline_propagates_a_stage_failure() -> None:
     calc, _ = make_calculator(errors={"UPDATE words": RuntimeError("words table is gone")})
 
-    with pytest.raises(RuntimeError, match="words table is gone"):
+    # TaskGroup wraps child failures in an ExceptionGroup.
+    with pytest.raises(ExceptionGroup) as excinfo:
         await calc.run_pipeline()
+    assert any("words table is gone" in str(e) for e in excinfo.value.exceptions)
 
 
 async def test_run_pipeline_propagates_a_pagerank_failure() -> None:
     calc, _ = make_calculator(errors={"update_page_rank": RuntimeError("LOG(0) detected")})
 
-    with pytest.raises(RuntimeError, match="LOG"):
+    with pytest.raises(ExceptionGroup) as excinfo:
         await calc.run_pipeline()
+    assert any("LOG" in str(e) for e in excinfo.value.exceptions)
 
 
 async def test_run_pipeline_returns_none() -> None:

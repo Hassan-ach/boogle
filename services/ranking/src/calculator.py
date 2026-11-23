@@ -5,13 +5,9 @@ from psql import DatabaseManager, retry_on_db_error
 
 logger = logging.getLogger(__name__)
 
-# Recomputes IDF for every word in one statement.
-#
-# Two GREATEST guards matter. The inner one keeps df >= 1, and the outer one
-# clamps the ratio at 1 so IDF never goes negative: a word appearing on every
-# page has n/df == 1, which gives idf = 0 and makes the term contribute nothing,
-# while rounding could otherwise push it below zero. Corpus size is clamped to at
-# least 1 for the same reason -- an empty corpus would divide by zero.
+# Recomputes IDF for every word in one statement. GREATEST keeps df >= 1 and
+# clamps the ratio at 1 so rounding cannot make IDF negative; corpus size is
+# clamped too so an empty corpus cannot divide by zero.
 IDF_UPDATE_SQL = """
     WITH corpus AS (
         SELECT GREATEST(COUNT(*), 1)::numeric AS n
@@ -31,10 +27,8 @@ IDF_UPDATE_SQL = """
     WHERE words.id = df.word_id
 """
 
-# PageRank lives in a PL/pgSQL function because the iteration is inherently
-# recursive: each pass ranks pages from the previous pass's scores. Doing it in
-# Python would mean holding the whole graph in memory and round-tripping once per
-# iteration.
+# PageRank runs in PL/pgSQL: each pass uses the previous pass's scores, so doing
+# it in Python would hold the whole graph in memory and round-trip per iteration.
 PAGERANK_UPDATE_SQL = "SELECT update_page_rank(%s, %s);"
 
 
@@ -110,15 +104,15 @@ class RankingCalculator:
     ) -> None:
         """Run both jobs concurrently on separate pooled connections.
 
-        gather runs them at the same time but does not make them atomic: a
-        failure in one leaves the other's work committed. Each job is a full
-        table rewrite, so a partial run is still internally consistent.
+        A TaskGroup cancels the sibling on failure, so a partial pair cannot
+        commit alone; the cancelled pair leaves the previous scores intact.
         """
         logger.info("Executing full ranking pipeline (IDF + PageRank)...")
-        await asyncio.gather(
-            self.compute_idf(),
-            self.update_pagerank(
-                iterations=iterations, damping_factor=damping_factor
-            ),
-        )
+        async with asyncio.TaskGroup() as group:
+            group.create_task(self.compute_idf())
+            group.create_task(
+                self.update_pagerank(
+                    iterations=iterations, damping_factor=damping_factor
+                )
+            )
         logger.info("Ranking pipeline execution completed.")
