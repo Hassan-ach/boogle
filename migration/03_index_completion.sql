@@ -1,13 +1,6 @@
--- Index completion marker and sweep support.
---
--- `indexed` alone cannot distinguish "the indexer finished this page" from "a
--- worker claimed it and died": both leave indexed = TRUE. `indexed_at` records
--- completion, and the reconciliation sweep reclaims only rows where it is NULL.
--- Without this column the sweep matched every successfully indexed page and
--- deleted its page_word rows every SWEEP_INTERVAL_SECONDS (C-01).
---
--- This file is idempotent so it can be applied to an existing database as well
--- as a fresh one.
+-- `indexed` is a claim, not a completion flag: `indexed_at` marks a finished
+-- page so the reconciliation sweep only reclaims claimed-but-unfinished rows.
+-- This file is idempotent for both fresh and existing databases.
 
 DO $$
 BEGIN
@@ -20,10 +13,8 @@ BEGIN
     ) THEN
         ALTER TABLE pages ADD COLUMN indexed_at TIMESTAMP;
 
-        -- One-time backfill for databases created before this column existed.
-        -- A page that has word rows is completed: stamp it so the first sweep
-        -- does not delete the corpus. A claim with no words is a dead worker,
-        -- so it is deliberately left NULL and reclaimed normally.
+        -- Stamp pages with word rows as completed; claims with none stay NULL
+        -- so the sweep reclaims them.
         UPDATE pages p
         SET indexed_at = COALESCE(p.last_index_attempt_at, NOW())
         WHERE p.indexed = TRUE
@@ -46,12 +37,11 @@ CREATE INDEX IF NOT EXISTS idx_pages_unindexed_updated
 -- single-column index served, so it is pure write cost.
 DROP INDEX IF EXISTS idx_page_word_word_id;
 
--- The monitor orchestrator was removed; nothing reads or writes this table.
+-- Nothing reads or writes this table.
 DROP TABLE IF EXISTS monitor_state;
 
--- The reverse unique index dropped any edge whose reverse already existed, so
--- reciprocal links (a -> b and b -> a) were silently discarded and PageRank saw
--- an incomplete graph. UNIQUE(from_url, to_url) is the only rule needed (H-15).
+-- UNIQUE(from_url, to_url) is the only edge rule; the reverse index rejected
+-- reciprocal links.
 DROP INDEX IF EXISTS idx_graph_edges_unique_revese;
 
 -- UNIQUE(from_url, to_url) on graph_edges already creates an index; the explicit
