@@ -4,11 +4,23 @@
 .idea/
 .vscode/
 data/
+# `data/` ignores every directory named data, including the MkDocs source tree.
+!docs/data/
 .scannerwork/
 *.log
 .env
 .env.docker
 services/*/.env.docker
+
+# === Documentation build ===
+# Markdown sources in docs/ and services/*/docs/ are version-controlled.
+# Generated aggregation, virtualenvs and HTML output are not.
+.venv-docs/
+.docs-build/
+site/
+site-services/
+docs/services/
+docs/assets/
 # === Rust ===
 target/
 **/*.rs.bk

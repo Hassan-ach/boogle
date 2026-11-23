@@ -143,3 +143,21 @@ test-all: test test-integration
 clean:
     @for svc in {{go_services}}; do rm -f services/$svc/coverage.out; done
     @find services/ranking -name '__pycache__' -type d -prune -exec rm -rf {} +
+
+# === Documentation ===
+# Markdown lives in docs/ and services/<svc>/docs/; scripts/docs.py aggregates
+# the service pages, then builds or serves the MkDocs site in strict mode.
+docs-install:
+    python3 scripts/docs.py install
+
+docs-build:
+    python3 scripts/docs.py build
+
+docs-serve:
+    python3 scripts/docs.py serve
+
+docs-service svc:
+    python3 scripts/docs.py service {{svc}}
+
+docs-check:
+    python3 scripts/docs.py check
