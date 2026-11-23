@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./migration:/docker-entrypoint-initdb.d
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql
     environment:
       POSTGRES_USER: ${PG_USER}
       POSTGRES_PASSWORD: ${PG_PASSWORD}
@@ -32,7 +32,8 @@ services:
     networks:
       - search_net
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a \"$${REDISCLI_AUTH}\" ping | grep -q PONG"]
+      test:
+        ["CMD-SHELL", 'redis-cli -a "$${REDISCLI_AUTH}" ping | grep -q PONG']
       interval: 5s
       timeout: 5s
       retries: 10
